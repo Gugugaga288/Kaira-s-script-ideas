@@ -154,9 +154,20 @@ local function refreshMenu(super)
 end
 
 -- toggle panel
-local panel = new("Frame", {
-	Position = UDim2.new(0, 10, .5, -74), Size = UDim2.fromOffset(150, 148), BackgroundTransparency = 1, Visible = false,
+-- Scripts can't add to Roblox's own menu, so this sits next to it in the top-left.
+-- If it overlaps other icons in your game, change MENU_X.
+local MENU_X = 150
+local panelOpen = false
+local menuBtn = new("TextButton", {
+	Position = UDim2.fromOffset(MENU_X, 4), Size = UDim2.fromOffset(70, 36), Text = "TUNG",
+	BackgroundColor3 = Color3.fromRGB(25, 25, 25), BackgroundTransparency = .2, TextColor3 = GOLD,
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false,
 }, gui)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, menuBtn)
+local panel = new("Frame", {
+	Position = UDim2.fromOffset(MENU_X, 46), Size = UDim2.fromOffset(150, 148), BackgroundTransparency = 1, Visible = false,
+}, gui)
+menuBtn.MouseButton1Click:Connect(function() panelOpen = not panelOpen panel.Visible = panelOpen end)
 local tSpeed, tJump, tEsp = button(panel, "", 0), button(panel, "", 48), button(panel, "", 96)
 
 local function applyBuffs()
@@ -171,7 +182,9 @@ local function refreshPanel()
 	tJump.Text = "Jump: " .. (on.jump and "ON" or "OFF")
 	tEsp.Text = "ESP: " .. (on.esp and "ON" or "OFF")
 	tSpeed.Visible, tJump.Visible, tEsp.Visible = speedBonus > 0, jumpBonus > 0, espTier > 0
-	panel.Visible = speedBonus > 0 or jumpBonus > 0 or espTier > 0
+	local unlocked = speedBonus > 0 or jumpBonus > 0 or espTier > 0
+	menuBtn.Visible = unlocked
+	panel.Visible = unlocked and panelOpen
 end
 tSpeed.MouseButton1Click:Connect(function() on.speed = not on.speed refreshPanel() applyBuffs() end)
 tJump.MouseButton1Click:Connect(function() on.jump = not on.jump refreshPanel() applyBuffs() end)
@@ -181,7 +194,7 @@ lp.CharacterAdded:Connect(function() task.wait(.5) applyBuffs() end)
 -- missile ability button
 local useMissile
 local abilityBtn = new("TextButton", {
-	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -130), Size = UDim2.fromOffset(150, 56),
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, .5, -20), Size = UDim2.fromOffset(130, 52),
 	BackgroundColor3 = Color3.fromRGB(0, 90, 220), TextColor3 = Color3.new(1, 1, 1),
 	Font = Enum.Font.GothamBlack, TextSize = 16, Visible = false, Text = "MISSILE (Q)",
 }, gui)
