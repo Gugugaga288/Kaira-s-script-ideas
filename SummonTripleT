@@ -203,7 +203,7 @@ local menuButtons = {}
 
 local function options(super)
 	local o = {}
-	local function add(key, text) table.insert(o, {key, text .. " - " .. (cost() + itemPrice(key, super)) .. " coins"}) end
+	local function add(key, text) table.insert(o, {key, text .. " - " .. itemPrice(key, super) .. " coins"}) end
 	if super then
 		add("speed", "SUPER Speed (+" .. SUPER_SPEED .. ")")
 		add("jump", "SUPER Jump (+" .. SUPER_JUMP .. ")")
@@ -232,7 +232,7 @@ end
 local function refreshMenu(super)
 	menu.BackgroundColor3 = super and Color3.fromRGB(70, 50, 0) or Color3.fromRGB(20, 20, 20)
 	stroke.Enabled = super
-	title.Text = (super and "SUPER SHOP" or "Pick ONE") .. "  (summon fee " .. cost() .. " + item)"
+	title.Text = (super and "SUPER SHOP" or "Pick ONE") .. "  |  +" .. cost() .. " summon fee"
 	title.TextColor3 = super and GOLD or Color3.new(1, 1, 1)
 	for _, b in ipairs(menuButtons) do b:Destroy() end
 	menuButtons = {}
