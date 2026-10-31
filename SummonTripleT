@@ -32,6 +32,7 @@ local OWNER_USER_IDS = {5312058798, 10459535763}
 local TIERS = {"ESP", "ESP + Names", "ESP + Chams", "ESP + Arrows"}
 local COIN_COUNT, COIN_RESPAWN = 12, 12
 -- ------------------------------------------------------------------------
+local FLOAT_HEIGHT, BOB_AMOUNT = 14, .8      -- how high you levitate and how far you bob
 local STEP = 1 / 60
 
 local coins, summons = 0, 0
@@ -41,6 +42,8 @@ local missileTime, missileSpeed, missileCd = 5, 110, 12
 local espTier = 0
 local on = {speed = false, jump = false, esp = false}
 local busy, missileBusy, lastMissile = false, false, -100
+local planning, stopRequested, planStart = false, false, 0
+local hasPhase = false
 
 local function new(class, props, parent)
 	local o = Instance.new(class)
@@ -98,16 +101,22 @@ end
 
 -- shop menu: pick ONE buff (rebuilt every time it opens)
 local menu = new("Frame", {
-	AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .45), Size = UDim2.fromOffset(300, 0),
-	AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Color3.fromRGB(20, 20, 20), Visible = false,
+	AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .45), Size = UDim2.fromOffset(300, 290),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 20), Visible = false,
 }, gui)
 new("UICorner", {CornerRadius = UDim.new(0, 12)}, menu)
 local stroke = new("UIStroke", {Color = GOLD, Thickness = 3, Enabled = false}, menu)
-new("UIPadding", {PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8)}, menu)
-new("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, menu)
 local title = new("TextLabel", {
-	Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 16, LayoutOrder = 0,
+	Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 0, 30), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold, TextSize = 16,
 }, menu)
+-- scrolling list; buttons leave a gutter on the right so you can drag-scroll without pressing one
+local scroll = new("ScrollingFrame", {
+	Position = UDim2.fromOffset(8, 38), Size = UDim2.new(1, -16, 1, -46), BackgroundTransparency = 1, BorderSizePixel = 0,
+	ScrollBarThickness = 8, ScrollBarImageColor3 = GOLD, CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+}, menu)
+new("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, scroll)
 local choiceEvt = Instance.new("BindableEvent")
 local menuButtons = {}
 
@@ -129,6 +138,7 @@ local function options(super)
 			table.insert(o, {"mdur", "Missile Duration (+" .. DUR_STEP .. "s)"})
 			table.insert(o, {"mspeed", "Missile Speed (+" .. MSPEED_STEP .. ")"})
 			if missileCd > MIN_CD then table.insert(o, {"mcd", "Missile Cooldown (-" .. CD_STEP .. "s)"}) end
+			if not hasPhase then table.insert(o, {"mphase", "Missile Phase (fly through walls)"}) end
 		end
 	end
 	return o
@@ -141,12 +151,13 @@ local function refreshMenu(super)
 	title.TextColor3 = super and GOLD or Color3.new(1, 1, 1)
 	for _, b in ipairs(menuButtons) do b:Destroy() end
 	menuButtons = {}
+	scroll.CanvasPosition = Vector2.zero
 	for i, opt in ipairs(options(super)) do
 		local b = new("TextButton", {
-			Size = UDim2.new(1, 0, 0, 36), LayoutOrder = i, Text = opt[2], Font = Enum.Font.GothamBold, TextSize = 14,
+			Size = UDim2.new(1, -44, 0, 38), LayoutOrder = i, Text = opt[2], Font = Enum.Font.GothamBold, TextSize = 14,
 			BackgroundColor3 = super and GOLD or Color3.fromRGB(40, 40, 40),
 			TextColor3 = super and Color3.new(0, 0, 0) or Color3.new(1, 1, 1),
-		}, menu)
+		}, scroll)
 		new("UICorner", {CornerRadius = UDim.new(0, 8)}, b)
 		b.MouseButton1Click:Connect(function() choiceEvt:Fire(opt[1]) end)
 		table.insert(menuButtons, b)
@@ -206,7 +217,7 @@ end)
 RS.Heartbeat:Connect(function()
 	if not hasMissile then return end
 	local left = missileCd - (os.clock() - lastMissile)
-	if missileBusy then abilityBtn.Text = "ACTIVE"
+	if missileBusy then abilityBtn.Text = planning and "STOP" or "ACTIVE"
 	elseif left > 0 then abilityBtn.Text = "MISSILE " .. math.ceil(left) .. "s"
 	else abilityBtn.Text = "MISSILE (Q)" end
 end)
@@ -304,15 +315,27 @@ local function summon()
 	hum.JumpPower = 0
 	local start = root.Position
 	local bp = new("BodyPosition", {MaxForce = Vector3.new(1e6, 1e6, 1e6), P = 3000, D = 500, Position = start}, root)
-	TS:Create(bp, TweenInfo.new(2), {Position = start + Vector3.new(0, 8, 0)}):Play()
+	-- no falling pose: with Freefall disabled the limbs stay like you're standing on the ground
+	pcall(function()
+		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+		hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		hum:ChangeState(Enum.HumanoidStateType.Running)
+	end)
+	-- rise smoothly, then bob up and down a little
+	local t0 = os.clock()
+	local bobConn = RS.Heartbeat:Connect(function()
+		local k = math.min(1, (os.clock() - t0) / 2.5)
+		k = k * k * (3 - 2 * k)
+		bp.Position = start + Vector3.new(0, FLOAT_HEIGHT * k + math.sin((os.clock() - t0) * 2.5) * BOB_AMOUNT * k, 0)
+	end)
 
 	-- Tung Tung Tung Sahur + golden beam
-	local p = (root.CFrame * CFrame.new(0, 0, -12)).Position + Vector3.new(0, 12, 0)
+	local p = (root.CFrame * CFrame.new(0, 0, -12)).Position + Vector3.new(0, FLOAT_HEIGHT + 4, 0)
 	local tung = buildTung(super)
 	tung:PivotTo(CFrame.new(p.X, p.Y + 150, p.Z))
 	tung.Parent = workspace
 	local beam = new("Part", {
-		Shape = Enum.PartType.Cylinder, Size = Vector3.new(400, 6, 6), Color = GOLD, Material = Enum.Material.Neon,
+		Shape = Enum.PartType.Cylinder, Size = Vector3.new(400, 10, 10), Color = GOLD, Material = Enum.Material.Neon,
 		Transparency = .45, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
 	}, workspace)
 	local tag = new("BillboardGui", {Size = UDim2.fromOffset(240, 30), StudsOffset = Vector3.new(0, 7, 0), AlwaysOnTop = true}, tung:FindFirstChildOfClass("Part"))
@@ -323,7 +346,7 @@ local function summon()
 	}, tag)
 	local function place(y)
 		tung:PivotTo(CFrame.lookAt(Vector3.new(p.X, y, p.Z), Vector3.new(start.X, y, start.Z)))
-		beam.CFrame = CFrame.new(p.X, y + 200, p.Z) * CFrame.Angles(0, 0, math.pi / 2)
+		beam.CFrame = CFrame.new(p.X, y + 190, p.Z) * CFrame.Angles(0, 0, math.pi / 2)
 	end
 	for i = 0, 60 do
 		place(p.Y + 150 * (1 - i / 60) ^ 2)
@@ -332,6 +355,11 @@ local function summon()
 
 	local function cleanup()
 		menu.Visible = false
+		bobConn:Disconnect()
+		pcall(function()
+			hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		end)
 		bp:Destroy()
 		tung:Destroy()
 		beam:Destroy()
@@ -370,9 +398,22 @@ local function summon()
 
 	if pay < price then
 		-- couldn't afford it: drift far up into the sky, then die
+		bobConn:Disconnect()
 		TS:Create(bp, TweenInfo.new(4, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Position = bp.Position + Vector3.new(0, 250, 0)}):Play()
 		task.wait(4)
-		hum.Health = 0
+		if hum.Health > 0 then
+			hum.Health = 0
+			-- Tung killed you for not paying: lose every buff and the summon cost goes back to 5
+			summons = 0
+			speedBonus, jumpBonus, espTier = 0, 0, 0
+			hasMissile, hasPhase = false, false
+			missileTime, missileSpeed, missileCd = 5, 110, 12
+			on.speed, on.jump, on.esp = false, false, false
+			panelOpen = false
+			abilityBtn.Visible = false
+			refresh()
+			refreshPanel()
+		end
 		cleanup()
 		return
 	end
@@ -396,6 +437,8 @@ local function summon()
 		missileSpeed += MSPEED_STEP
 	elseif chosen == "mcd" then
 		missileCd = math.max(MIN_CD, missileCd - CD_STEP)
+	elseif chosen == "mphase" then
+		hasPhase = true
 	end
 	refresh()
 	refreshPanel()
@@ -450,7 +493,12 @@ local function afterimage(missile)
 end
 
 useMissile = function()
-	if missileBusy or busy or not hasMissile then return end
+	if missileBusy then
+		-- press again while steering to stop early
+		if planning and os.clock() - planStart > .4 then stopRequested = true end
+		return
+	end
+	if busy or not hasMissile then return end
 	if os.clock() - lastMissile < missileCd then return end
 	local char = lp.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -498,7 +546,8 @@ useMissile = function()
 	params.FilterDescendantsInstances = {char, coinFolder}
 	local path = {}
 	local elapsed, acc, lastGhost, hit = 0, 0, 0, false
-	while elapsed < missileTime and not hit do
+	planning, stopRequested, planStart = true, false, os.clock()
+	while elapsed < missileTime and not hit and not stopRequested do
 		local dt = RS.Heartbeat:Wait()
 		if hum.Health <= 0 then break end
 		elapsed += dt
@@ -507,7 +556,7 @@ useMissile = function()
 			acc -= STEP
 			dir = dir:Lerp(cam.CFrame.LookVector, math.min(1, MISSILE_TURN * STEP)).Unit
 			local move = dir * missileSpeed * STEP
-			if workspace:Raycast(pos, move + dir * 1.5, params) then
+			if not hasPhase and workspace:Raycast(pos, move + dir * 1.5, params) then
 				hit = true
 			else
 				pos += move
@@ -522,6 +571,7 @@ useMissile = function()
 	end
 
 	-- back to normal
+	planning = false
 	missile:Destroy()
 	cam.CameraSubject = hum
 	freezeConn:Disconnect()
@@ -560,7 +610,17 @@ useMissile = function()
 		local last = path[#path]
 		local flat = Vector3.new(last.dir.X, 0, last.dir.Z)
 		if flat.Magnitude < .01 then flat = Vector3.new(0, 0, -1) end
-		root.CFrame = CFrame.lookAt(last.pos + Vector3.new(0, 2, 0), last.pos + Vector3.new(0, 2, 0) + flat)
+		local landing = last.pos + Vector3.new(0, 2, 0)
+		if hasPhase then
+			-- if you ended inside something, pop up to the first free spot
+			local op = OverlapParams.new()
+			op.FilterDescendantsInstances = {char, coinFolder}
+			for _ = 1, 60 do
+				if #workspace:GetPartBoundsInBox(CFrame.new(landing), Vector3.new(4, 6, 4), op) == 0 then break end
+				landing += Vector3.new(0, 4, 0)
+			end
+		end
+		root.CFrame = CFrame.lookAt(landing, landing + flat)
 		root.AssemblyLinearVelocity = Vector3.zero
 		for _, d in ipairs(parts) do d.CanCollide = true end
 		hum.PlatformStand = false
