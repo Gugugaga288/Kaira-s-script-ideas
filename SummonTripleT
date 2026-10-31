@@ -156,7 +156,7 @@ end
 -- toggle panel
 -- Scripts can't add to Roblox's own menu, so this sits next to it in the top-left.
 -- If it overlaps other icons in your game, change MENU_X.
-local MENU_X = 150
+local MENU_X = 250
 local panelOpen = false
 local menuBtn = new("TextButton", {
 	Position = UDim2.fromOffset(MENU_X, 4), Size = UDim2.fromOffset(70, 36), Text = "TUNG",
