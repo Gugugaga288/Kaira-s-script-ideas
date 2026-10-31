@@ -1,27 +1,46 @@
 -- LocalScript: put in StarterPlayer > StarterPlayerScripts
 -- Say the phrase in chat -> levitate -> Tung Tung Tung Sahur drops in on a golden beam
--- -> pick buffs -> coins fly out of your body to pay. Not enough coins = you die.
+-- -> pick ONE buff -> coins fly out of your body to pay. Not enough coins = you float into the sky and die.
+-- Every 3rd summon (3, 6, 9...) is a golden SUPER shop: stronger buffs, plus the Missile ability and its upgrades.
+-- Secret coin phrase is COIN_PHRASE below (owner only).
 
 local Players = game:GetService("Players")
 local RS = game:GetService("RunService")
 local TS = game:GetService("TweenService")
 local TCS = game:GetService("TextChatService")
+local UIS = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Debris = game:GetService("Debris")
 local lp = Players.LocalPlayer
 local cam = workspace.CurrentCamera
 
--- Upload your Tung Tung Tung Sahur PNG to Roblox (Creator Hub > Assets > Decal/Image),
--- then paste its ID here:
-local TUNG_IMAGE = "rbxassetid://72939506872420"
-
 local PHRASE = "tung tung are you there take my money if you dare"
-local BLUE = Color3.fromRGB(0, 140, 255)
 local GOLD = Color3.fromRGB(255, 200, 40)
+local BLUE = Color3.fromRGB(0, 140, 255)
+
+-- tweak these ------------------------------------------------------------
+local BASE_SPEED, BASE_JUMP = 16, 50
+local SPEED_STEP, JUMP_STEP = 3, 5          -- normal shop (weak)
+local SUPER_SPEED, SUPER_JUMP = 10, 20      -- super shop (strong)
+local SUPER_EVERY = 3                      -- every 3rd summon is a SUPER shop
+local MISSILE_TURN = 6
+local DUR_STEP, MSPEED_STEP, CD_STEP, MIN_CD = 1, 25, 2, 3   -- missile upgrades (seconds, speed, seconds, min cooldown)
+-- Coin cheat: letters and spaces only. Chat is public, so it ONLY works for the accounts in OWNER_USER_IDS
+-- (Roblox user IDs, the number in each profile link). 0 = nobody. Works for anyone in Studio test mode.
+local COIN_PHRASE, COIN_AMOUNT = "quorble zanthic velvet mumbo plunk", 50
+local OWNER_USER_IDS = {5312058798, 10459535763}
 local TIERS = {"ESP", "ESP + Names", "ESP + Chams", "ESP + Arrows"}
+local COIN_COUNT, COIN_RESPAWN = 12, 12
+-- ------------------------------------------------------------------------
+local STEP = 1 / 60
 
 local coins, summons = 0, 0
-local espTier, speedLvl, jumpLvl = 0, 0, 0
-local on = {esp = false, speed = false, jump = false}
-local busy = false
+local speedBonus, jumpBonus = 0, 0
+local hasMissile = false
+local missileTime, missileSpeed, missileCd = 5, 110, 12
+local espTier = 0
+local on = {speed = false, jump = false, esp = false}
+local busy, missileBusy, lastMissile = false, false, -100
 
 local function new(class, props, parent)
 	local o = Instance.new(class)
@@ -35,14 +54,36 @@ local function cost() return 5 * (summons + 1) end
 ---------------------------------------------------------------- UI
 local gui = new("ScreenGui", {Name = "TungUI", ResetOnSpawn = false, IgnoreGuiInset = true}, lp:WaitForChild("PlayerGui"))
 
-local counter = new("TextLabel", {
-	AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 16, 1, -16), Size = UDim2.fromOffset(300, 40),
-	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = .35, TextColor3 = GOLD,
-	Font = Enum.Font.GothamBold, TextSize = 20,
+-- blue missile tint
+local tintFrame = new("Frame", {
+	Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(0, 70, 255), BackgroundTransparency = 1, BorderSizePixel = 0,
 }, gui)
-new("UICorner", {CornerRadius = UDim.new(0, 10)}, counter)
+local cc = new("ColorCorrectionEffect", {
+	Enabled = false, TintColor = Color3.fromRGB(60, 110, 255), Saturation = -.3, Contrast = .15,
+}, Lighting)
+local function tint(state)
+	cc.Enabled = state
+	TS:Create(tintFrame, TweenInfo.new(.3), {BackgroundTransparency = state and .65 or 1}):Play()
+end
 
-local function refresh() counter.Text = "🪙 " .. coins .. "   |   Next summon: " .. cost() end
+-- coin counter (bottom left) with a drawn coin icon
+local box = new("Frame", {
+	AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 16, 1, -16), Size = UDim2.fromOffset(300, 44),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = .35,
+}, gui)
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, box)
+local icon = new("Frame", {Position = UDim2.fromOffset(8, 8), Size = UDim2.fromOffset(28, 28), BackgroundColor3 = GOLD}, box)
+new("UICorner", {CornerRadius = UDim.new(1, 0)}, icon)
+new("UIStroke", {Color = Color3.fromRGB(170, 110, 0), Thickness = 2}, icon)
+new("TextLabel", {
+	Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "$", TextColor3 = Color3.fromRGB(150, 95, 0),
+	Font = Enum.Font.GothamBlack, TextSize = 18,
+}, icon)
+local counter = new("TextLabel", {
+	Position = UDim2.fromOffset(46, 0), Size = UDim2.new(1, -50, 1, 0), BackgroundTransparency = 1, TextColor3 = GOLD,
+	Font = Enum.Font.GothamBold, TextSize = 18, TextXAlignment = Enum.TextXAlignment.Left,
+}, box)
+local function refresh() counter.Text = coins .. "   |   Next summon: " .. cost() end
 refresh()
 
 local function button(parent, text, y)
@@ -55,56 +96,107 @@ local function button(parent, text, y)
 	return b
 end
 
--- buff pick menu (shown while floating)
+-- shop menu: pick ONE buff (rebuilt every time it opens)
 local menu = new("Frame", {
-	AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .45), Size = UDim2.fromOffset(280, 230),
-	BackgroundColor3 = Color3.fromRGB(20, 20, 20), Visible = false,
+	AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .45), Size = UDim2.fromOffset(300, 0),
+	AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Color3.fromRGB(20, 20, 20), Visible = false,
 }, gui)
 new("UICorner", {CornerRadius = UDim.new(0, 12)}, menu)
-local pick = {esp = false, speed = false, jump = false}
-local bEsp, bSpeed, bJump = button(menu, "", 10), button(menu, "", 58), button(menu, "", 106)
-local bPay = button(menu, "PAY", 170)
-bPay.BackgroundColor3 = Color3.fromRGB(180, 130, 0)
-local payEvt = Instance.new("BindableEvent")
+local stroke = new("UIStroke", {Color = GOLD, Thickness = 3, Enabled = false}, menu)
+new("UIPadding", {PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8)}, menu)
+new("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, menu)
+local title = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 16, LayoutOrder = 0,
+}, menu)
+local choiceEvt = Instance.new("BindableEvent")
+local menuButtons = {}
 
-local function refreshMenu()
-	bEsp.Text = (pick.esp and "✅ " or "⬜ ") .. TIERS[math.min(espTier + 1, 4)]
-	bSpeed.Text = (pick.speed and "✅ " or "⬜ ") .. "Speed buff"
-	bJump.Text = (pick.jump and "✅ " or "⬜ ") .. "Jump buff"
-	bPay.Text = "PAY " .. cost() .. " COINS"
+local function options(super)
+	local o
+	if super then
+		o = {
+			{"speed", "SUPER Speed (+" .. SUPER_SPEED .. ")"},
+			{"jump", "SUPER Jump (+" .. SUPER_JUMP .. ")"},
+		}
+		if not hasMissile then table.insert(o, {"missile", "Missile Ability (" .. missileTime .. "s)"}) end
+	else
+		o = {
+			{"speed", "Speed (+" .. SPEED_STEP .. ")"},
+			{"jump", "Jump (+" .. JUMP_STEP .. ")"},
+		}
+		if espTier < 4 then table.insert(o, {"esp", TIERS[espTier + 1]}) end
+		if hasMissile then -- missile upgrades show up in the normal shop once you own the missile
+			table.insert(o, {"mdur", "Missile Duration (+" .. DUR_STEP .. "s)"})
+			table.insert(o, {"mspeed", "Missile Speed (+" .. MSPEED_STEP .. ")"})
+			if missileCd > MIN_CD then table.insert(o, {"mcd", "Missile Cooldown (-" .. CD_STEP .. "s)"}) end
+		end
+	end
+	return o
 end
-bEsp.MouseButton1Click:Connect(function() pick.esp = not pick.esp refreshMenu() end)
-bSpeed.MouseButton1Click:Connect(function() pick.speed = not pick.speed refreshMenu() end)
-bJump.MouseButton1Click:Connect(function() pick.jump = not pick.jump refreshMenu() end)
-bPay.MouseButton1Click:Connect(function()
-	if pick.esp or pick.speed or pick.jump then payEvt:Fire() end
-end)
+
+local function refreshMenu(super)
+	menu.BackgroundColor3 = super and Color3.fromRGB(70, 50, 0) or Color3.fromRGB(20, 20, 20)
+	stroke.Enabled = super
+	title.Text = (super and "SUPER SHOP - " or "Pick ONE - ") .. cost() .. " coins"
+	title.TextColor3 = super and GOLD or Color3.new(1, 1, 1)
+	for _, b in ipairs(menuButtons) do b:Destroy() end
+	menuButtons = {}
+	for i, opt in ipairs(options(super)) do
+		local b = new("TextButton", {
+			Size = UDim2.new(1, 0, 0, 36), LayoutOrder = i, Text = opt[2], Font = Enum.Font.GothamBold, TextSize = 14,
+			BackgroundColor3 = super and GOLD or Color3.fromRGB(40, 40, 40),
+			TextColor3 = super and Color3.new(0, 0, 0) or Color3.new(1, 1, 1),
+		}, menu)
+		new("UICorner", {CornerRadius = UDim.new(0, 8)}, b)
+		b.MouseButton1Click:Connect(function() choiceEvt:Fire(opt[1]) end)
+		table.insert(menuButtons, b)
+	end
+end
 
 -- toggle panel
 local panel = new("Frame", {
-	Position = UDim2.new(0, 10, .5, -80), Size = UDim2.fromOffset(150, 160),
-	BackgroundTransparency = 1, Visible = false,
+	Position = UDim2.new(0, 10, .5, -74), Size = UDim2.fromOffset(150, 148), BackgroundTransparency = 1, Visible = false,
 }, gui)
-local tEsp, tSpeed, tJump = button(panel, "", 0), button(panel, "", 48), button(panel, "", 96)
-local function refreshPanel()
-	tEsp.Text = "ESP: " .. (on.esp and "ON" or "OFF")
-	tSpeed.Text = "Speed: " .. (on.speed and "ON" or "OFF")
-	tJump.Text = "Jump: " .. (on.jump and "ON" or "OFF")
-	tEsp.Visible, tSpeed.Visible, tJump.Visible = espTier > 0, speedLvl > 0, jumpLvl > 0
-	panel.Visible = espTier > 0 or speedLvl > 0 or jumpLvl > 0
-end
+local tSpeed, tJump, tEsp = button(panel, "", 0), button(panel, "", 48), button(panel, "", 96)
 
 local function applyBuffs()
 	local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
 	if not hum then return end
 	hum.UseJumpPower = true
-	hum.WalkSpeed = on.speed and (16 + 8 * speedLvl) or 16
-	hum.JumpPower = on.jump and (50 + 15 * jumpLvl) or 50
+	hum.WalkSpeed = on.speed and (BASE_SPEED + speedBonus) or BASE_SPEED
+	hum.JumpPower = on.jump and (BASE_JUMP + jumpBonus) or BASE_JUMP
 end
-tEsp.MouseButton1Click:Connect(function() on.esp = not on.esp refreshPanel() end)
+local function refreshPanel()
+	tSpeed.Text = "Speed: " .. (on.speed and "ON" or "OFF")
+	tJump.Text = "Jump: " .. (on.jump and "ON" or "OFF")
+	tEsp.Text = "ESP: " .. (on.esp and "ON" or "OFF")
+	tSpeed.Visible, tJump.Visible, tEsp.Visible = speedBonus > 0, jumpBonus > 0, espTier > 0
+	panel.Visible = speedBonus > 0 or jumpBonus > 0 or espTier > 0
+end
 tSpeed.MouseButton1Click:Connect(function() on.speed = not on.speed refreshPanel() applyBuffs() end)
 tJump.MouseButton1Click:Connect(function() on.jump = not on.jump refreshPanel() applyBuffs() end)
+tEsp.MouseButton1Click:Connect(function() on.esp = not on.esp refreshPanel() end)
 lp.CharacterAdded:Connect(function() task.wait(.5) applyBuffs() end)
+
+-- missile ability button
+local useMissile
+local abilityBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -130), Size = UDim2.fromOffset(150, 56),
+	BackgroundColor3 = Color3.fromRGB(0, 90, 220), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 16, Visible = false, Text = "MISSILE (Q)",
+}, gui)
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, abilityBtn)
+abilityBtn.MouseButton1Click:Connect(function() useMissile() end)
+UIS.InputBegan:Connect(function(input, gp)
+	if not gp and input.KeyCode == Enum.KeyCode.Q then useMissile() end
+end)
+RS.Heartbeat:Connect(function()
+	if not hasMissile then return end
+	local left = missileCd - (os.clock() - lastMissile)
+	if missileBusy then abilityBtn.Text = "ACTIVE"
+	elseif left > 0 then abilityBtn.Text = "MISSILE " .. math.ceil(left) .. "s"
+	else abilityBtn.Text = "MISSILE (Q)" end
+end)
 
 ---------------------------------------------------------------- map coins (client-side)
 local coinFolder = new("Folder", {Name = "LocalCoins"}, workspace)
@@ -125,7 +217,7 @@ local function spawnCoin()
 	c:SetAttribute("base", hit.Position + Vector3.new(0, 3, 0))
 	table.insert(coinList, c)
 end
-for _ = 1, 12 do spawnCoin() end
+for _ = 1, COIN_COUNT do spawnCoin() end
 
 RS.Heartbeat:Connect(function()
 	local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
@@ -134,25 +226,64 @@ RS.Heartbeat:Connect(function()
 		local c = coinList[i]
 		local base = c:GetAttribute("base")
 		c.CFrame = CFrame.new(base + Vector3.new(0, math.sin(t) * .3, 0)) * CFrame.Angles(0, t, 0)
-		if root and not busy and (root.Position - base).Magnitude < 5 then
+		if root and not busy and not missileBusy and (root.Position - base).Magnitude < 5 then
 			coins += 1
 			refresh()
 			c:Destroy()
 			table.remove(coinList, i)
-			task.delay(12, spawnCoin) -- slow respawn
+			task.delay(COIN_RESPAWN, spawnCoin)
 		end
 	end
 end)
 
+---------------------------------------------------------------- Tung Tung Tung Sahur (3D model)
+local function buildTung(golden)
+	local m = Instance.new("Model")
+	m.Name = "TungSahur"
+	local wood = golden and GOLD or Color3.fromRGB(150, 100, 50)
+	local dark = golden and Color3.fromRGB(230, 170, 20) or Color3.fromRGB(105, 68, 34)
+	local mat = golden and Enum.Material.Metal or Enum.Material.Wood
+	local Cyl, Ball, Block = Enum.PartType.Cylinder, Enum.PartType.Ball, Enum.PartType.Block
+	local function part(shape, size, cf, color, material)
+		return new("Part", {
+			Shape = shape, Size = size, CFrame = cf, Color = color, Material = material or mat,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+	end
+	local up = CFrame.Angles(0, 0, math.pi / 2) -- stands a cylinder upright
+
+	local body = part(Cyl, Vector3.new(8, 3.2, 3.2), up, wood)
+	-- face (front is -Z)
+	for _, s in ipairs({-1, 1}) do
+		part(Ball, Vector3.new(1.2, 1.2, 1.2), CFrame.new(s * .75, 1.6, -1.45), Color3.new(1, 1, 1), Enum.Material.SmoothPlastic)
+		part(Ball, Vector3.new(.55, .55, .55), CFrame.new(s * .75, 1.55, -1.95), Color3.new(0, 0, 0), Enum.Material.SmoothPlastic)
+		-- legs + feet
+		part(Cyl, Vector3.new(3, .6, .6), CFrame.new(s * .8, -5.5, 0) * up, dark)
+		part(Block, Vector3.new(1, .4, 1.6), CFrame.new(s * .8, -7.15, -.3), dark)
+	end
+	part(Block, Vector3.new(1.8, .3, .2), CFrame.new(0, .2, -1.62), Color3.new(0, 0, 0), Enum.Material.SmoothPlastic)
+	-- left arm hangs down
+	part(Cyl, Vector3.new(3.2, .5, .5), CFrame.new(-2.1, .8, 0) * up, dark)
+	part(Ball, Vector3.new(.7, .7, .7), CFrame.new(-2.1, -.8, 0), dark)
+	-- right arm raised, holding the bat
+	part(Cyl, Vector3.new(3.2, .5, .5), CFrame.new(2.1, 1.6, -1) * CFrame.Angles(math.rad(-55), 0, 0) * up, dark)
+	part(Ball, Vector3.new(.7, .7, .7), CFrame.new(2.1, 2.5, -2.3), dark)
+	part(Cyl, Vector3.new(5, .7, .7), CFrame.new(2.1, 4.5, -2.4) * up, golden and GOLD or Color3.fromRGB(190, 145, 85))
+
+	m.WorldPivot = CFrame.new()
+	return m
+end
+
 ---------------------------------------------------------------- summon sequence
 local function summon()
-	if busy then return end
+	if busy or missileBusy then return end
 	local char = lp.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	local root = char and char:FindFirstChild("HumanoidRootPart")
 	if not (hum and root) or hum.Health <= 0 then return end
 	busy = true
 	local price = cost()
+	local super = (summons + 1) % SUPER_EVERY == 0
 
 	-- levitate + freeze
 	hum.WalkSpeed = 0
@@ -164,22 +295,21 @@ local function summon()
 
 	-- Tung Tung Tung Sahur + golden beam
 	local p = (root.CFrame * CFrame.new(0, 0, -12)).Position + Vector3.new(0, 12, 0)
-	local totem = new("Part", {
-		Name = "TungSahur", Size = Vector3.new(1, 1, 1), Transparency = 1, Anchored = true, CanCollide = false, CanTouch = false,
-	}, workspace)
+	local tung = buildTung(super)
+	tung:PivotTo(CFrame.new(p.X, p.Y + 150, p.Z))
+	tung.Parent = workspace
 	local beam = new("Part", {
 		Shape = Enum.PartType.Cylinder, Size = Vector3.new(400, 6, 6), Color = GOLD, Material = Enum.Material.Neon,
-		Transparency = .45, Anchored = true, CanCollide = false, CanTouch = false,
+		Transparency = .45, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
 	}, workspace)
-	local pic = new("BillboardGui", {Size = UDim2.new(12, 0, 14, 0), AlwaysOnTop = false, LightInfluence = 0}, totem)
-	new("ImageLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = TUNG_IMAGE}, pic)
-	local bill = new("BillboardGui", {Size = UDim2.fromOffset(220, 30), StudsOffset = Vector3.new(0, 8.5, 0), AlwaysOnTop = true}, totem)
+	local tag = new("BillboardGui", {Size = UDim2.fromOffset(240, 30), StudsOffset = Vector3.new(0, 7, 0), AlwaysOnTop = true}, tung:FindFirstChildOfClass("Part"))
+	tag.Adornee = tung:FindFirstChildOfClass("Part")
 	new("TextLabel", {
 		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "Tung Tung Tung Sahur", TextColor3 = GOLD,
 		TextStrokeTransparency = 0, TextScaled = true, Font = Enum.Font.GothamBlack,
-	}, bill)
+	}, tag)
 	local function place(y)
-		totem.CFrame = CFrame.new(p.X, y, p.Z) * CFrame.Angles(0, 0, math.pi / 2)
+		tung:PivotTo(CFrame.lookAt(Vector3.new(p.X, y, p.Z), Vector3.new(start.X, y, start.Z)))
 		beam.CFrame = CFrame.new(p.X, y + 200, p.Z) * CFrame.Angles(0, 0, math.pi / 2)
 	end
 	for i = 0, 60 do
@@ -187,15 +317,25 @@ local function summon()
 		task.wait(1 / 40)
 	end
 
-	-- choose buffs
-	pick.esp, pick.speed, pick.jump = false, false, false
-	refreshMenu()
-	menu.Visible = true
-	payEvt.Event:Wait()
-	menu.Visible = false
-	local chosen = {esp = pick.esp, speed = pick.speed, jump = pick.jump}
+	local function cleanup()
+		menu.Visible = false
+		bp:Destroy()
+		tung:Destroy()
+		beam:Destroy()
+		busy = false
+	end
 
-	-- coins come out of the body and fly to Tung Tung
+	-- pick ONE buff
+	refreshMenu(super)
+	menu.Visible = true
+	local died = hum.Died:Connect(function() choiceEvt:Fire(nil) end)
+	local chosen = choiceEvt.Event:Wait()
+	died:Disconnect()
+	menu.Visible = false
+	if not chosen then cleanup() return end
+
+	-- coins come out of the body and fly to Tung
+	local target = tung:GetPivot().Position
 	local pay = math.min(coins, price)
 	for _ = 1, pay do
 		task.spawn(function()
@@ -204,7 +344,7 @@ local function summon()
 				Anchored = true, CanCollide = false, CanTouch = false,
 				CFrame = root.CFrame * CFrame.new(math.random(-10, 10) / 10, math.random(-10, 10) / 10, -1),
 			}, workspace)
-			local tw = TS:Create(coin, TweenInfo.new(.9, Enum.EasingStyle.Back, Enum.EasingDirection.In), {Position = totem.Position})
+			local tw = TS:Create(coin, TweenInfo.new(.9, Enum.EasingStyle.Back, Enum.EasingDirection.In), {Position = target})
 			tw:Play()
 			tw.Completed:Wait()
 			coin:Destroy()
@@ -220,27 +360,45 @@ local function summon()
 		TS:Create(bp, TweenInfo.new(4, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Position = bp.Position + Vector3.new(0, 250, 0)}):Play()
 		task.wait(4)
 		hum.Health = 0
-		bp:Destroy()
-		totem:Destroy()
-		beam:Destroy()
-	else
-		bp:Destroy()
-		totem:Destroy()
-		beam:Destroy()
-		summons += 1
-		if chosen.esp then espTier = math.min(espTier + 1, 4) on.esp = true end
-		if chosen.speed then speedLvl += 1 on.speed = true end
-		if chosen.jump then jumpLvl += 1 on.jump = true end
-		refresh()
-		refreshPanel()
-		applyBuffs()
+		cleanup()
+		return
 	end
-	busy = false
+
+	summons += 1
+	if chosen == "speed" then
+		speedBonus += super and SUPER_SPEED or SPEED_STEP
+		on.speed = true
+	elseif chosen == "jump" then
+		jumpBonus += super and SUPER_JUMP or JUMP_STEP
+		on.jump = true
+	elseif chosen == "esp" then
+		espTier = math.min(espTier + 1, 4)
+		on.esp = true
+	elseif chosen == "missile" then
+		hasMissile = true
+		abilityBtn.Visible = true
+	elseif chosen == "mdur" then
+		missileTime += DUR_STEP
+	elseif chosen == "mspeed" then
+		missileSpeed += MSPEED_STEP
+	elseif chosen == "mcd" then
+		missileCd = math.max(MIN_CD, missileCd - CD_STEP)
+	end
+	refresh()
+	refreshPanel()
+	cleanup()
+	applyBuffs()
 end
 
 local function onChat(text)
 	local s = text:lower():gsub("[^%a%s]", ""):gsub("%s+", " ")
-	if s:match("^%s*(.-)%s*$") == PHRASE then summon() end
+	s = s:match("^%s*(.-)%s*$")
+	if s == PHRASE then
+		summon()
+	elseif s == COIN_PHRASE and (table.find(OWNER_USER_IDS, lp.UserId) or RS:IsStudio()) then
+		coins += COIN_AMOUNT
+		refresh()
+	end
 end
 lp.Chatted:Connect(onChat)
 pcall(function()
@@ -248,6 +406,157 @@ pcall(function()
 		if m.TextSource and m.TextSource.UserId == lp.UserId then onChat(m.Text) end
 	end)
 end)
+
+---------------------------------------------------------------- Missile ability
+local function buildMissile()
+	local m = Instance.new("Model")
+	local function part(shape, size, cf)
+		return new("Part", {
+			Shape = shape, Size = size, CFrame = cf, Color = BLUE, Material = Enum.Material.Neon,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+	end
+	local body = part(Enum.PartType.Cylinder, Vector3.new(6, 1.4, 1.4), CFrame.new())
+	part(Enum.PartType.Ball, Vector3.new(1.4, 1.4, 1.4), CFrame.new(3, 0, 0))
+	part(Enum.PartType.Block, Vector3.new(1.2, .15, 3), CFrame.new(-2.4, 0, 0))
+	part(Enum.PartType.Block, Vector3.new(1.2, 3, .15), CFrame.new(-2.4, 0, 0))
+	m.PrimaryPart = body
+	return m
+end
+
+local function afterimage(missile)
+	local g = missile:Clone()
+	for _, d in ipairs(g:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Transparency = .35
+			TS:Create(d, TweenInfo.new(.7), {Transparency = 1}):Play()
+		end
+	end
+	g.Parent = workspace
+	Debris:AddItem(g, .8)
+end
+
+useMissile = function()
+	if missileBusy or busy or not hasMissile then return end
+	if os.clock() - lastMissile < missileCd then return end
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	missileBusy = true
+
+	-- freeze everyone else (on your screen) and tint the world blue
+	local frozen, tracks = {}, {}
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local c = pl ~= lp and pl.Character
+		if c then
+			local r = c:FindFirstChild("HumanoidRootPart")
+			if r then table.insert(frozen, {root = r, cf = r.CFrame}) end
+			local h = c:FindFirstChildOfClass("Humanoid")
+			local an = h and h:FindFirstChildOfClass("Animator")
+			if an then
+				for _, t in ipairs(an:GetPlayingAnimationTracks()) do
+					t:AdjustSpeed(0)
+					table.insert(tracks, t)
+				end
+			end
+		end
+	end
+	local freezeConn = RS.Heartbeat:Connect(function()
+		for _, f in ipairs(frozen) do
+			if f.root.Parent then
+				f.root.CFrame = f.cf
+				f.root.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+	end)
+	root.Anchored = true
+	tint(true)
+
+	-- planning phase: steer a ghost missile with the camera
+	local missile = buildMissile()
+	local dir = cam.CFrame.LookVector
+	local pos = root.Position + Vector3.new(0, 1.5, 0)
+	missile:PivotTo(CFrame.lookAt(pos, pos + dir) * CFrame.Angles(0, math.pi / 2, 0))
+	missile.Parent = workspace
+	cam.CameraSubject = missile.PrimaryPart
+
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {char, coinFolder}
+	local path = {}
+	local elapsed, acc, lastGhost, hit = 0, 0, 0, false
+	while elapsed < missileTime and not hit do
+		local dt = RS.Heartbeat:Wait()
+		if hum.Health <= 0 then break end
+		elapsed += dt
+		acc += dt
+		while acc >= STEP and not hit do
+			acc -= STEP
+			dir = dir:Lerp(cam.CFrame.LookVector, math.min(1, MISSILE_TURN * STEP)).Unit
+			local move = dir * missileSpeed * STEP
+			if workspace:Raycast(pos, move + dir * 1.5, params) then
+				hit = true
+			else
+				pos += move
+				table.insert(path, {pos = pos, dir = dir})
+			end
+		end
+		missile:PivotTo(CFrame.lookAt(pos, pos + dir) * CFrame.Angles(0, math.pi / 2, 0))
+		if os.clock() - lastGhost > .04 then
+			lastGhost = os.clock()
+			afterimage(missile)
+		end
+	end
+
+	-- back to normal
+	missile:Destroy()
+	cam.CameraSubject = hum
+	freezeConn:Disconnect()
+	for _, t in ipairs(tracks) do pcall(function() t:AdjustSpeed(1) end) end
+	tint(false)
+
+	-- your real body flies the exact path you planned
+	if hum.Health > 0 and #path > 1 then
+		hum.PlatformStand = true
+		-- NOT anchored: the client owns an unanchored character, so its movement replicates and other players see it fly
+		root.Anchored = false
+		local parts = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") and d.CanCollide then table.insert(parts, d) end
+		end
+		local a0 = new("Attachment", {Position = Vector3.new(1.5, 0, 0)}, root)
+		local a1 = new("Attachment", {Position = Vector3.new(-1.5, 0, 0)}, root)
+		local trail = new("Trail", {
+			Attachment0 = a0, Attachment1 = a1, Color = ColorSequence.new(BLUE), LightEmission = 1,
+			Lifetime = .8, Transparency = NumberSequence.new(.2, 1),
+		}, root)
+		local i, acc2 = 1, 0
+		while i <= #path and hum.Health > 0 do
+			acc2 += RS.Heartbeat:Wait()
+			for _, d in ipairs(parts) do d.CanCollide = false end
+			while acc2 >= STEP and i <= #path do
+				acc2 -= STEP
+				local e = path[i]
+				i += 1
+				-- lie flat like a missile: head points along the flight direction
+				root.CFrame = CFrame.lookAt(e.pos, e.pos + e.dir) * CFrame.Angles(-math.pi / 2, 0, 0)
+				root.AssemblyLinearVelocity = e.dir * missileSpeed -- real velocity so it replicates smoothly
+				root.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+		local last = path[#path]
+		local flat = Vector3.new(last.dir.X, 0, last.dir.Z)
+		if flat.Magnitude < .01 then flat = Vector3.new(0, 0, -1) end
+		root.CFrame = CFrame.lookAt(last.pos + Vector3.new(0, 2, 0), last.pos + Vector3.new(0, 2, 0) + flat)
+		root.AssemblyLinearVelocity = Vector3.zero
+		for _, d in ipairs(parts) do d.CanCollide = true end
+		hum.PlatformStand = false
+		task.delay(1, function() trail:Destroy() a0:Destroy() a1:Destroy() end)
+	end
+	root.Anchored = false
+	lastMissile = os.clock()
+	missileBusy = false
+end
 
 ---------------------------------------------------------------- ESP (blue)
 local esp = {}
@@ -268,10 +577,13 @@ local function build(p, c)
 		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = p.DisplayName, TextColor3 = BLUE,
 		TextStrokeTransparency = 0, TextScaled = true, Font = Enum.Font.GothamBold,
 	}, bill)
-	local arrow = new("TextLabel", {
-		Size = UDim2.fromOffset(30, 30), AnchorPoint = Vector2.new(.5, .5), BackgroundTransparency = 1,
-		Text = "▲", TextColor3 = BLUE, TextSize = 28, Visible = false,
+	local arrow = new("Frame", {
+		Size = UDim2.fromOffset(22, 22), AnchorPoint = Vector2.new(.5, .5), BackgroundColor3 = BLUE, Visible = false,
 	}, gui)
+	new("UICorner", {CornerRadius = UDim.new(1, 0)}, arrow)
+	local tip = new("Frame", {
+		Size = UDim2.fromOffset(8, 14), Position = UDim2.new(.5, -4, 0, -10), BackgroundColor3 = BLUE, BorderSizePixel = 0,
+	}, arrow)
 	return {hl = hl, bill = bill, arrow = arrow, char = c}
 end
 
