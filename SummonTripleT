@@ -1,0 +1,316 @@
+-- LocalScript: put in StarterPlayer > StarterPlayerScripts
+-- Say the phrase in chat -> levitate -> Tung Tung Tung Sahur drops in on a golden beam
+-- -> pick buffs -> coins fly out of your body to pay. Not enough coins = you die.
+
+local Players = game:GetService("Players")
+local RS = game:GetService("RunService")
+local TS = game:GetService("TweenService")
+local TCS = game:GetService("TextChatService")
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+-- Upload your Tung Tung Tung Sahur PNG to Roblox (Creator Hub > Assets > Decal/Image),
+-- then paste its ID here:
+local TUNG_IMAGE = "rbxassetid://72939506872420"
+
+local PHRASE = "tung tung are you there take my money if you dare"
+local BLUE = Color3.fromRGB(0, 140, 255)
+local GOLD = Color3.fromRGB(255, 200, 40)
+local TIERS = {"ESP", "ESP + Names", "ESP + Chams", "ESP + Arrows"}
+
+local coins, summons = 0, 0
+local espTier, speedLvl, jumpLvl = 0, 0, 0
+local on = {esp = false, speed = false, jump = false}
+local busy = false
+
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+
+local function cost() return 5 * (summons + 1) end
+
+---------------------------------------------------------------- UI
+local gui = new("ScreenGui", {Name = "TungUI", ResetOnSpawn = false, IgnoreGuiInset = true}, lp:WaitForChild("PlayerGui"))
+
+local counter = new("TextLabel", {
+	AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 16, 1, -16), Size = UDim2.fromOffset(300, 40),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = .35, TextColor3 = GOLD,
+	Font = Enum.Font.GothamBold, TextSize = 20,
+}, gui)
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, counter)
+
+local function refresh() counter.Text = "🪙 " .. coins .. "   |   Next summon: " .. cost() end
+refresh()
+
+local function button(parent, text, y)
+	local b = new("TextButton", {
+		Size = UDim2.new(1, -16, 0, 40), Position = UDim2.new(0, 8, 0, y), Text = text,
+		BackgroundColor3 = Color3.fromRGB(40, 40, 40), TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 16,
+	}, parent)
+	new("UICorner", {CornerRadius = UDim.new(0, 8)}, b)
+	return b
+end
+
+-- buff pick menu (shown while floating)
+local menu = new("Frame", {
+	AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .45), Size = UDim2.fromOffset(280, 230),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 20), Visible = false,
+}, gui)
+new("UICorner", {CornerRadius = UDim.new(0, 12)}, menu)
+local pick = {esp = false, speed = false, jump = false}
+local bEsp, bSpeed, bJump = button(menu, "", 10), button(menu, "", 58), button(menu, "", 106)
+local bPay = button(menu, "PAY", 170)
+bPay.BackgroundColor3 = Color3.fromRGB(180, 130, 0)
+local payEvt = Instance.new("BindableEvent")
+
+local function refreshMenu()
+	bEsp.Text = (pick.esp and "✅ " or "⬜ ") .. TIERS[math.min(espTier + 1, 4)]
+	bSpeed.Text = (pick.speed and "✅ " or "⬜ ") .. "Speed buff"
+	bJump.Text = (pick.jump and "✅ " or "⬜ ") .. "Jump buff"
+	bPay.Text = "PAY " .. cost() .. " COINS"
+end
+bEsp.MouseButton1Click:Connect(function() pick.esp = not pick.esp refreshMenu() end)
+bSpeed.MouseButton1Click:Connect(function() pick.speed = not pick.speed refreshMenu() end)
+bJump.MouseButton1Click:Connect(function() pick.jump = not pick.jump refreshMenu() end)
+bPay.MouseButton1Click:Connect(function()
+	if pick.esp or pick.speed or pick.jump then payEvt:Fire() end
+end)
+
+-- toggle panel
+local panel = new("Frame", {
+	Position = UDim2.new(0, 10, .5, -80), Size = UDim2.fromOffset(150, 160),
+	BackgroundTransparency = 1, Visible = false,
+}, gui)
+local tEsp, tSpeed, tJump = button(panel, "", 0), button(panel, "", 48), button(panel, "", 96)
+local function refreshPanel()
+	tEsp.Text = "ESP: " .. (on.esp and "ON" or "OFF")
+	tSpeed.Text = "Speed: " .. (on.speed and "ON" or "OFF")
+	tJump.Text = "Jump: " .. (on.jump and "ON" or "OFF")
+	tEsp.Visible, tSpeed.Visible, tJump.Visible = espTier > 0, speedLvl > 0, jumpLvl > 0
+	panel.Visible = espTier > 0 or speedLvl > 0 or jumpLvl > 0
+end
+
+local function applyBuffs()
+	local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	hum.UseJumpPower = true
+	hum.WalkSpeed = on.speed and (16 + 8 * speedLvl) or 16
+	hum.JumpPower = on.jump and (50 + 15 * jumpLvl) or 50
+end
+tEsp.MouseButton1Click:Connect(function() on.esp = not on.esp refreshPanel() end)
+tSpeed.MouseButton1Click:Connect(function() on.speed = not on.speed refreshPanel() applyBuffs() end)
+tJump.MouseButton1Click:Connect(function() on.jump = not on.jump refreshPanel() applyBuffs() end)
+lp.CharacterAdded:Connect(function() task.wait(.5) applyBuffs() end)
+
+---------------------------------------------------------------- map coins (client-side)
+local coinFolder = new("Folder", {Name = "LocalCoins"}, workspace)
+local coinList = {}
+
+local function spawnCoin()
+	local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	local origin = root.Position + Vector3.new(math.random(-150, 150), 100, math.random(-150, 150))
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {lp.Character, coinFolder}
+	local hit = workspace:Raycast(origin, Vector3.new(0, -300, 0), params)
+	if not hit then return end
+	local c = new("Part", {
+		Shape = Enum.PartType.Cylinder, Size = Vector3.new(.3, 2, 2), Color = GOLD, Material = Enum.Material.Metal,
+		Anchored = true, CanCollide = false, CanTouch = false,
+	}, coinFolder)
+	c:SetAttribute("base", hit.Position + Vector3.new(0, 3, 0))
+	table.insert(coinList, c)
+end
+for _ = 1, 12 do spawnCoin() end
+
+RS.Heartbeat:Connect(function()
+	local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	local t = os.clock() * 2
+	for i = #coinList, 1, -1 do
+		local c = coinList[i]
+		local base = c:GetAttribute("base")
+		c.CFrame = CFrame.new(base + Vector3.new(0, math.sin(t) * .3, 0)) * CFrame.Angles(0, t, 0)
+		if root and not busy and (root.Position - base).Magnitude < 5 then
+			coins += 1
+			refresh()
+			c:Destroy()
+			table.remove(coinList, i)
+			task.delay(12, spawnCoin) -- slow respawn
+		end
+	end
+end)
+
+---------------------------------------------------------------- summon sequence
+local function summon()
+	if busy then return end
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	busy = true
+	local price = cost()
+
+	-- levitate + freeze
+	hum.WalkSpeed = 0
+	hum.UseJumpPower = true
+	hum.JumpPower = 0
+	local start = root.Position
+	local bp = new("BodyPosition", {MaxForce = Vector3.new(1e6, 1e6, 1e6), P = 3000, D = 500, Position = start}, root)
+	TS:Create(bp, TweenInfo.new(2), {Position = start + Vector3.new(0, 8, 0)}):Play()
+
+	-- Tung Tung Tung Sahur + golden beam
+	local p = (root.CFrame * CFrame.new(0, 0, -12)).Position + Vector3.new(0, 12, 0)
+	local totem = new("Part", {
+		Name = "TungSahur", Size = Vector3.new(1, 1, 1), Transparency = 1, Anchored = true, CanCollide = false, CanTouch = false,
+	}, workspace)
+	local beam = new("Part", {
+		Shape = Enum.PartType.Cylinder, Size = Vector3.new(400, 6, 6), Color = GOLD, Material = Enum.Material.Neon,
+		Transparency = .45, Anchored = true, CanCollide = false, CanTouch = false,
+	}, workspace)
+	local pic = new("BillboardGui", {Size = UDim2.new(12, 0, 14, 0), AlwaysOnTop = false, LightInfluence = 0}, totem)
+	new("ImageLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = TUNG_IMAGE}, pic)
+	local bill = new("BillboardGui", {Size = UDim2.fromOffset(220, 30), StudsOffset = Vector3.new(0, 8.5, 0), AlwaysOnTop = true}, totem)
+	new("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "Tung Tung Tung Sahur", TextColor3 = GOLD,
+		TextStrokeTransparency = 0, TextScaled = true, Font = Enum.Font.GothamBlack,
+	}, bill)
+	local function place(y)
+		totem.CFrame = CFrame.new(p.X, y, p.Z) * CFrame.Angles(0, 0, math.pi / 2)
+		beam.CFrame = CFrame.new(p.X, y + 200, p.Z) * CFrame.Angles(0, 0, math.pi / 2)
+	end
+	for i = 0, 60 do
+		place(p.Y + 150 * (1 - i / 60) ^ 2)
+		task.wait(1 / 40)
+	end
+
+	-- choose buffs
+	pick.esp, pick.speed, pick.jump = false, false, false
+	refreshMenu()
+	menu.Visible = true
+	payEvt.Event:Wait()
+	menu.Visible = false
+	local chosen = {esp = pick.esp, speed = pick.speed, jump = pick.jump}
+
+	-- coins come out of the body and fly to Tung Tung
+	local pay = math.min(coins, price)
+	for _ = 1, pay do
+		task.spawn(function()
+			local coin = new("Part", {
+				Shape = Enum.PartType.Cylinder, Size = Vector3.new(.3, 2, 2), Color = GOLD, Material = Enum.Material.Metal,
+				Anchored = true, CanCollide = false, CanTouch = false,
+				CFrame = root.CFrame * CFrame.new(math.random(-10, 10) / 10, math.random(-10, 10) / 10, -1),
+			}, workspace)
+			local tw = TS:Create(coin, TweenInfo.new(.9, Enum.EasingStyle.Back, Enum.EasingDirection.In), {Position = totem.Position})
+			tw:Play()
+			tw.Completed:Wait()
+			coin:Destroy()
+		end)
+		coins -= 1
+		refresh()
+		task.wait(.12)
+	end
+	task.wait(1)
+
+	if pay < price then
+		-- couldn't afford it: drift far up into the sky, then die
+		TS:Create(bp, TweenInfo.new(4, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Position = bp.Position + Vector3.new(0, 250, 0)}):Play()
+		task.wait(4)
+		hum.Health = 0
+		bp:Destroy()
+		totem:Destroy()
+		beam:Destroy()
+	else
+		bp:Destroy()
+		totem:Destroy()
+		beam:Destroy()
+		summons += 1
+		if chosen.esp then espTier = math.min(espTier + 1, 4) on.esp = true end
+		if chosen.speed then speedLvl += 1 on.speed = true end
+		if chosen.jump then jumpLvl += 1 on.jump = true end
+		refresh()
+		refreshPanel()
+		applyBuffs()
+	end
+	busy = false
+end
+
+local function onChat(text)
+	local s = text:lower():gsub("[^%a%s]", ""):gsub("%s+", " ")
+	if s:match("^%s*(.-)%s*$") == PHRASE then summon() end
+end
+lp.Chatted:Connect(onChat)
+pcall(function()
+	TCS.MessageReceived:Connect(function(m)
+		if m.TextSource and m.TextSource.UserId == lp.UserId then onChat(m.Text) end
+	end)
+end)
+
+---------------------------------------------------------------- ESP (blue)
+local esp = {}
+local function destroyRec(rec)
+	if rec then rec.hl:Destroy() rec.bill:Destroy() rec.arrow:Destroy() end
+end
+
+local function build(p, c)
+	local hl = new("Highlight", {
+		Adornee = c, OutlineColor = BLUE, FillColor = BLUE,
+		DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Enabled = false,
+	}, c)
+	local bill = new("BillboardGui", {
+		Adornee = c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart"),
+		Size = UDim2.fromOffset(120, 24), StudsOffset = Vector3.new(0, 2.5, 0), AlwaysOnTop = true, Enabled = false,
+	}, c)
+	new("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = p.DisplayName, TextColor3 = BLUE,
+		TextStrokeTransparency = 0, TextScaled = true, Font = Enum.Font.GothamBold,
+	}, bill)
+	local arrow = new("TextLabel", {
+		Size = UDim2.fromOffset(30, 30), AnchorPoint = Vector2.new(.5, .5), BackgroundTransparency = 1,
+		Text = "▲", TextColor3 = BLUE, TextSize = 28, Visible = false,
+	}, gui)
+	return {hl = hl, bill = bill, arrow = arrow, char = c}
+end
+
+Players.PlayerRemoving:Connect(function(p) destroyRec(esp[p]) esp[p] = nil end)
+
+RS.RenderStepped:Connect(function()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= lp then
+			local c = p.Character
+			local rec = esp[p]
+			if rec and rec.char ~= c then destroyRec(rec) rec = nil esp[p] = nil end
+			if c and not rec and c:FindFirstChild("HumanoidRootPart") then
+				rec = build(p, c)
+				esp[p] = rec
+			end
+			if rec then
+				local show = on.esp and espTier >= 1
+				rec.hl.Enabled = show
+				rec.hl.FillTransparency = espTier >= 3 and .5 or 1 -- chams at tier 3
+				rec.bill.Enabled = show and espTier >= 2         -- names at tier 2
+				local arrowShow = false
+				if show and espTier >= 4 then                     -- offscreen arrows at tier 4
+					local v, onScreen = cam:WorldToViewportPoint(c.HumanoidRootPart.Position)
+					if not onScreen then
+						local vs = cam.ViewportSize
+						local center = vs / 2
+						local dir = Vector2.new(v.X, v.Y) - center
+						if v.Z < 0 then dir = -dir end
+						if dir.Magnitude > 0 then
+							dir = dir.Unit
+							local r = math.min(vs.X, vs.Y) / 2 - 40
+							rec.arrow.Position = UDim2.fromOffset(center.X + dir.X * r, center.Y + dir.Y * r)
+							rec.arrow.Rotation = math.deg(math.atan2(dir.Y, dir.X)) + 90
+							arrowShow = true
+						end
+					end
+				end
+				rec.arrow.Visible = arrowShow
+			end
+		end
+	end
+end)
