@@ -47,8 +47,6 @@ local coins, summons = 0, 0
 local speedBonus, jumpBonus, espTier = 0, 0, 0
 local hasMissile, hasPhase = false, false
 local hasSpiritBuff, hasSpiritSwitch = false, false
-local inSpirit, spiritModel = false, nil
-local spiritPath, spiritLastPos = {}, nil
 local missileTime, missileSpeed, missileCd = BASE_MTIME, BASE_MSPEED, BASE_MCD
 local hasDouble, hasTriple, hasGlide, hasMulti, hasMagnet = false, false, false, false, false
 local mercy = 0
@@ -106,6 +104,7 @@ local function itemPrice(key, super)
 end
 
 local useMissile, startGlide, stopGlide, sync, refreshAdmin, spawnBabies, enterSpirit, exitSpirit
+local spiritBtn
 
 local function grant(key, super)
 	if key == "djump" or key == "tjump" then key = "mjump" end
@@ -1135,7 +1134,7 @@ startGlide = function()
 end
 
 -- meter recharge, jump bookkeeping, button labels
-local spiritBtn = new("TextButton", {
+spiritBtn = new("TextButton", {
 	AnchorPoint = Vector2.new(1, .5), Position = UDim2.new(1, -16, .5, -150), Size = UDim2.fromOffset(130, 52),
 	BackgroundColor3 = Color3.fromRGB(60, 0, 140), TextColor3 = Color3.new(1, 1, 1),
 	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false, Text = "SPIRIT (E)",
@@ -1184,93 +1183,153 @@ RS.Heartbeat:Connect(function(dt)
 end)
 
 ---------------------------------------------------------------- Spirit ability
+-- Approach: real character IS the spirit (translucent, noclip). A frozen clone is left behind.
+-- On exit: character reverses its own path back to the clone position.
 local SPIRIT_SPEED_MOVE = 25
-local MAGE_ANIMS={idle="rbxassetid://8135192992",walk="rbxassetid://8135144928",run="rbxassetid://8135152562",jump="rbxassetid://8135160862",fall="rbxassetid://8135167869"}
-local function spiritPulse(pos,norm)
-	local r=new("Part",{Shape=Enum.PartType.Cylinder,Size=Vector3.new(.12,.7,.7),Color=BLUE,Material=Enum.Material.Neon,Anchored=true,CanCollide=false,CanTouch=false,CanQuery=false,Transparency=.15,CFrame=CFrame.lookAt(pos,pos+(norm or Vector3.yAxis))*CFrame.Angles(math.pi/2,0,0)},workspace)
-	TS:Create(r,TweenInfo.new(.5,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Size=Vector3.new(.08,8,8),Transparency=1}):Play()
-	Debris:AddItem(r,.6)
-end
-enterSpirit=function(jumpBack)
-	if inSpirit or busy or missileBusy or gliding then return end
-	local char=lp.Character; local hum=char and char:FindFirstChildOfClass("Humanoid"); local root=char and char:FindFirstChild("HumanoidRootPart")
-	if not(hum and root) or hum.Health<=0 then return end
-	inSpirit=true; spiritPath={}; spiritBtn.Text="EXIT (E)"; tint(true)
-	hum.WalkSpeed=0; hum.JumpPower=0; root.Anchored=true
-	local ghost=Instance.new("Model"); ghost.Name="SpiritGhost"; local gr
-	for _,p in ipairs(char:GetDescendants()) do
-		if p:IsA("BasePart") and not(p.Parent:IsA("Accessory") or p.Parent:IsA("Tool")) then
-			local gp=p:Clone(); gp.Transparency=.5; gp.Color=Color3.fromRGB(160,190,255); gp.Material=Enum.Material.Neon
-			gp.CanCollide=false; gp.CanTouch=false; gp.CanQuery=false; gp.CastShadow=false; gp.Parent=ghost
-			if p.Name=="HumanoidRootPart" then gr=gp end
-		end
-	end
-	if not gr then inSpirit=false; root.Anchored=false; tint(false); spiritBtn.Text="SPIRIT (E)"; return end
-	for _,gp in ipairs(ghost:GetDescendants()) do
-		if gp:IsA("BasePart") and gp~=gr then new("WeldConstraint",{Part0=gr,Part1=gp},gr) end
-	end
-	gr.CFrame=jumpBack and spiritLastPos and CFrame.new(spiritLastPos) or root.CFrame
-	ghost.Parent=workspace; spiritModel=ghost
-	task.spawn(function()
-		pcall(function()
-			local gh=new("Humanoid",{WalkSpeed=0,JumpPower=0,HealthDisplayDistance=0,NameDisplayDistance=0},ghost)
-			local ga=new("Animator",{},gh)
-			for _,id in pairs(MAGE_ANIMS) do pcall(function() ga:LoadAnimation(new("Animation",{AnimationId=id})):Play() end) end
-		end)
-	end)
-	cam.CameraSubject=gr
-	local bv=new("BodyVelocity",{MaxForce=Vector3.new(1e6,1e6,1e6),Velocity=Vector3.zero,P=9000},gr)
-	local overlapLast={}; local conn4
-	conn4=RS.Heartbeat:Connect(function()
-		if not inSpirit then conn4:Disconnect() return end
-		local mv=Vector3.zero; local lcf=cam.CFrame
-		local fwd2=Vector3.new(lcf.LookVector.X,0,lcf.LookVector.Z); local rgt2=Vector3.new(lcf.RightVector.X,0,lcf.RightVector.Z)
-		if fwd2.Magnitude>.01 then fwd2=fwd2.Unit end; if rgt2.Magnitude>.01 then rgt2=rgt2.Unit end
-		if UIS:IsKeyDown(Enum.KeyCode.W) then mv+=fwd2 end; if UIS:IsKeyDown(Enum.KeyCode.S) then mv-=fwd2 end
-		if UIS:IsKeyDown(Enum.KeyCode.A) then mv-=rgt2 end; if UIS:IsKeyDown(Enum.KeyCode.D) then mv+=rgt2 end
-		if UIS:IsKeyDown(Enum.KeyCode.Space) then mv+=Vector3.yAxis end
-		if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then mv-=Vector3.yAxis end
-		bv.Velocity=mv.Magnitude>.01 and mv.Unit*SPIRIT_SPEED_MOVE or Vector3.zero
-		if mv.Magnitude>.01 then gr.CFrame=CFrame.lookAt(gr.Position,gr.Position+mv*Vector3.new(1,0,1)) end
-		local op2=OverlapParams.new(); op2.FilterDescendantsInstances={char,ghost,coinFolder}
-		local nowO={}
-		for _,p2 in ipairs(workspace:GetPartBoundsInBox(gr.CFrame,gr.Size*2,op2)) do
-			nowO[p2]=true
-			if not overlapLast[p2] then
-				local rp2=RaycastParams.new(); rp2.FilterDescendantsInstances={char,ghost,coinFolder}
-				local hit2=workspace:Raycast(gr.Position,(p2.Position-gr.Position).Unit*8,rp2)
-				spiritPulse(hit2 and hit2.Position or gr.Position, hit2 and hit2.Normal)
-			end
-		end
-		overlapLast=nowO
-		table.insert(spiritPath,{pos=gr.Position})
-	end)
-end
-exitSpirit=function(force,instantSwap)
-	if not inSpirit then return end
-	inSpirit=false; spiritBtn.Text="SPIRIT (E)"; tint(false)
-	local char=lp.Character; local hum=char and char:FindFirstChildOfClass("Humanoid"); local root=char and char:FindFirstChild("HumanoidRootPart")
-	if spiritModel then
-		local sr=spiritModel:FindFirstChild("HumanoidRootPart"); spiritLastPos=sr and sr.Position or spiritLastPos
-		spiritModel:Destroy(); spiritModel=nil
-	end
-	if not(hum and root) then return end
-	root.Anchored=false
-	if force or #spiritPath==0 then cam.CameraSubject=hum; applyBuffs(); return end
-	if instantSwap then cam.CameraSubject=hum; applyBuffs(); return end
-	hum.WalkSpeed=0; hum.JumpPower=0; tint(true)
-	local a0=new("Attachment",{},root); local a1=new("Attachment",{Position=Vector3.new(1.5,0,0)},root)
-	local tr=new("Trail",{Attachment0=a0,Attachment1=a1,Color=ColorSequence.new(BLUE),LightEmission=1,Lifetime=.5,Transparency=NumberSequence.new(.3,1)},root)
-	cam.CameraSubject=root
-	local rev={}; for i=#spiritPath,1,-1 do rev[#rev+1]=spiritPath[i] end
-	local acc3,idx3=0,1; local conn5
-	conn5=RS.Heartbeat:Connect(function(dt2)
-		acc3+=dt2
-		while acc3>=STEP and idx3<=#rev do acc3-=STEP; root.CFrame=CFrame.new(rev[idx3].pos); root.AssemblyLinearVelocity=Vector3.zero; idx3+=1 end
-		if idx3>#rev then conn5:Disconnect(); tr:Destroy(); a0:Destroy(); a1:Destroy(); tint(false); cam.CameraSubject=hum; applyBuffs() end
-	end)
+-- R15 Mage animation IDs (may not load on R6, that is fine):
+local MAGE_ANIMS = {idle="rbxassetid://8135192992",walk="rbxassetid://8135144928",run="rbxassetid://8135152562",jump="rbxassetid://8135160862",fall="rbxassetid://8135167869"}
+
+local spiritFrozen = nil
+local spiritConn = nil    -- single cleanup closure
+local spiritPath = {}
+local spiritLastPos = nil
+local inSpirit = false
+
+local function spiritPulse(pos, norm)
+	local r = new("Part", {Shape=Enum.PartType.Cylinder, Size=Vector3.new(.12,.7,.7), Color=BLUE,
+		Material=Enum.Material.Neon, Anchored=true, CanCollide=false, CanTouch=false, CanQuery=false,
+		Transparency=.15, CFrame=CFrame.lookAt(pos,pos+(norm or Vector3.yAxis))*CFrame.Angles(math.pi/2,0,0)}, workspace)
+	TS:Create(r, TweenInfo.new(.5,Enum.EasingStyle.Quad,Enum.EasingDirection.Out), {Size=Vector3.new(.08,8,8),Transparency=1}):Play()
+	Debris:AddItem(r, .6)
 end
 
+enterSpirit = function(jumpBack)
+	if inSpirit or busy or missileBusy or gliding then return end
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	inSpirit = true; spiritPath = {}; spiritBtn.Text = "EXIT (E)"; tint(true)
+
+	-- Everything below can fail on an unusual character; if it does, roll back instead of leaving
+	-- you stuck with a blue screen and no spirit.
+	local ok, err = pcall(function()
+		-- teleport to saved position if re-entering
+		if jumpBack and spiritLastPos then root.CFrame = CFrame.new(spiritLastPos) end
+
+		-- leave a frozen clone of the character at the current position (with accessories, looks normal)
+		local okClone, clone = pcall(function() return char:Clone() end)
+		if okClone and clone then
+			for _, d in ipairs(clone:GetDescendants()) do
+				pcall(function()
+					if d:IsA("BasePart") then d.Anchored = true; d.CanCollide = false; d.CanTouch = false; d.CanQuery = false end
+					if d:IsA("BaseScript") or d:IsA("Animator") or d:IsA("AnimationController") then d:Destroy() end
+				end)
+			end
+			clone.Parent = workspace
+			spiritFrozen = clone
+		end -- if cloning fails, we just skip the frozen decoy and continue with the spirit itself
+
+		-- detach accessories so the spirit has no hats
+		local removedAccs = {}
+		for _, a in ipairs(char:GetChildren()) do
+			if a:IsA("Accessory") then a.Parent = nil; table.insert(removedAccs, a) end
+		end
+
+		-- save appearance and make spirit translucent + blue
+		local saved = {}
+		for _, p in ipairs(char:GetDescendants()) do
+			if p:IsA("BasePart") then
+				saved[p] = {t=p.Transparency, c=p.Color, s=p.CastShadow}
+				if p.Name ~= "HumanoidRootPart" then p.Transparency = .55; p.Color = Color3.fromRGB(150,180,255) end
+				p.CastShadow = false
+			end
+		end
+		local glow = new("Highlight", {Adornee=char, FillColor=BLUE, OutlineColor=BLUE,
+			FillTransparency=.65, OutlineTransparency=.1, DepthMode=Enum.HighlightDepthMode.AlwaysOnTop}, char)
+
+		-- try mage animations (fine if these animation ids don't load)
+		pcall(function()
+			local anim = hum:FindFirstChildOfClass("Animator")
+			if anim then
+				for _, id in pairs(MAGE_ANIMS) do pcall(function() anim:LoadAnimation(new("Animation",{AnimationId=id})):Play() end) end
+			end
+		end)
+
+		hum.WalkSpeed = SPIRIT_SPEED_MOVE; hum.UseJumpPower = true; hum.JumpPower = 50
+
+		-- noclip every frame (lets you walk through walls but Humanoid still handles floor)
+		local noclip = RS.Heartbeat:Connect(function()
+			for _, p in ipairs(char:GetDescendants()) do
+				if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+			end
+		end)
+
+		-- record path and spawn pulses when walking into objects
+		local lastP = root.Position
+		local record = RS.Heartbeat:Connect(function()
+			if not inSpirit then return end
+			table.insert(spiritPath, root.CFrame)
+			local move = root.Position - lastP
+			if move.Magnitude > 0.05 then
+				local rp = RaycastParams.new(); rp.FilterDescendantsInstances = {char, coinFolder}
+				local hit = workspace:Raycast(lastP, move * 3, rp)
+				if hit then spiritPulse(hit.Position, hit.Normal) end
+			end
+			lastP = root.Position
+		end)
+
+		-- cleanup function: restores everything
+		spiritConn = function()
+			pcall(function() noclip:Disconnect() end)
+			pcall(function() record:Disconnect() end)
+			for _, a in ipairs(removedAccs) do pcall(function() a.Parent = char end) end
+			for p, v in pairs(saved) do
+				pcall(function() if p and p.Parent then p.Transparency=v.t; p.Color=v.c; p.CastShadow=v.s end end)
+			end
+			pcall(function() glow:Destroy() end)
+			if spiritFrozen then spiritFrozen:Destroy(); spiritFrozen = nil end
+			spiritConn = nil
+			applyBuffs()
+		end
+	end)
+
+	if not ok then
+		warn("[TungSahur] Spirit failed to start: " .. tostring(err))
+		inSpirit = false; tint(false); spiritBtn.Text = "SPIRIT (E)"
+		if spiritFrozen then spiritFrozen:Destroy(); spiritFrozen = nil end
+		applyBuffs()
+	end
+end
+
+exitSpirit = function(died, instantSwap)
+	if not inSpirit then return end
+	inSpirit = false; tint(false); spiritBtn.Text = "SPIRIT (E)"
+	local char = lp.Character; local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if died or not spiritConn then if spiritConn then spiritConn() end return end
+	if instantSwap then
+		if root then spiritLastPos = root.Position end
+		if spiritConn then spiritConn() end; return
+	end
+	if not (hum and root) or #spiritPath == 0 then if spiritConn then spiritConn() end return end
+	hum.WalkSpeed = 0; hum.JumpPower = 0; tint(true)
+	-- blue trail
+	local a0 = new("Attachment",{},root); local a1 = new("Attachment",{Position=Vector3.new(1.5,0,0)},root)
+	local tr = new("Trail",{Attachment0=a0,Attachment1=a1,Color=ColorSequence.new(BLUE),LightEmission=1,Lifetime=.5,Transparency=NumberSequence.new(.3,1)},root)
+	-- sample path so reversal takes ~2s regardless of how far you went
+	local rev = {}; for i = #spiritPath,1,-1 do rev[#rev+1] = spiritPath[i] end
+	local skip = math.max(1, math.floor(#rev/60)); local sampled = {}
+	for i=1,#rev,skip do sampled[#sampled+1]=rev[i] end
+	local idx, conn = 1
+	conn = RS.Heartbeat:Connect(function()
+		if idx > #sampled then
+			conn:Disconnect(); tr:Destroy(); a0:Destroy(); a1:Destroy(); tint(false)
+			if spiritConn then spiritConn() end; return
+		end
+		root.CFrame = sampled[idx]; root.AssemblyLinearVelocity = Vector3.zero; idx += 1
+	end)
+end
 
 ---------------------------------------------------------------- ESP (blue)
 local esp = {}
