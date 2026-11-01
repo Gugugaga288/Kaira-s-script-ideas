@@ -46,12 +46,15 @@ local TIERS = {"ESP", "ESP + Names", "ESP + Chams", "ESP + Arrows"}
 local coins, summons = 0, 0
 local speedBonus, jumpBonus, espTier = 0, 0, 0
 local hasMissile, hasPhase = false, false
+local hasSpiritBuff, hasSpiritSwitch = false, false
+local inSpirit, spiritModel = false, nil
+local spiritPath, spiritLastPos = {}, nil
 local missileTime, missileSpeed, missileCd = BASE_MTIME, BASE_MSPEED, BASE_MCD
 local hasDouble, hasTriple, hasGlide, hasMulti, hasMagnet = false, false, false, false, false
 local mercy = 0
 local on = {
 	speed = false, jump = false, esp = false, mdur = false, mspeed = false, mcd = false,
-	mphase = false, mjump = false, glide = false, magnet = false, gdur = false,
+	mphase = false, mjump = false, glide = false, magnet = false, gdur = false, spirit = false, spiritswitch = false,
 }
 local busy, missileBusy, gliding = false, false, false
 local lastMissile = -100
@@ -62,10 +65,10 @@ local coinTarget, coinRespawn = COIN_COUNT, COIN_RESPAWN
 -- how many times each buff has been bought (the shop and the admin panel both go through grant/revoke)
 local lv = {
 	speed = 0, jump = 0, esp = 0, missile = 0, mdur = 0, mspeed = 0, mcd = 0, mphase = 0,
-	mjump = 0, glide = 0, gdur = 0, magnet = 0, multi = 0, mercy = 0,
+	mjump = 0, glide = 0, gdur = 0, magnet = 0, multi = 0, mercy = 0, spirit = 0, spiritswitch = 0,
 }
 local speedSteps, jumpSteps = {}, {}
-local CAP = {esp = 4, missile = 1, mphase = 1, mjump = 2, glide = 1, magnet = 1, multi = 1, mcd = math.floor((BASE_MCD - MIN_CD) / CD_STEP)}
+local CAP = {esp = 4, missile = 1, mphase = 1, mjump = 2, glide = 1, magnet = 1, multi = 1, spirit = 1, spiritswitch = 1, mcd = math.floor((BASE_MCD - MIN_CD) / CD_STEP)}
 local airTime, jumpsUsed, lastExtraJump = 0, 0, 0
 
 -- effective values (a buff only counts while its toggle is ON)
@@ -92,6 +95,7 @@ local function cost() return 5 * (summons + 1) end -- the summon fee
 local PRICES = {
 	speed = {2, 1}, jump = {2, 1}, esp = {3, 2}, mdur = {3, 2}, mspeed = {3, 2}, mcd = {4, 2}, mphase = {8, 0},
 	mjump = {2, 3}, gdur = {3, 2}, glide = {10, 0}, missile = {12, 0}, multi = {10, 0}, magnet = {8, 0}, mercy = {8, 4},
+	spirit = {15, 0}, spiritswitch = {6, 0},
 }
 local SUPER_PRICES = {speed = {6, 3}, jump = {6, 3}} -- super speed/jump are pricier
 local function itemPrice(key, super)
@@ -101,7 +105,7 @@ local function itemPrice(key, super)
 	return p[1] + p[2] * (lv[key] or 0)
 end
 
-local useMissile, startGlide, stopGlide, sync, refreshAdmin, spawnBabies
+local useMissile, startGlide, stopGlide, sync, refreshAdmin, spawnBabies, enterSpirit, exitSpirit
 
 local function grant(key, super)
 	if key == "djump" or key == "tjump" then key = "mjump" end
@@ -199,6 +203,13 @@ local scroll = new("ScrollingFrame", {
 }, menu)
 new("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, scroll)
 local choiceEvt = Instance.new("BindableEvent")
+local cancelBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(.5, 1), Position = UDim2.new(.5, 0, 1, -8), Size = UDim2.new(1, -16, 0, 36),
+	Text = "Cancel (leave without paying)", BackgroundColor3 = Color3.fromRGB(100, 30, 30),
+	TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14, Visible = false,
+}, menu)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, cancelBtn)
+cancelBtn.MouseButton1Click:Connect(function() choiceEvt:Fire("cancel") end)
 local menuButtons = {}
 
 local function options(super)
@@ -212,11 +223,13 @@ local function options(super)
 		if not hasMulti then add("multi", "Coin Multiplier (x2)")
 		elseif not hasMagnet then add("magnet", "Coin Magnet") end
 		if not hasGlide then add("glide", "Glide") end
+		if not hasSpiritBuff then add("spirit", "Spirit Ability") end
 		if hasDouble and not hasTriple then add("tjump", "Triple Jump") end
 	else
 		add("speed", "Speed (+" .. SPEED_STEP .. ")")
 		add("jump", "Jump (+" .. JUMP_STEP .. ")")
 		if espTier < 4 then add("esp", TIERS[espTier + 1]) end
+		if hasSpiritBuff and not hasSpiritSwitch then add("spiritswitch", "Spirit Switch") end
 		if hasMissile then
 			add("mdur", "Missile Duration (+" .. DUR_STEP .. "s)")
 			add("mspeed", "Missile Speed (+" .. MSPEED_STEP .. ")")
@@ -232,11 +245,12 @@ end
 local function refreshMenu(super)
 	menu.BackgroundColor3 = super and Color3.fromRGB(70, 50, 0) or Color3.fromRGB(20, 20, 20)
 	stroke.Enabled = super
-	title.Text = (super and "SUPER SHOP" or "Pick ONE") .. "  |  +" .. cost() .. " summon fee"
+	title.Text = (super and "SUPER SHOP" or "Pick ONE") .. "  |  summon fee " .. cost()
 	title.TextColor3 = super and GOLD or Color3.new(1, 1, 1)
 	for _, b in ipairs(menuButtons) do b:Destroy() end
 	menuButtons = {}
 	scroll.CanvasPosition = Vector2.zero
+	cancelBtn.Visible = true
 	for i, opt in ipairs(options(super)) do
 		local b = new("TextButton", {
 			Size = UDim2.new(1, -44, 0, 38), LayoutOrder = i, Text = opt[2], Font = Enum.Font.GothamBold, TextSize = 13,
@@ -294,6 +308,8 @@ local TOGGLES = { -- {key, label, unlocked?, number shown on the button}
 	{"glide", "Glide", function() return hasGlide end},
 	{"gdur", "Glide Time", function() return lv.gdur > 0 end, function() return lv.gdur end},
 	{"magnet", "Magnet", function() return hasMagnet end},
+	{"spirit", "Spirit Form", function() return hasSpiritBuff end},
+	{"spiritswitch", "Spirit Switch", function() return hasSpiritSwitch end},
 }
 
 local function applyBuffs()
@@ -336,6 +352,7 @@ local function refreshPanel()
 	menuBtn.Visible = any
 	panel.Visible = any and panelOpen
 	abilityBtn.Visible = hasMissile
+	if spiritBtn then spiritBtn.Visible = hasSpiritBuff end
 	glideBtn.Visible = hasGlide and on.glide
 	gbar.Visible = hasGlide and on.glide
 end
@@ -352,6 +369,7 @@ sync = function()
 	missileCd = math.max(MIN_CD, BASE_MCD - CD_STEP * lv.mcd)
 	hasDouble, hasTriple = lv.mjump >= 1, lv.mjump >= 2
 	hasGlide, hasMulti, hasMagnet = lv.glide > 0, lv.multi > 0, lv.magnet > 0
+	hasSpiritBuff, hasSpiritSwitch = lv.spirit > 0, lv.spiritswitch > 0
 	mercy = lv.mercy
 	glideMax = GLIDE_TIME + (on.gdur and GDUR_STEP * lv.gdur or 0)
 	glideEnergy = math.min(glideEnergy, glideMax)
@@ -362,6 +380,7 @@ sync = function()
 end
 
 local function resetAll()
+	if inSpirit and exitSpirit then exitSpirit(true) end
 	summons = 0
 	for k in pairs(lv) do lv[k] = 0 end
 	speedSteps, jumpSteps = {}, {}
@@ -465,6 +484,7 @@ local ADMIN_BUFFS = {
 	{"mdur", "Missile Time"}, {"mspeed", "Missile Speed"}, {"mcd", "Missile Cooldown"}, {"mphase", "Missile Phase"},
 	{"mjump", "Extra Jumps"}, {"glide", "Glide"}, {"gdur", "Glide Time"},
 	{"magnet", "Coin Magnet"}, {"multi", "Coin x2"}, {"mercy", "Mercy"},
+	{"spirit", "Spirit"}, {"spiritswitch", "Spirit Switch"},
 }
 refreshAdmin = function() end
 
@@ -717,7 +737,8 @@ local function summon()
 	local chosen = choiceEvt.Event:Wait()
 	died:Disconnect()
 	menu.Visible = false
-	if not chosen then cleanup() return end
+	cancelBtn.Visible = false
+	if not chosen or chosen == "cancel" then cleanup() return end
 	price += itemPrice(chosen, super) -- item price on top of the summon fee
 
 	-- coins come out of the body and fly to Tung
@@ -1114,6 +1135,32 @@ startGlide = function()
 end
 
 -- meter recharge, jump bookkeeping, button labels
+local spiritBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, .5), Position = UDim2.new(1, -16, .5, -150), Size = UDim2.fromOffset(130, 52),
+	BackgroundColor3 = Color3.fromRGB(60, 0, 140), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false, Text = "SPIRIT (E)",
+}, gui)
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, spiritBtn)
+local SPIRIT_HOLD = .45
+local spiritPressT = -99
+local function handleSpiritInput(down)
+	if not hasSpiritBuff then return end
+	if down then spiritPressT = os.clock() return end
+	local held = os.clock() - spiritPressT > SPIRIT_HOLD
+	if inSpirit then
+		if held and hasSpiritSwitch then exitSpirit(false, true)
+		else exitSpirit(false, false) end
+	else
+		if held and hasSpiritSwitch and spiritLastPos then enterSpirit(true)
+		else enterSpirit(false) end
+	end
+end
+spiritBtn.MouseButton1Down:Connect(function() handleSpiritInput(true) end)
+spiritBtn.MouseButton1Up:Connect(function() handleSpiritInput(false) end)
+UIS.InputBegan:Connect(function(i, gp) if not gp and i.KeyCode == Enum.KeyCode.E then handleSpiritInput(true) end end)
+UIS.InputEnded:Connect(function(i) if i.KeyCode == Enum.KeyCode.E then handleSpiritInput(false) end end)
+
+
 RS.Heartbeat:Connect(function(dt)
 	local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
 	if hum then
@@ -1135,6 +1182,95 @@ RS.Heartbeat:Connect(function(dt)
 		else abilityBtn.Text = "MISSILE (Q)" end
 	end
 end)
+
+---------------------------------------------------------------- Spirit ability
+local SPIRIT_SPEED_MOVE = 25
+local MAGE_ANIMS={idle="rbxassetid://8135192992",walk="rbxassetid://8135144928",run="rbxassetid://8135152562",jump="rbxassetid://8135160862",fall="rbxassetid://8135167869"}
+local function spiritPulse(pos,norm)
+	local r=new("Part",{Shape=Enum.PartType.Cylinder,Size=Vector3.new(.12,.7,.7),Color=BLUE,Material=Enum.Material.Neon,Anchored=true,CanCollide=false,CanTouch=false,CanQuery=false,Transparency=.15,CFrame=CFrame.lookAt(pos,pos+(norm or Vector3.yAxis))*CFrame.Angles(math.pi/2,0,0)},workspace)
+	TS:Create(r,TweenInfo.new(.5,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{Size=Vector3.new(.08,8,8),Transparency=1}):Play()
+	Debris:AddItem(r,.6)
+end
+enterSpirit=function(jumpBack)
+	if inSpirit or busy or missileBusy or gliding then return end
+	local char=lp.Character; local hum=char and char:FindFirstChildOfClass("Humanoid"); local root=char and char:FindFirstChild("HumanoidRootPart")
+	if not(hum and root) or hum.Health<=0 then return end
+	inSpirit=true; spiritPath={}; spiritBtn.Text="EXIT (E)"; tint(true)
+	hum.WalkSpeed=0; hum.JumpPower=0; root.Anchored=true
+	local ghost=Instance.new("Model"); ghost.Name="SpiritGhost"; local gr
+	for _,p in ipairs(char:GetDescendants()) do
+		if p:IsA("BasePart") and not(p.Parent:IsA("Accessory") or p.Parent:IsA("Tool")) then
+			local gp=p:Clone(); gp.Transparency=.5; gp.Color=Color3.fromRGB(160,190,255); gp.Material=Enum.Material.Neon
+			gp.CanCollide=false; gp.CanTouch=false; gp.CanQuery=false; gp.CastShadow=false; gp.Parent=ghost
+			if p.Name=="HumanoidRootPart" then gr=gp end
+		end
+	end
+	if not gr then inSpirit=false; root.Anchored=false; tint(false); spiritBtn.Text="SPIRIT (E)"; return end
+	for _,gp in ipairs(ghost:GetDescendants()) do
+		if gp:IsA("BasePart") and gp~=gr then new("WeldConstraint",{Part0=gr,Part1=gp},gr) end
+	end
+	gr.CFrame=jumpBack and spiritLastPos and CFrame.new(spiritLastPos) or root.CFrame
+	ghost.Parent=workspace; spiritModel=ghost
+	task.spawn(function()
+		pcall(function()
+			local gh=new("Humanoid",{WalkSpeed=0,JumpPower=0,HealthDisplayDistance=0,NameDisplayDistance=0},ghost)
+			local ga=new("Animator",{},gh)
+			for _,id in pairs(MAGE_ANIMS) do pcall(function() ga:LoadAnimation(new("Animation",{AnimationId=id})):Play() end) end
+		end)
+	end)
+	cam.CameraSubject=gr
+	local bv=new("BodyVelocity",{MaxForce=Vector3.new(1e6,1e6,1e6),Velocity=Vector3.zero,P=9000},gr)
+	local overlapLast={}; local conn4
+	conn4=RS.Heartbeat:Connect(function()
+		if not inSpirit then conn4:Disconnect() return end
+		local mv=Vector3.zero; local lcf=cam.CFrame
+		local fwd2=Vector3.new(lcf.LookVector.X,0,lcf.LookVector.Z); local rgt2=Vector3.new(lcf.RightVector.X,0,lcf.RightVector.Z)
+		if fwd2.Magnitude>.01 then fwd2=fwd2.Unit end; if rgt2.Magnitude>.01 then rgt2=rgt2.Unit end
+		if UIS:IsKeyDown(Enum.KeyCode.W) then mv+=fwd2 end; if UIS:IsKeyDown(Enum.KeyCode.S) then mv-=fwd2 end
+		if UIS:IsKeyDown(Enum.KeyCode.A) then mv-=rgt2 end; if UIS:IsKeyDown(Enum.KeyCode.D) then mv+=rgt2 end
+		if UIS:IsKeyDown(Enum.KeyCode.Space) then mv+=Vector3.yAxis end
+		if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then mv-=Vector3.yAxis end
+		bv.Velocity=mv.Magnitude>.01 and mv.Unit*SPIRIT_SPEED_MOVE or Vector3.zero
+		if mv.Magnitude>.01 then gr.CFrame=CFrame.lookAt(gr.Position,gr.Position+mv*Vector3.new(1,0,1)) end
+		local op2=OverlapParams.new(); op2.FilterDescendantsInstances={char,ghost,coinFolder}
+		local nowO={}
+		for _,p2 in ipairs(workspace:GetPartBoundsInBox(gr.CFrame,gr.Size*2,op2)) do
+			nowO[p2]=true
+			if not overlapLast[p2] then
+				local rp2=RaycastParams.new(); rp2.FilterDescendantsInstances={char,ghost,coinFolder}
+				local hit2=workspace:Raycast(gr.Position,(p2.Position-gr.Position).Unit*8,rp2)
+				spiritPulse(hit2 and hit2.Position or gr.Position, hit2 and hit2.Normal)
+			end
+		end
+		overlapLast=nowO
+		table.insert(spiritPath,{pos=gr.Position})
+	end)
+end
+exitSpirit=function(force,instantSwap)
+	if not inSpirit then return end
+	inSpirit=false; spiritBtn.Text="SPIRIT (E)"; tint(false)
+	local char=lp.Character; local hum=char and char:FindFirstChildOfClass("Humanoid"); local root=char and char:FindFirstChild("HumanoidRootPart")
+	if spiritModel then
+		local sr=spiritModel:FindFirstChild("HumanoidRootPart"); spiritLastPos=sr and sr.Position or spiritLastPos
+		spiritModel:Destroy(); spiritModel=nil
+	end
+	if not(hum and root) then return end
+	root.Anchored=false
+	if force or #spiritPath==0 then cam.CameraSubject=hum; applyBuffs(); return end
+	if instantSwap then cam.CameraSubject=hum; applyBuffs(); return end
+	hum.WalkSpeed=0; hum.JumpPower=0; tint(true)
+	local a0=new("Attachment",{},root); local a1=new("Attachment",{Position=Vector3.new(1.5,0,0)},root)
+	local tr=new("Trail",{Attachment0=a0,Attachment1=a1,Color=ColorSequence.new(BLUE),LightEmission=1,Lifetime=.5,Transparency=NumberSequence.new(.3,1)},root)
+	cam.CameraSubject=root
+	local rev={}; for i=#spiritPath,1,-1 do rev[#rev+1]=spiritPath[i] end
+	local acc3,idx3=0,1; local conn5
+	conn5=RS.Heartbeat:Connect(function(dt2)
+		acc3+=dt2
+		while acc3>=STEP and idx3<=#rev do acc3-=STEP; root.CFrame=CFrame.new(rev[idx3].pos); root.AssemblyLinearVelocity=Vector3.zero; idx3+=1 end
+		if idx3>#rev then conn5:Disconnect(); tr:Destroy(); a0:Destroy(); a1:Destroy(); tint(false); cam.CameraSubject=hum; applyBuffs() end
+	end)
+end
+
 
 ---------------------------------------------------------------- ESP (blue)
 local esp = {}
