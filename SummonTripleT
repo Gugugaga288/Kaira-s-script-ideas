@@ -46,13 +46,17 @@ local TIERS = {"ESP", "ESP + Names", "ESP + Chams", "ESP + Arrows"}
 local coins, summons = 0, 0
 local speedBonus, jumpBonus, espTier = 0, 0, 0
 local hasMissile, hasPhase = false, false
-local hasSpiritBuff, hasSpiritSwitch = false, false
+local hasDrone, hasDronePark, hasDroneMount = false, false, false
+local pilotingDrone, mountedDrone, droneParked = false, false, false
+local droneModel, droneCF = nil, nil
+local droneSeat = nil -- the temporary Seat used while mounted (built/destroyed per mount)
 local missileTime, missileSpeed, missileCd = BASE_MTIME, BASE_MSPEED, BASE_MCD
 local hasDouble, hasTriple, hasGlide, hasMulti, hasMagnet = false, false, false, false, false
 local mercy = 0
 local on = {
 	speed = false, jump = false, esp = false, mdur = false, mspeed = false, mcd = false,
-	mphase = false, mjump = false, glide = false, magnet = false, gdur = false, spirit = false, spiritswitch = false,
+	mphase = false, mjump = false, glide = false, magnet = false, gdur = false,
+	drone = false, dronepark = false, dronemount = false,
 }
 local busy, missileBusy, gliding = false, false, false
 local lastMissile = -100
@@ -63,10 +67,10 @@ local coinTarget, coinRespawn = COIN_COUNT, COIN_RESPAWN
 -- how many times each buff has been bought (the shop and the admin panel both go through grant/revoke)
 local lv = {
 	speed = 0, jump = 0, esp = 0, missile = 0, mdur = 0, mspeed = 0, mcd = 0, mphase = 0,
-	mjump = 0, glide = 0, gdur = 0, magnet = 0, multi = 0, mercy = 0, spirit = 0, spiritswitch = 0,
+	mjump = 0, glide = 0, gdur = 0, magnet = 0, multi = 0, mercy = 0, drone = 0, dronepark = 0, dronemount = 0,
 }
 local speedSteps, jumpSteps = {}, {}
-local CAP = {esp = 4, missile = 1, mphase = 1, mjump = 2, glide = 1, magnet = 1, multi = 1, spirit = 1, spiritswitch = 1, mcd = math.floor((BASE_MCD - MIN_CD) / CD_STEP)}
+local CAP = {esp = 4, missile = 1, mphase = 1, mjump = 2, glide = 1, magnet = 1, multi = 1, drone = 1, dronepark = 1, dronemount = 1, mcd = math.floor((BASE_MCD - MIN_CD) / CD_STEP)}
 local airTime, jumpsUsed, lastExtraJump = 0, 0, 0
 
 -- effective values (a buff only counts while its toggle is ON)
@@ -93,7 +97,7 @@ local function cost() return 5 * (summons + 1) end -- the summon fee
 local PRICES = {
 	speed = {2, 1}, jump = {2, 1}, esp = {3, 2}, mdur = {3, 2}, mspeed = {3, 2}, mcd = {4, 2}, mphase = {8, 0},
 	mjump = {2, 3}, gdur = {3, 2}, glide = {10, 0}, missile = {12, 0}, multi = {10, 0}, magnet = {8, 0}, mercy = {8, 4},
-	spirit = {15, 0}, spiritswitch = {6, 0},
+	drone = {15, 0}, dronepark = {6, 0}, dronemount = {8, 0},
 }
 local SUPER_PRICES = {speed = {6, 3}, jump = {6, 3}} -- super speed/jump are pricier
 local function itemPrice(key, super)
@@ -103,14 +107,16 @@ local function itemPrice(key, super)
 	return p[1] + p[2] * (lv[key] or 0)
 end
 
-local useMissile, startGlide, stopGlide, sync, refreshAdmin, spawnBabies, enterSpirit, exitSpirit
-local spiritBtn
+local useMissile, startGlide, stopGlide, sync, refreshAdmin, spawnBabies
+local startPilot, stopPilotReturn, stopPilotPark, mountDrone, unmountDrone, handleDroneInput, ensureDrone
+local droneBtn
 
 local function grant(key, super)
 	if key == "djump" or key == "tjump" then key = "mjump" end
 	if lv[key] == nil or lv[key] >= (CAP[key] or 99) then return false end
 	if (key == "mdur" or key == "mspeed" or key == "mcd" or key == "mphase") and lv.missile == 0 then lv.missile = 1 end
 	if key == "gdur" and lv.glide == 0 then lv.glide = 1 end
+	if (key == "dronepark" or key == "dronemount") and lv.drone == 0 then lv.drone = 1 end
 	lv[key] += 1
 	if key == "speed" then table.insert(speedSteps, super and SUPER_SPEED or SPEED_STEP)
 	elseif key == "jump" then table.insert(jumpSteps, super and SUPER_JUMP or JUMP_STEP) end
@@ -222,13 +228,14 @@ local function options(super)
 		if not hasMulti then add("multi", "Coin Multiplier (x2)")
 		elseif not hasMagnet then add("magnet", "Coin Magnet") end
 		if not hasGlide then add("glide", "Glide") end
-		if not hasSpiritBuff then add("spirit", "Spirit Ability") end
+		if not hasDrone then add("drone", "Drone Ability") end
 		if hasDouble and not hasTriple then add("tjump", "Triple Jump") end
 	else
 		add("speed", "Speed (+" .. SPEED_STEP .. ")")
 		add("jump", "Jump (+" .. JUMP_STEP .. ")")
 		if espTier < 4 then add("esp", TIERS[espTier + 1]) end
-		if hasSpiritBuff and not hasSpiritSwitch then add("spiritswitch", "Spirit Switch") end
+		if hasDrone and not hasDronePark then add("dronepark", "Drone Park") end
+		if hasDrone and not hasDroneMount then add("dronemount", "Drone Mount") end
 		if hasMissile then
 			add("mdur", "Missile Duration (+" .. DUR_STEP .. "s)")
 			add("mspeed", "Missile Speed (+" .. MSPEED_STEP .. ")")
@@ -307,8 +314,9 @@ local TOGGLES = { -- {key, label, unlocked?, number shown on the button}
 	{"glide", "Glide", function() return hasGlide end},
 	{"gdur", "Glide Time", function() return lv.gdur > 0 end, function() return lv.gdur end},
 	{"magnet", "Magnet", function() return hasMagnet end},
-	{"spirit", "Spirit Form", function() return hasSpiritBuff end},
-	{"spiritswitch", "Spirit Switch", function() return hasSpiritSwitch end},
+	{"drone", "Drone", function() return hasDrone end},
+	{"dronepark", "Drone Park", function() return hasDronePark end},
+	{"dronemount", "Drone Mount", function() return hasDroneMount end},
 }
 
 local function applyBuffs()
@@ -351,7 +359,7 @@ local function refreshPanel()
 	menuBtn.Visible = any
 	panel.Visible = any and panelOpen
 	abilityBtn.Visible = hasMissile
-	if spiritBtn then spiritBtn.Visible = hasSpiritBuff end
+	if droneBtn then droneBtn.Visible = hasDrone and on.drone end
 	glideBtn.Visible = hasGlide and on.glide
 	gbar.Visible = hasGlide and on.glide
 end
@@ -368,7 +376,8 @@ sync = function()
 	missileCd = math.max(MIN_CD, BASE_MCD - CD_STEP * lv.mcd)
 	hasDouble, hasTriple = lv.mjump >= 1, lv.mjump >= 2
 	hasGlide, hasMulti, hasMagnet = lv.glide > 0, lv.multi > 0, lv.magnet > 0
-	hasSpiritBuff, hasSpiritSwitch = lv.spirit > 0, lv.spiritswitch > 0
+	hasDrone, hasDronePark, hasDroneMount = lv.drone > 0, lv.dronepark > 0, lv.dronemount > 0
+	if hasDrone and ensureDrone then ensureDrone() end -- the idle-hover loop then parents/positions it automatically
 	mercy = lv.mercy
 	glideMax = GLIDE_TIME + (on.gdur and GDUR_STEP * lv.gdur or 0)
 	glideEnergy = math.min(glideEnergy, glideMax)
@@ -379,7 +388,10 @@ sync = function()
 end
 
 local function resetAll()
-	if inSpirit and exitSpirit then exitSpirit(true) end
+	if pilotingDrone and stopPilotReturn then stopPilotReturn() end
+	if mountedDrone and unmountDrone then unmountDrone() end
+	droneParked = false
+	if droneModel then droneModel:Destroy(); droneModel = nil end
 	summons = 0
 	for k in pairs(lv) do lv[k] = 0 end
 	speedSteps, jumpSteps = {}, {}
@@ -390,6 +402,9 @@ end
 
 local killedByTung, pendingBabies = false, false
 local function onDeath()
+	pilotingDrone = false -- stop any drone control immediately; resetAll()/mercy below decide if you keep the drone itself
+	mountedDrone = false
+	if droneSeat then droneSeat:Destroy(); droneSeat = nil end
 	if DEATH_WIPES_ALL or killedByTung then
 		if lv.mercy > 0 then
 			lv.mercy -= 1 -- Mercy: keep everything, baby Tungs rain down when you respawn
@@ -411,6 +426,8 @@ lp.CharacterAdded:Connect(function(char)
 	if gliding then stopGlide() end
 	task.wait(.5)
 	applyBuffs()
+	local h = char:FindFirstChildOfClass("Humanoid")
+	if h then cam.CameraSubject = h end
 	if pendingBabies then
 		pendingBabies = false
 		char:WaitForChild("HumanoidRootPart", 5)
@@ -455,19 +472,21 @@ end)
 
 RS.Heartbeat:Connect(function(dt)
 	local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	-- while piloting the drone, it collects coins instead of your (frozen) body
+	local collectPos = (pilotingDrone and droneCF) and droneCF.Position or (root and root.Position)
 	local t = os.clock() * 2
 	for i = #coinList, 1, -1 do
 		local c = coinList[i]
 		local base = c:GetAttribute("base")
-		if root and hasMagnet and on.magnet then -- magnet pulls nearby coins to you
-			local d = root.Position - base
+		if collectPos and hasMagnet and on.magnet then -- magnet pulls nearby coins to you
+			local d = collectPos - base
 			if d.Magnitude < MAGNET_RADIUS and d.Magnitude > .1 then
 				base += d.Unit * math.min(d.Magnitude, MAGNET_SPEED * dt)
 				c:SetAttribute("base", base)
 			end
 		end
 		c.CFrame = CFrame.new(base + Vector3.new(0, math.sin(t) * .3, 0)) * CFrame.Angles(0, t, 0)
-		if root and not busy and not missileBusy and (root.Position - base).Magnitude < 5 then
+		if collectPos and not busy and not missileBusy and (collectPos - base).Magnitude < 5 then
 			coins += hasMulti and 2 or 1
 			refresh()
 			c:Destroy()
@@ -483,7 +502,7 @@ local ADMIN_BUFFS = {
 	{"mdur", "Missile Time"}, {"mspeed", "Missile Speed"}, {"mcd", "Missile Cooldown"}, {"mphase", "Missile Phase"},
 	{"mjump", "Extra Jumps"}, {"glide", "Glide"}, {"gdur", "Glide Time"},
 	{"magnet", "Coin Magnet"}, {"multi", "Coin x2"}, {"mercy", "Mercy"},
-	{"spirit", "Spirit"}, {"spiritswitch", "Spirit Switch"},
+	{"drone", "Drone"}, {"dronepark", "Drone Park"}, {"dronemount", "Drone Mount"},
 }
 refreshAdmin = function() end
 
@@ -1134,30 +1153,42 @@ startGlide = function()
 end
 
 -- meter recharge, jump bookkeeping, button labels
-spiritBtn = new("TextButton", {
+droneBtn = new("TextButton", {
 	AnchorPoint = Vector2.new(1, .5), Position = UDim2.new(1, -16, .5, -150), Size = UDim2.fromOffset(130, 52),
 	BackgroundColor3 = Color3.fromRGB(60, 0, 140), TextColor3 = Color3.new(1, 1, 1),
-	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false, Text = "SPIRIT (E)",
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false, Text = "DRONE (E)",
 }, gui)
-new("UICorner", {CornerRadius = UDim.new(0, 10)}, spiritBtn)
-local SPIRIT_HOLD = .45
-local spiritPressT = -99
-local function handleSpiritInput(down)
-	if not hasSpiritBuff then return end
-	if down then spiritPressT = os.clock() return end
-	local held = os.clock() - spiritPressT > SPIRIT_HOLD
-	if inSpirit then
-		if held and hasSpiritSwitch then exitSpirit(false, true)
-		else exitSpirit(false, false) end
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, droneBtn)
+local DRONE_HOLD = .45
+local dronePressT = -99
+handleDroneInput = function(down)
+	if not hasDrone or not on.drone then return end
+	if down then dronePressT = os.clock() return end
+	local held = os.clock() - dronePressT > DRONE_HOLD
+	if pilotingDrone then
+		if held and hasDronePark then stopPilotPark() else stopPilotReturn() end
+	elseif mountedDrone then
+		unmountDrone()
 	else
-		if held and hasSpiritSwitch and spiritLastPos then enterSpirit(true)
-		else enterSpirit(false) end
+		if held and hasDroneMount then mountDrone() else startPilot() end
 	end
 end
-spiritBtn.MouseButton1Down:Connect(function() handleSpiritInput(true) end)
-spiritBtn.MouseButton1Up:Connect(function() handleSpiritInput(false) end)
-UIS.InputBegan:Connect(function(i, gp) if not gp and i.KeyCode == Enum.KeyCode.E then handleSpiritInput(true) end end)
-UIS.InputEnded:Connect(function(i) if i.KeyCode == Enum.KeyCode.E then handleSpiritInput(false) end end)
+local dronePressInput = nil
+droneBtn.InputBegan:Connect(function(input)
+	if dronePressInput then return end
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dronePressInput = input
+		handleDroneInput(true)
+	end
+end)
+UIS.InputEnded:Connect(function(input)
+	if input == dronePressInput then
+		dronePressInput = nil
+		handleDroneInput(false)
+	end
+end)
+UIS.InputBegan:Connect(function(i, gp) if not gp and i.KeyCode == Enum.KeyCode.E then handleDroneInput(true) end end)
+UIS.InputEnded:Connect(function(i) if i.KeyCode == Enum.KeyCode.E then handleDroneInput(false) end end)
 
 
 RS.Heartbeat:Connect(function(dt)
@@ -1182,153 +1213,431 @@ RS.Heartbeat:Connect(function(dt)
 	end
 end)
 
----------------------------------------------------------------- Spirit ability
--- Approach: real character IS the spirit (translucent, noclip). A frozen clone is left behind.
--- On exit: character reverses its own path back to the clone position.
-local SPIRIT_SPEED_MOVE = 25
--- R15 Mage animation IDs (may not load on R6, that is fine):
-local MAGE_ANIMS = {idle="rbxassetid://8135192992",walk="rbxassetid://8135144928",run="rbxassetid://8135152562",jump="rbxassetid://8135160862",fall="rbxassetid://8135167869"}
+---------------------------------------------------------------- Drone ability
+local DRONE_SCALE = .7                           -- overall drone size (1 = the old, bigger one)
+local DRONE_FOLLOW_OFFSET = CFrame.new(4, .8, 0) -- relative to your HumanoidRootPart: sticks to your right side
+local DRONE_FOLLOW_LERP = 6                      -- how snappily the idle drone catches up to you / flies back
+local DRONE_PILOT_SPEED = 55
+local DRONE_MOUNT_SPEED = 45
+local DRONE_SIT_OFFSET = CFrame.new(0, 1.7, 0)   -- where your root sits relative to the drone while mounted (tweak if you float/sink)
+local PROP_SPIN = 45                             -- propeller spin speed (radians/second)
+local DRONE_BLUE = Color3.fromRGB(35, 105, 225)   -- the drone's blue
+local DRONE_FADE = .12                       -- extra transparency added to every drone part
+local RING_BLUE = Color3.fromRGB(60, 140, 255)   -- brighter blue for pulses so they read clearly
+local mountCollideParts = {}
+local droneProps, droneSpin = {}, 0
+local mountSitTrack = nil
 
-local spiritFrozen = nil
-local spiritConn = nil    -- single cleanup closure
-local spiritPath = {}
-local spiritLastPos = nil
-local inSpirit = false
+local function getCam() return workspace.CurrentCamera end
 
-local function spiritPulse(pos, norm)
-	local r = new("Part", {Shape=Enum.PartType.Cylinder, Size=Vector3.new(.12,.7,.7), Color=BLUE,
-		Material=Enum.Material.Neon, Anchored=true, CanCollide=false, CanTouch=false, CanQuery=false,
-		Transparency=.15, CFrame=CFrame.lookAt(pos,pos+(norm or Vector3.yAxis))*CFrame.Angles(math.pi/2,0,0)}, workspace)
-	TS:Create(r, TweenInfo.new(.5,Enum.EasingStyle.Quad,Enum.EasingDirection.Out), {Size=Vector3.new(.08,8,8),Transparency=1}):Play()
-	Debris:AddItem(r, .6)
+-- Smooth, rounded drone: puck body + dome + camera eye, four arms ending in motor balls with spinning propellers.
+local function buildDrone()
+	local k = DRONE_SCALE
+	local m = Instance.new("Model")
+	m.Name = "TungDrone"
+	droneProps = {}
+	local Cyl, Ball, Block = Enum.PartType.Cylinder, Enum.PartType.Ball, Enum.PartType.Block
+	local up = CFrame.Angles(0, 0, math.pi / 2) -- stands a cylinder upright
+	local function part(shape, size, cf, transparency, color)
+		return new("Part", {
+			Shape = shape, Size = size, CFrame = cf, Color = color or DRONE_BLUE, Material = Enum.Material.Neon,
+			Transparency = math.min(1, (transparency or .25) + DRONE_FADE), Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+	end
+	m.PrimaryPart = part(Block, Vector3.new(.5, .5, .5), CFrame.new(), 1)               -- invisible pivot + camera anchor
+	part(Cyl, Vector3.new(1.1 * k, 3.4 * k, 3.4 * k), up, .2)                           -- round body
+	part(Ball, Vector3.new(2.3 * k, 2.3 * k, 2.3 * k), CFrame.new(0, .45 * k, 0), .3)   -- dome
+	part(Ball, Vector3.new(.7 * k, .7 * k, .7 * k), CFrame.new(0, .1 * k, -1.65 * k), .05, Color3.fromRGB(120, 190, 255)) -- camera eye (front)
+	for _, o in ipairs({Vector3.new(1, 0, 1), Vector3.new(-1, 0, 1), Vector3.new(1, 0, -1), Vector3.new(-1, 0, -1)}) do
+		local near = Vector3.new(o.X * 1.15 * k, 0, o.Z * 1.15 * k)
+		local hub = Vector3.new(o.X * 2.7 * k, .9 * k, o.Z * 2.7 * k)
+		local dir, mid = hub - near, (hub + near) / 2
+		part(Cyl, Vector3.new(dir.Magnitude, .32 * k, .32 * k), CFrame.lookAt(mid, mid + dir.Unit) * CFrame.Angles(0, math.pi / 2, 0), .3) -- arm
+		part(Ball, Vector3.new(.9 * k, .9 * k, .9 * k), CFrame.new(hub), .2)                                                              -- motor
+		local top = hub + Vector3.new(0, .6 * k, 0)
+		part(Cyl, Vector3.new(.08 * k, 3.3 * k, 3.3 * k), CFrame.new(top) * up, .82)                                                      -- soft rotor disc
+		for i = 0, 1 do                                                                                                                    -- two crossed spinning blades
+			local rel = CFrame.new(top) * CFrame.Angles(0, i * math.pi / 2, 0)
+			local blade = part(Cyl, Vector3.new(3.1 * k, .2 * k, .2 * k), rel, .35, Color3.fromRGB(70, 120, 230))
+			table.insert(droneProps, {part = blade, rel = rel, dir = (o.X * o.Z > 0) and 1 or -1})
+		end
+	end
+	local glow = new("Highlight", {
+		Adornee = m, FillColor = Color3.fromRGB(40, 100, 255), OutlineColor = RING_BLUE,
+		FillTransparency = .5, OutlineTransparency = 0, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Enabled = false,
+	}, m)
+	return m, glow
 end
 
-enterSpirit = function(jumpBack)
-	if inSpirit or busy or missileBusy or gliding then return end
+local droneHighlight = nil
+ensureDrone = function()
+	if droneModel then return true end
+	local ok, mOrErr, glow = pcall(function()
+		local m, g = buildDrone()
+		return m, g
+	end)
+	if not ok then
+		warn("[TungSahur] Drone failed to build: " .. tostring(mOrErr))
+		return false
+	end
+	droneModel = mOrErr
+	droneHighlight = glow
+	return true
+end
+
+-- every place that moves the drone goes through this, so the propellers always spin
+local function placeDrone(cf, dt)
+	droneModel:PivotTo(cf)
+	droneSpin += (dt or 1 / 60) * PROP_SPIN
+	for _, p in ipairs(droneProps) do
+		p.part.CFrame = cf * p.rel * CFrame.Angles(0, droneSpin * p.dir, 0)
+	end
+end
+
+-- a ring that pulses outward at the point a phasing drone passes through something
+local lastPhasePulse = 0
+local function phasePulse(pos, norm)
+	if os.clock() - lastPhasePulse < .12 then return end -- don't spawn one every single frame
+	lastPhasePulse = os.clock()
+	local ok, err = pcall(function()
+		norm = (norm and norm.Magnitude > 0) and norm.Unit or Vector3.yAxis
+		local upGuess = (math.abs(norm.Y) > .9) and Vector3.xAxis or Vector3.yAxis
+		local tangent = norm:Cross(upGuess).Unit
+		local okCf, cf = pcall(function() return CFrame.fromMatrix(pos, norm, tangent) end)
+		if not okCf then cf = CFrame.new(pos) end
+		local r = new("Part", {
+			Shape = Enum.PartType.Cylinder, Size = Vector3.new(.1, .6, .6), Color = RING_BLUE, Material = Enum.Material.Neon,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, Transparency = .1, CFrame = cf,
+		}, workspace)
+		TS:Create(r, TweenInfo.new(.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = Vector3.new(.06, 8, 8), Transparency = 1}):Play()
+		Debris:AddItem(r, .6)
+	end)
+	if not ok then warn("[TungSahur] phasePulse failed: " .. tostring(err)) end
+end
+
+-- idle behaviour: when nobody is piloting/mounting it, the drone hovers at your right side (or stays put if parked)
+RS.Heartbeat:Connect(function(dt)
+	if not (hasDrone and on.drone and droneModel) then return end
+	local root = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	if pilotingDrone or mountedDrone then return end -- those modes position the drone themselves
+	local target = droneParked and droneCF or (root.CFrame * DRONE_FOLLOW_OFFSET)
+	droneCF = droneCF and droneCF:Lerp(target, math.min(1, DRONE_FOLLOW_LERP * dt)) or target
+	placeDrone(droneCF, dt)
+	if droneModel.Parent ~= workspace then droneModel.Parent = workspace end
+end)
+RS.Heartbeat:Connect(function()
+	if droneModel and not (hasDrone and on.drone) and droneModel.Parent and not pilotingDrone and not mountedDrone then
+		droneModel.Parent = nil -- toggled off in the TUNG menu (but never yank it out from under active use)
+	end
+end)
+
+-- ===== parked pulse: a sonar ring on a BillboardGui with AlwaysOnTop, so it is genuinely visible through walls =====
+local pulseGui = nil
+local function clearPulseGui()
+	if pulseGui then pulseGui:Destroy(); pulseGui = nil end
+end
+local function spawnRing()
+	if not (droneModel and droneModel.PrimaryPart) then return end
+	if not pulseGui or not pulseGui.Parent then
+		pulseGui = new("BillboardGui", {
+			Name = "DronePulse", Adornee = droneModel.PrimaryPart, AlwaysOnTop = true, LightInfluence = 0,
+			Size = UDim2.new(18, 0, 18, 0), MaxDistance = 5000,
+		}, droneModel.PrimaryPart)
+		local dot = new("Frame", {
+			AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromScale(.07, .07),
+			BackgroundColor3 = RING_BLUE, BackgroundTransparency = .1, BorderSizePixel = 0,
+		}, pulseGui)
+		new("UICorner", {CornerRadius = UDim.new(.5, 0)}, dot)
+	end
+	local ring = new("Frame", {
+		AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromScale(.08, .08),
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+	}, pulseGui)
+	new("UICorner", {CornerRadius = UDim.new(.5, 0)}, ring)
+	local stroke = new("UIStroke", {Color = RING_BLUE, Thickness = 4, Transparency = 0}, ring)
+	TS:Create(ring, TweenInfo.new(1.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = UDim2.fromScale(1, 1)}):Play()
+	TS:Create(stroke, TweenInfo.new(1.1), {Transparency = 1}):Play()
+	Debris:AddItem(ring, 1.2)
+end
+
+local function droneParkGlowLoop()
+	task.spawn(function()
+		while droneParked and droneModel and droneModel.Parent do
+			local ok, err = pcall(spawnRing)
+			if not ok then warn("[TungSahur] park pulse failed: " .. tostring(err)) end
+			if droneHighlight then
+				pcall(function()
+					droneHighlight.FillTransparency, droneHighlight.OutlineTransparency = .2, 0
+					TS:Create(droneHighlight, TweenInfo.new(.9), {FillTransparency = .85, OutlineTransparency = .5}):Play()
+				end)
+			end
+			task.wait(.9)
+		end
+		clearPulseGui()
+	end)
+end
+
+-- ===== flight input: the normal Roblox controls (WASD on PC, the regular thumbstick on mobile) =====
+local touchUp, touchDown = false, false
+local upBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -92), Size = UDim2.fromOffset(60, 60),
+	Text = "UP", BackgroundColor3 = Color3.fromRGB(0, 60, 180), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false,
+}, gui)
+corner(upBtn, 30)
+local downBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -84, 1, -92), Size = UDim2.fromOffset(60, 60),
+	Text = "DOWN", BackgroundColor3 = Color3.fromRGB(0, 60, 180), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false,
+}, gui)
+corner(downBtn, 30)
+upBtn.MouseButton1Down:Connect(function() touchUp = true end)
+upBtn.MouseButton1Up:Connect(function() touchUp = false end)
+upBtn.MouseLeave:Connect(function() touchUp = false end)
+downBtn.MouseButton1Down:Connect(function() touchDown = true end)
+downBtn.MouseButton1Up:Connect(function() touchDown = false end)
+downBtn.MouseLeave:Connect(function() touchDown = false end)
+
+local function showFlightControls(v)
+	upBtn.Visible, downBtn.Visible = v, v
+	if not v then touchUp, touchDown = false, false end
+end
+
+-- Roblox's own ControlModule gives us the stick/keys exactly like normal movement, on every platform
+local controlModule = nil
+task.spawn(function()
+	pcall(function()
+		local pm = require(lp:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 10))
+		controlModule = pm:GetControls()
+	end)
+end)
+
+-- Movement is level with the camera's HEADING (tilting the camera does nothing to the drone).
+-- Up/Down only happen when you ask for them: Space / Ctrl, or the UP / DOWN buttons.
+local function readFlightInput(hum)
+	local c = getCam().CFrame
+	local f, r = c.LookVector, c.RightVector
+	local fl = Vector3.new(f.X, 0, f.Z)
+	if fl.Magnitude < .05 then fl = Vector3.new(c.UpVector.X, 0, c.UpVector.Z) * (f.Y < 0 and 1 or -1) end
+	fl = fl.Magnitude > .01 and fl.Unit or Vector3.new(0, 0, -1)
+	local rl = Vector3.new(r.X, 0, r.Z)
+	rl = rl.Magnitude > .01 and rl.Unit or Vector3.new(1, 0, 0)
+	local right, fwd, got = 0, 0, false
+	if controlModule then
+		local ok, v = pcall(function() return controlModule:GetMoveVector() end)
+		if ok and typeof(v) == "Vector3" then right, fwd, got = v.X, -v.Z, true end
+	end
+	if not got and hum and hum.MoveDirection.Magnitude > .01 then
+		local md = hum.MoveDirection
+		fwd, right, got = md:Dot(fl), md:Dot(rl), true
+	end
+	if not got then
+		if UIS:IsKeyDown(Enum.KeyCode.W) then fwd += 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.S) then fwd -= 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.D) then right += 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.A) then right -= 1 end
+	end
+	local vert = ((UIS:IsKeyDown(Enum.KeyCode.Space) or touchUp) and 1 or 0) - ((UIS:IsKeyDown(Enum.KeyCode.LeftControl) or touchDown) and 1 or 0)
+	return fl * fwd + rl * right + Vector3.yAxis * vert
+end
+
+-- Which way the drone faces. Like a normal character it only turns toward where you MOVE (level), and
+-- looking around with the camera never turns it.
+local droneFace = Vector3.new(0, 0, -1)
+local function resetFace()
+	local l = droneCF and droneCF.LookVector or Vector3.new(0, 0, -1)
+	local flat = Vector3.new(l.X, 0, l.Z)
+	droneFace = flat.Magnitude > .01 and flat.Unit or Vector3.new(0, 0, -1)
+end
+local function turnToward(mv, dt)
+	local flat = Vector3.new(mv.X, 0, mv.Z)
+	if flat.Magnitude < .05 then return end
+	local mixed = droneFace:Lerp(flat.Unit, math.min(1, 10 * dt))
+	droneFace = mixed.Magnitude > .01 and mixed.Unit or flat.Unit
+end
+
+-- Walls and floors BLOCK you while mounted (the piloted drone is the one that phases through everything).
+local MOUNT_RADIUS = 2.4
+local function moveSolid(pos, delta, params)
+	local dist = delta.Magnitude
+	if dist < 1e-4 then return pos end
+	local hit = workspace:Spherecast(pos, MOUNT_RADIUS, delta.Unit * (dist + .05), params)
+	if not hit then return pos + delta end
+	local slid = delta - hit.Normal * delta:Dot(hit.Normal) -- slide along what you hit
+	if slid.Magnitude < 1e-4 then return pos end
+	if workspace:Spherecast(pos, MOUNT_RADIUS, slid.Unit * (slid.Magnitude + .05), params) then return pos end
+	return pos + slid
+end
+
+-- Tap from idle: control the drone directly from its point of view. Noclips through everything.
+startPilot = function()
+	if pilotingDrone or mountedDrone or busy or missileBusy or gliding then return end
 	local char = lp.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	local root = char and char:FindFirstChild("HumanoidRootPart")
 	if not (hum and root) or hum.Health <= 0 then return end
-	inSpirit = true; spiritPath = {}; spiritBtn.Text = "EXIT (E)"; tint(true)
+	if not ensureDrone() then return end
+	if not droneCF then droneCF = root.CFrame * DRONE_FOLLOW_OFFSET end
+	resetFace()
+	pilotingDrone, droneParked = true, false
+	clearPulseGui()
+	droneBtn.Text = "RETURN (E)"
+	if droneHighlight then droneHighlight.Enabled = false end
+	hum.WalkSpeed, hum.JumpPower = 0, 0
+	hum.PlatformStand = true
+	root.Anchored = true
+	getCam().CameraSubject = droneModel.PrimaryPart
+	showFlightControls(true)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {char, coinFolder}
 
-	-- Everything below can fail on an unusual character; if it does, roll back instead of leaving
-	-- you stuck with a blue screen and no spirit.
-	local ok, err = pcall(function()
-		-- teleport to saved position if re-entering
-		if jumpBack and spiritLastPos then root.CFrame = CFrame.new(spiritLastPos) end
-
-		-- leave a frozen clone of the character at the current position (with accessories, looks normal)
-		local okClone, clone = pcall(function() return char:Clone() end)
-		if okClone and clone then
-			for _, d in ipairs(clone:GetDescendants()) do
-				pcall(function()
-					if d:IsA("BasePart") then d.Anchored = true; d.CanCollide = false; d.CanTouch = false; d.CanQuery = false end
-					if d:IsA("BaseScript") or d:IsA("Animator") or d:IsA("AnimationController") then d:Destroy() end
-				end)
+	local conn
+	conn = RS.Heartbeat:Connect(function(dt)
+		if not pilotingDrone then conn:Disconnect() return end
+		local ok, err = pcall(function()
+			local mv = readFlightInput(hum)
+			local pos = droneCF.Position
+			local delta = Vector3.zero
+			if mv.Magnitude > .01 then
+				delta = mv.Unit * DRONE_PILOT_SPEED * math.min(1, mv.Magnitude) * dt
+				local hit = workspace:Raycast(pos, delta.Unit * (delta.Magnitude + 1), params)
+				if hit then phasePulse(hit.Position, hit.Normal) end -- you phase through it; the pulse just marks where
+				turnToward(mv, dt)
 			end
-			clone.Parent = workspace
-			spiritFrozen = clone
-		end -- if cloning fails, we just skip the frozen decoy and continue with the spirit itself
-
-		-- detach accessories so the spirit has no hats
-		local removedAccs = {}
-		for _, a in ipairs(char:GetChildren()) do
-			if a:IsA("Accessory") then a.Parent = nil; table.insert(removedAccs, a) end
-		end
-
-		-- save appearance and make spirit translucent + blue
-		local saved = {}
-		for _, p in ipairs(char:GetDescendants()) do
-			if p:IsA("BasePart") then
-				saved[p] = {t=p.Transparency, c=p.Color, s=p.CastShadow}
-				if p.Name ~= "HumanoidRootPart" then p.Transparency = .55; p.Color = Color3.fromRGB(150,180,255) end
-				p.CastShadow = false
-			end
-		end
-		local glow = new("Highlight", {Adornee=char, FillColor=BLUE, OutlineColor=BLUE,
-			FillTransparency=.65, OutlineTransparency=.1, DepthMode=Enum.HighlightDepthMode.AlwaysOnTop}, char)
-
-		-- try mage animations (fine if these animation ids don't load)
-		pcall(function()
-			local anim = hum:FindFirstChildOfClass("Animator")
-			if anim then
-				for _, id in pairs(MAGE_ANIMS) do pcall(function() anim:LoadAnimation(new("Animation",{AnimationId=id})):Play() end) end
-			end
+			-- level, and turned only by your movement: looking around with the camera leaves the drone alone
+			droneCF = CFrame.lookAt(pos + delta, pos + delta + droneFace)
+			placeDrone(droneCF, dt)
 		end)
-
-		hum.WalkSpeed = SPIRIT_SPEED_MOVE; hum.UseJumpPower = true; hum.JumpPower = 50
-
-		-- noclip every frame (lets you walk through walls but Humanoid still handles floor)
-		local noclip = RS.Heartbeat:Connect(function()
-			for _, p in ipairs(char:GetDescendants()) do
-				if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
-			end
-		end)
-
-		-- record path and spawn pulses when walking into objects
-		local lastP = root.Position
-		local record = RS.Heartbeat:Connect(function()
-			if not inSpirit then return end
-			table.insert(spiritPath, root.CFrame)
-			local move = root.Position - lastP
-			if move.Magnitude > 0.05 then
-				local rp = RaycastParams.new(); rp.FilterDescendantsInstances = {char, coinFolder}
-				local hit = workspace:Raycast(lastP, move * 3, rp)
-				if hit then spiritPulse(hit.Position, hit.Normal) end
-			end
-			lastP = root.Position
-		end)
-
-		-- cleanup function: restores everything
-		spiritConn = function()
-			pcall(function() noclip:Disconnect() end)
-			pcall(function() record:Disconnect() end)
-			for _, a in ipairs(removedAccs) do pcall(function() a.Parent = char end) end
-			for p, v in pairs(saved) do
-				pcall(function() if p and p.Parent then p.Transparency=v.t; p.Color=v.c; p.CastShadow=v.s end end)
-			end
-			pcall(function() glow:Destroy() end)
-			if spiritFrozen then spiritFrozen:Destroy(); spiritFrozen = nil end
-			spiritConn = nil
-			applyBuffs()
-		end
+		if not ok then warn("[TungSahur] pilot tick failed: " .. tostring(err)) end
 	end)
-
-	if not ok then
-		warn("[TungSahur] Spirit failed to start: " .. tostring(err))
-		inSpirit = false; tint(false); spiritBtn.Text = "SPIRIT (E)"
-		if spiritFrozen then spiritFrozen:Destroy(); spiritFrozen = nil end
-		applyBuffs()
-	end
 end
 
-exitSpirit = function(died, instantSwap)
-	if not inSpirit then return end
-	inSpirit = false; tint(false); spiritBtn.Text = "SPIRIT (E)"
-	local char = lp.Character; local hum = char and char:FindFirstChildOfClass("Humanoid")
+local function endPilotCommon()
+	pilotingDrone = false
+	droneBtn.Text = "DRONE (E)"
+	showFlightControls(false)
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	local root = char and char:FindFirstChild("HumanoidRootPart")
-	if died or not spiritConn then if spiritConn then spiritConn() end return end
-	if instantSwap then
-		if root then spiritLastPos = root.Position end
-		if spiritConn then spiritConn() end; return
+	if hum then hum.PlatformStand = false; hum.WalkSpeed = on.speed and (BASE_SPEED + speedBonus) or BASE_SPEED; hum.JumpPower = on.jump and (BASE_JUMP + jumpBonus) or BASE_JUMP end
+	if root then root.Anchored = false end
+	getCam().CameraSubject = hum
+end
+
+-- Tap while piloting: stop, and the drone flies itself back to your side (the idle-follow loop handles the flight).
+stopPilotReturn = function()
+	if not pilotingDrone then return end
+	droneParked = false
+	endPilotCommon()
+end
+
+-- Hold while piloting (needs Drone Park): stop, but leave the drone exactly where it is, with a sonar pulse that
+-- shows through walls. Tapping again later re-enters piloting it from right where you left it.
+stopPilotPark = function()
+	if not pilotingDrone then return end
+	droneParked = true
+	endPilotCommon()
+	droneBtn.Text = "DRONE (parked)"
+	if droneHighlight then droneHighlight.Enabled = true end
+	droneParkGlowLoop()
+end
+
+-- Hold from idle (needs Drone Mount): sit on the drone and fly it with your own body, in Roblox's default sit pose.
+-- (No Seat weld: your body is carried directly each frame, the same way the missile flight carries it.)
+mountDrone = function()
+	if mountedDrone or pilotingDrone or busy or missileBusy or gliding then return end
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	if not ensureDrone() then return end
+	if droneParked then -- mounting a parked drone: call it to you first
+		droneParked = false
+		clearPulseGui()
+		if droneHighlight then droneHighlight.Enabled = false end
+		droneCF = root.CFrame * DRONE_FOLLOW_OFFSET
 	end
-	if not (hum and root) or #spiritPath == 0 then if spiritConn then spiritConn() end return end
-	hum.WalkSpeed = 0; hum.JumpPower = 0; tint(true)
-	-- blue trail
-	local a0 = new("Attachment",{},root); local a1 = new("Attachment",{Position=Vector3.new(1.5,0,0)},root)
-	local tr = new("Trail",{Attachment0=a0,Attachment1=a1,Color=ColorSequence.new(BLUE),LightEmission=1,Lifetime=.5,Transparency=NumberSequence.new(.3,1)},root)
-	-- sample path so reversal takes ~2s regardless of how far you went
-	local rev = {}; for i = #spiritPath,1,-1 do rev[#rev+1] = spiritPath[i] end
-	local skip = math.max(1, math.floor(#rev/60)); local sampled = {}
-	for i=1,#rev,skip do sampled[#sampled+1]=rev[i] end
-	local idx, conn = 1
-	conn = RS.Heartbeat:Connect(function()
-		if idx > #sampled then
-			conn:Disconnect(); tr:Destroy(); a0:Destroy(); a1:Destroy(); tint(false)
-			if spiritConn then spiritConn() end; return
+	if not droneCF then droneCF = root.CFrame * DRONE_FOLLOW_OFFSET end
+	resetFace()
+	local solidParams = RaycastParams.new()
+	solidParams.FilterDescendantsInstances = {char, droneModel, coinFolder}
+
+	local ok, err = pcall(function()
+		mountCollideParts = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") and d.CanCollide then table.insert(mountCollideParts, d); d.CanCollide = false end
 		end
-		root.CFrame = sampled[idx]; root.AssemblyLinearVelocity = Vector3.zero; idx += 1
+		hum.WalkSpeed, hum.JumpPower = 0, 0
+		hum.PlatformStand = false
+		hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		root.Anchored = false
+		hum.Sit = true -- Roblox's own sit state: the default Animate script plays the default sit animation (R6 or R15)
+		-- belt and braces: also play the default sit animation directly, in case the game's Animate script doesn't
+		local animate = char:FindFirstChild("Animate")
+		local sitAnim = animate and animate:FindFirstChild("sit") and animate.sit:FindFirstChild("SitAnim")
+		local id = sitAnim and sitAnim.AnimationId
+			or ((hum.RigType == Enum.HumanoidRigType.R15) and "rbxassetid://2506281703" or "rbxassetid://178130996")
+		local a = Instance.new("Animation")
+		a.AnimationId = id
+		local animator = hum:FindFirstChildOfClass("Animator")
+		mountSitTrack = animator and animator:LoadAnimation(a) or hum:LoadAnimation(a)
+		mountSitTrack.Priority = Enum.AnimationPriority.Action
+		mountSitTrack.Looped = true
+		mountSitTrack:Play()
 	end)
+	if not ok then
+		warn("[TungSahur] Mount setup hit an error (continuing anyway): " .. tostring(err))
+	end
+
+	mountedDrone = true
+	droneBtn.Text = "DISMOUNT (E)"
+	showFlightControls(true)
+
+	local conn
+	conn = RS.Heartbeat:Connect(function(dt)
+		if not mountedDrone then conn:Disconnect() return end
+		local ok2, err2 = pcall(function()
+			local mv = readFlightInput(hum)
+			local pos, vel = droneCF.Position, Vector3.zero
+			if mv.Magnitude > .01 then
+				local want = mv.Unit * DRONE_MOUNT_SPEED * math.min(1, mv.Magnitude) * dt
+				local newPos = moveSolid(pos, want, solidParams) -- walls and floors stop you
+				vel = (newPos - pos) / math.max(dt, 1 / 240)
+				pos = newPos
+				turnToward(mv, dt)
+			end
+			droneCF = CFrame.lookAt(pos, pos + droneFace) -- level so you sit upright; the camera never turns it
+			placeDrone(droneCF, dt)
+			root.CFrame = droneCF * DRONE_SIT_OFFSET
+			root.AssemblyLinearVelocity = vel
+			root.AssemblyAngularVelocity = Vector3.zero
+			hum.Sit = true
+		end)
+		if not ok2 then warn("[TungSahur] mount tick failed: " .. tostring(err2)) end
+	end)
+end
+
+-- Tap while mounted: unmount. The drone resumes idle hover at your side on its own.
+unmountDrone = function()
+	if not mountedDrone then return end
+	mountedDrone = false
+	droneBtn.Text = "DRONE (E)"
+	showFlightControls(false)
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if mountSitTrack then pcall(function() mountSitTrack:Stop() end); mountSitTrack = nil end
+	if hum then
+		pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end)
+		hum.Sit = false
+	end
+	for _, d in ipairs(mountCollideParts) do
+		if d and d.Parent then d.CanCollide = true end
+	end
+	mountCollideParts = {}
+	if root then root.AssemblyLinearVelocity = Vector3.zero end
+	if hum and hum.Health > 0 then applyBuffs() end
 end
 
 ---------------------------------------------------------------- ESP (blue)
