@@ -1,0 +1,2713 @@
+-- LocalScript: put in StarterPlayer > StarterPlayerScripts
+-- DemonSummon: souls, Blessings/Curses, demon ritual + summon, ghost souls, summon limit + punishment, improved drone.
+-- RITUAL: type these three lines in chat yourself, in order (letters only, case ignored):
+--   1) i call the flame within the dark
+--   2) hear my plea and leave your mark
+--   3) rise up red and spark the spark
+-- Secret soul phrase is COIN_PHRASE below (owner only).
+
+local K, V = {}, {} -- K = settings, V = state. Luau allows only 200 local variables per script, so they live in tables.
+local Players = game:GetService("Players")
+local RS = game:GetService("RunService")
+local TS = game:GetService("TweenService")
+local TCS = game:GetService("TextChatService")
+local UIS = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Debris = game:GetService("Debris")
+V.lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+K.GOLD = Color3.fromRGB(255, 200, 40)
+K.BLUE = Color3.fromRGB(0, 140, 255)
+
+-- tweak these ------------------------------------------------------------
+K.BASE_SPEED, K.BASE_JUMP = 16, 50
+K.SPEED_STEP, K.JUMP_STEP = 3, 5          -- normal shop (weak)
+K.SUPER_SPEED, K.SUPER_JUMP = 10, 20      -- super shop (strong)
+K.SUPER_EVERY = 3                       -- every 3rd summon is a SUPER shop
+K.MISSILE_TURN = 6
+K.BASE_MTIME, K.BASE_MSPEED, K.BASE_MCD = 5, 110, 12
+K.DUR_STEP, K.MSPEED_STEP, K.CD_STEP, K.MIN_CD = 1, 25, 2, 3   -- missile upgrades
+K.MAGNET_RADIUS, K.MAGNET_SPEED = 45, 70
+K.GLIDE_TIME, K.GLIDE_RECHARGE = 6, 1.5    -- seconds of glide, recharge per second on the ground
+K.GLIDE_START, K.GLIDE_MIN, K.GLIDE_MAX = 45, 18, 120
+K.GLIDE_ACCEL, K.GLIDE_DRAG, K.GLIDE_SINK = 70, 5, 6   -- dive gains speed, climbing/level loses it
+K.COIN_COUNT, K.COIN_RESPAWN = 5, 30       -- natural souls alive at once, seconds until a collected one respawns (admin panel can change both)
+K.SOUL_RADIUS = 120                     -- natural souls spawn within this many studs of you
+K.SOUL_SOUND_ID = "rbxasset://sounds/electronicpingshort.wav" -- collect sound (built-in Roblox file; swap for your own)
+K.DEATH_SOUL_STEP = 300                 -- +1 soul per 5 minutes the dead player survived
+K.GDUR_STEP = 2                        -- glide duration upgrade (seconds per buy)
+K.DEATH_WIPES_ALL = true                -- true: ANY death wipes your buffs (Mercy saves them). false: only dying to Tung for not paying
+K.BABY_COUNT, K.BABY_DESPAWN = 10, 5      -- Mercy baby Tungs: how many fall, seconds until each one despawns
+K.FLOAT_HEIGHT, K.BOB_AMOUNT = 14, .8
+-- blessings / curses (all numbers here are my defaults, change freely)
+K.FORTUNE_G_PRICE = 25                      -- Greater Fortune price in souls
+K.SUMMON_LIMIT, K.SUMMON_WINDOW, K.LOCKOUT = 5, 180, 300  -- 6th summon inside 3 minutes = punishment; escaping = 5 minute lockout
+K.MERCY_BONUS = 5                           -- Mercys granted the first time you summon the demon (once per session)
+K.CURSE_TIME = 300                          -- curses last 5 minutes (survives death)
+K.MIN_SPEED, K.MIN_JUMP = 6, 20               -- curses never push you below these
+-- Coin cheat: letters and spaces only. Chat is public, so it ONLY works for the accounts in OWNER_USER_IDS
+-- (Roblox user IDs). Works for anyone in Studio test mode.
+K.COIN_PHRASE, K.COIN_AMOUNT = "quorble zanthic velvet mumbo plunk", 50
+K.OWNER_USER_IDS = {5312058798, 10459535763}
+-- ------------------------------------------------------------------------
+K.STEP = 1 / 60
+K.TIERS = {"ESP", "ESP + Names", "ESP + Chams", "ESP + Arrows"}
+
+-- state
+local souls, summons = 0, 0
+V.gotFirstSummon = false
+local summonCount, windowStart, lockoutUntil = 0, 0, 0 -- summon limit bookkeeping (os.clock values)
+local summonTotal, forcePunish = 0, false          -- total summons so far / admin: make the NEXT summon the lava obby
+local speedBonus, jumpBonus, espTier = 0, 0, 0
+local hasMissile, hasPhase = false, false
+local hasDrone, hasDronePark, hasDroneMount = false, false, false
+local pilotingDrone, mountedDrone, droneParked = false, false, false
+local droneModel, droneCF = nil, nil
+V.droneSeat = nil -- the temporary Seat used while mounted (built/destroyed per mount)
+local missileTime, missileSpeed, missileCd = K.BASE_MTIME, K.BASE_MSPEED, K.BASE_MCD
+local hasDouble, hasTriple, hasGlide, hasMulti, hasMagnet = false, false, false, false, false
+local mercy = 0
+V.on = {
+	speed = false, jump = false, esp = false, mdur = false, mspeed = false, mcd = false,
+	mphase = false, mjump = false, glide = false, magnet = false, gdur = false,
+	drone = false, dronepark = false, dronemount = false,
+}
+local busy, missileBusy, gliding = false, false, false
+V.lastMissile = -100
+local planning, stopRequested, planStart = false, false, 0
+V.glideMax = K.GLIDE_TIME
+V.glideEnergy = V.glideMax
+local coinTarget, coinRespawn = K.COIN_COUNT, K.COIN_RESPAWN
+-- how many times each buff has been bought (the shop and the admin panel both go through grant/revoke)
+V.lv = {
+	speed = 0, jump = 0, esp = 0, missile = 0, mdur = 0, mspeed = 0, mcd = 0, mphase = 0,
+	mjump = 0, glide = 0, gdur = 0, magnet = 0, multi = 0, mercy = 0, drone = 0, dronepark = 0, dronemount = 0,
+}
+local speedSteps, jumpSteps = {}, {}
+K.CAP = {esp = 4, missile = 1, mphase = 1, mjump = 2, glide = 1, magnet = 1, multi = 2, drone = 1, dronepark = 1, dronemount = 1, mcd = math.floor((K.BASE_MCD - K.MIN_CD) / K.CD_STEP)}
+local airTime, jumpsUsed, lastExtraJump = 0, 0, 0
+
+-- effective values (a buff only counts while its toggle is ON)
+local function eTime() return V.on.mdur and missileTime or K.BASE_MTIME end
+local function eSpeed() return V.on.mspeed and missileSpeed or K.BASE_MSPEED end
+local function eCd() return V.on.mcd and missileCd or K.BASE_MCD end
+local function ePhase() return hasPhase and V.on.mphase end
+local function maxJumps()
+	if not V.on.mjump then return 1 end
+	if hasTriple then return 3 elseif hasDouble then return 2 end
+	return 1
+end
+
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function corner(o, r) new("UICorner", {CornerRadius = UDim.new(0, r or 8)}, o) end
+
+-- Item prices are paid ON TOP of the summon fee. {base, extra per stack already owned}, so every stack costs more.
+K.PRICES = {
+	speed = {2, 1}, jump = {2, 1}, esp = {3, 2}, mdur = {3, 2}, mspeed = {3, 2}, mcd = {4, 2}, mphase = {8, 0},
+	mjump = {6, 6}, gdur = {3, 2}, glide = {12, 0}, missile = {14, 0}, multi = {10, 0}, magnet = {8, 0}, mercy = {8, 4},
+	drone = {16, 0}, dronepark = {8, 0}, dronemount = {10, 0},
+}
+K.SUPER_PRICES = {speed = {6, 3}, jump = {6, 3}} -- super speed/jump are pricier
+local function itemPrice(key, super)
+	if key == "djump" or key == "tjump" then key = "mjump" end
+	local p = (super and K.SUPER_PRICES[key]) or K.PRICES[key]
+	if not p then return 0 end
+	return p[1] + p[2] * (V.lv[key] or 0)
+end
+
+local useMissile, startGlide, stopGlide, sync, refreshAdmin, spawnBabies, ritualStop
+local startPilot, stopPilotReturn, stopPilotPark, mountDrone, unmountDrone, handleDroneInput, ensureDrone
+local droneBtn
+
+local function grant(key, super)
+	if key == "djump" or key == "tjump" then key = "mjump" end
+	if key == "multi" and super then -- Greater Fortune
+		if V.lv.multi >= 2 then return false end
+		V.lv.multi = 2
+		return true
+	end
+	if V.lv[key] == nil or V.lv[key] >= (K.CAP[key] or 99) then return false end
+	if (key == "mdur" or key == "mspeed" or key == "mcd" or key == "mphase") and V.lv.missile == 0 then V.lv.missile = 1 end
+	if key == "gdur" and V.lv.glide == 0 then V.lv.glide = 1 end
+	if (key == "dronepark" or key == "dronemount") and V.lv.drone == 0 then V.lv.drone = 1 end
+	V.lv[key] += 1
+	if key == "speed" then table.insert(speedSteps, super and K.SUPER_SPEED or K.SPEED_STEP)
+	elseif key == "jump" then table.insert(jumpSteps, super and K.SUPER_JUMP or K.JUMP_STEP) end
+	if V.on[key] ~= nil then V.on[key] = true end
+	return true
+end
+
+local function revoke(key)
+	if V.lv[key] == nil or V.lv[key] <= 0 then return false end
+	V.lv[key] -= 1
+	if key == "speed" then table.remove(speedSteps) elseif key == "jump" then table.remove(jumpSteps) end
+	return true
+end
+
+---------------------------------------------------------------- UI
+V.gui = new("ScreenGui", {Name = "TungUI", ResetOnSpawn = false, IgnoreGuiInset = true}, V.lp:WaitForChild("PlayerGui"))
+
+-- blue missile tint
+V.tintFrame = new("Frame", {
+	Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(0, 70, 255), BackgroundTransparency = 1, BorderSizePixel = 0,
+}, V.gui)
+V.cc = new("ColorCorrectionEffect", {
+	Enabled = false, TintColor = Color3.fromRGB(60, 110, 255), Saturation = -.3, Contrast = .15,
+}, Lighting)
+local function tint(state)
+	V.cc.Enabled = state
+	TS:Create(V.tintFrame, TweenInfo.new(.3), {BackgroundTransparency = state and .65 or 1}):Play()
+end
+
+-- coin counter (bottom left) with a drawn coin icon
+local box = new("Frame", {
+	AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 56), Size = UDim2.fromOffset(250, 40),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = .35,
+}, V.gui)
+corner(box, 10)
+V.icon = new("Frame", {Position = UDim2.fromOffset(8, 8), Size = UDim2.fromOffset(28, 28), BackgroundColor3 = Color3.fromRGB(200, 230, 255)}, box)
+corner(V.icon, 14)
+new("UIStroke", {Color = Color3.fromRGB(90, 140, 200), Thickness = 2}, V.icon)
+new("TextLabel", {
+	Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "S", TextColor3 = Color3.fromRGB(40, 70, 120),
+	Font = Enum.Font.GothamBlack, TextSize = 18,
+}, V.icon)
+V.counter = new("TextLabel", {
+	Position = UDim2.fromOffset(46, 0), Size = UDim2.new(1, -50, 1, 0), BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(200, 230, 255),
+	Font = Enum.Font.GothamBold, TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left,
+}, box)
+local function refresh()
+	V.counter.Text = "Souls: " .. souls .. (mercy > 0 and ("  |  Mercy x" .. mercy) or "")
+end
+refresh()
+
+-- flight seconds (top centre)
+V.flightLbl = new("TextLabel", {
+	AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 10), Size = UDim2.fromOffset(230, 40),
+	BackgroundColor3 = Color3.fromRGB(0, 40, 120), BackgroundTransparency = .3, TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 20, Visible = false,
+}, V.gui)
+corner(V.flightLbl, 10)
+local function setFlight(label, secs)
+	V.flightLbl.Visible = true
+	V.flightLbl.Text = label .. string.format("  %.1fs", math.max(0, secs))
+end
+
+-- glide meter (bottom centre)
+V.gbar = new("Frame", {
+	AnchorPoint = Vector2.new(.5, 1), Position = UDim2.new(.5, 0, 1, -70), Size = UDim2.fromOffset(220, 16),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = .35, Visible = false,
+}, V.gui)
+corner(V.gbar, 8)
+V.gfill = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(120, 220, 255), BorderSizePixel = 0}, V.gbar)
+corner(V.gfill, 8)
+
+-- shop menu: pick ONE buff, scrolls when it has many options
+V.menu = new("Frame", {
+	AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromScale(.9, .75),
+	BackgroundColor3 = Color3.fromRGB(20, 20, 20), Visible = false,
+}, V.gui)
+corner(V.menu, 12)
+new("UISizeConstraint", {MaxSize = Vector2.new(440, 560), MinSize = Vector2.new(240, 220)}, V.menu)
+local stroke = new("UIStroke", {Color = K.GOLD, Thickness = 3, Enabled = false}, V.menu)
+V.title = new("TextLabel", {
+	Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 0, 30), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold, TextSize = 16,
+}, V.menu)
+-- buttons leave a gutter on the right so you can drag-scroll without pressing one
+V.scroll = new("ScrollingFrame", {
+	Position = UDim2.fromOffset(8, 38), Size = UDim2.new(1, -16, 1, -88), BackgroundTransparency = 1, BorderSizePixel = 0,
+	ScrollBarThickness = 8, ScrollBarImageColor3 = K.GOLD, CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+}, V.menu)
+new("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, V.scroll)
+V.choiceEvt = Instance.new("BindableEvent")
+V.cancelBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(.5, 1), Position = UDim2.new(.5, 0, 1, -8), Size = UDim2.new(1, -16, 0, 36),
+	Text = "Leave (take nothing)", BackgroundColor3 = Color3.fromRGB(100, 30, 30),
+	TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14, Visible = false,
+}, V.menu)
+new("UICorner", {CornerRadius = UDim.new(0, 8)}, V.cancelBtn)
+V.cancelBtn.MouseButton1Click:Connect(function() V.choiceEvt:Fire("cancel") end)
+-- ===== blessing / curse pool (only approved effects) =====
+K.BLESSINGS = {
+	{id = "speed",   key = "speed",  name = "Swift",           greater = false, weight = 100, desc = "+" .. K.SPEED_STEP .. " walk speed"},
+	{id = "jump",    key = "jump",   name = "Jump",            greater = false, weight = 100, desc = "+" .. K.JUMP_STEP .. " jump power"},
+	{id = "magnet",  key = "magnet", name = "Soul Magnet",     greater = false, weight = 45,  desc = "pulls nearby souls to you"},
+	{id = "fortune", key = "multi",  name = "Fortune",         greater = false, weight = 35,  desc = "souls you collect x2"},
+	{id = "fortuneG",key = "multi",  name = "Greater Fortune", greater = true,  weight = 8,   desc = "souls you collect x3"},
+	{id = "mercy",   key = "mercy",  name = "Mercy",           greater = false, weight = 14,  desc = "death keeps your blessings (+baby Tungs)"},
+	{id = "djump",   key = "mjump",  name = "Double Jump",     greater = false, weight = 30,  desc = "jump again in the air"},
+	{id = "tjump",   key = "mjump",  name = "Triple Jump",     greater = false, weight = 16,  desc = "a third jump in the air"},
+	{id = "glide",   key = "glide",  name = "Glide",           greater = false, weight = 25,  desc = "glide through the air (G)"},
+	{id = "missile", key = "missile",name = "Missile",         greater = false, weight = 20,  desc = "steer a missile with the camera (Q)"},
+	{id = "drone",   key = "drone",  name = "Drone",           greater = false, weight = 18,  desc = "a drone you can fly (E)"},
+	{id = "dronepark",key = "dronepark", name = "Drone Park",  greater = false, weight = 20,  desc = "park the drone (needs Drone)"},
+	{id = "dronemount",key = "dronemount", name = "Drone Mount", greater = false, weight = 15, desc = "ride the drone (needs Drone)"},
+}
+-- family = which curse slot it occupies (taking the same family again just refreshes the 5 minutes)
+K.CURSES = {
+	{id = "heavy",    family = "heavy",    name = "Heavy Steps",         greater = false, weight = 100, reward = 5,  desc = "-4 walk speed"},
+	{id = "heavyG",   family = "heavy",    name = "Greater Heavy Steps", greater = true,  weight = 14,  reward = 12, desc = "-8 walk speed"},
+	{id = "blind",    family = "blind",    name = "Blind Spot",          greater = false, weight = 100, reward = 5,  desc = "screen edges go dark"},
+	{id = "blindG",   family = "blind",    name = "Greater Blind Spot",  greater = true,  weight = 14,  reward = 12, desc = "darkness creeps far inward"},
+	{id = "unsteady", family = "unsteady", name = "Unsteady",            greater = false, weight = 100, reward = 5,  desc = "-15 jump power"},
+	{id = "unsteadyG",family = "unsteady", name = "Greater Unsteady",    greater = true,  weight = 14,  reward = 12, desc = "-25 jump power"},
+	{id = "trip",     family = "trip",     name = "Trip",                greater = false, weight = 100, reward = 6,  desc = "you stumble now and then while running"},
+	{id = "tripG",    family = "trip",     name = "Greater Trip",        greater = true,  weight = 14,  reward = 14, desc = "you stumble often while running"},
+}
+local function blessingPrice(def)
+	if def.id == "fortuneG" then return K.FORTUNE_G_PRICE end
+	return itemPrice(def.key, def.greater)
+end
+local function blessingAvailable(def)
+	local id = def.id
+	if id == "magnet" then return not hasMagnet end
+	if id == "fortune" then return V.lv.multi == 0 end
+	if id == "fortuneG" then return V.lv.multi < 2 end
+	if id == "djump" then return not hasDouble end
+	if id == "tjump" then return hasDouble and not hasTriple end
+	if id == "glide" then return not hasGlide end
+	if id == "missile" then return not hasMissile end
+	if id == "drone" then return not hasDrone end
+	if id == "dronepark" then return hasDrone and not hasDronePark end
+	if id == "dronemount" then return hasDrone and not hasDroneMount end
+	return true
+end
+
+local function weightedPick(list, taken)
+	local total = 0
+	for _, d in ipairs(list) do if not taken[d.id] then total += d.weight end end
+	if total <= 0 then return nil end
+	local r = math.random() * total
+	for _, d in ipairs(list) do
+		if not taken[d.id] then
+			r -= d.weight
+			if r <= 0 then return d end
+		end
+	end
+end
+local function rollSet(list, n)
+	local taken, out = {}, {}
+	for _ = 1, n do
+		local d = weightedPick(list, taken)
+		if not d then break end
+		taken[d.id] = true
+		table.insert(out, d)
+	end
+	return out
+end
+
+-- Slot-machine picker: 3 blessings + 3 curses spin at once, lock one after another, then you may pick ONE.
+V.menuButtons = {}
+V.pickerToken = 0
+K.REEL_LOCK = 1.0 -- seconds before the first reel stops; each next one stops .3s later
+local function showPicker()
+	V.pickerToken += 1
+	local token = V.pickerToken
+	for _, b in ipairs(V.menuButtons) do b:Destroy() end
+	V.menuButtons = {}
+	V.scroll.CanvasPosition = Vector2.zero
+	V.cancelBtn.Visible = true
+	V.menu.BackgroundColor3 = Color3.fromRGB(20, 12, 16)
+	stroke.Enabled = true
+	stroke.Color = Color3.fromRGB(190, 30, 30)
+	V.title.Text = "The demon offers...  Souls: " .. souls
+	V.title.TextColor3 = Color3.fromRGB(255, 120, 120)
+
+	local avail = {}
+	for _, d in ipairs(K.BLESSINGS) do if blessingAvailable(d) then table.insert(avail, d) end end
+	local bl, cu = rollSet(avail, 3), rollSet(K.CURSES, 3)
+	local order, picked = 0, false
+	local function header(text, color)
+		order += 1
+		local l = new("TextLabel", {
+			Size = UDim2.new(1, -44, 0, 24), LayoutOrder = order, BackgroundTransparency = 1, Text = text, TextColor3 = color,
+			Font = Enum.Font.GothamBlack, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+		}, V.scroll)
+		table.insert(V.menuButtons, l)
+	end
+	local function card(def, isCurse, list, lockAt)
+		order += 1
+		local price = isCurse and 0 or blessingPrice(def)
+		local affordable = isCurse or souls >= price
+		local final = def.name .. "\n" .. def.desc .. (isCurse
+			and ("  (5 min)  -  earn " .. def.reward .. " souls")
+			or ("  -  costs " .. price .. " souls"))
+		local base = isCurse and (def.greater and Color3.fromRGB(95, 30, 120) or Color3.fromRGB(80, 25, 25))
+			or (def.greater and Color3.fromRGB(190, 150, 20) or Color3.fromRGB(35, 60, 95))
+		local b = new("TextButton", {
+			Size = UDim2.new(1, -44, 0, 60), LayoutOrder = order, Text = "...", Font = Enum.Font.GothamBold, TextSize = 13,
+			TextWrapped = true, BackgroundColor3 = base, TextColor3 = Color3.new(1, 1, 1),
+			Active = false, AutoButtonColor = false,
+		}, V.scroll)
+		corner(b)
+		table.insert(V.menuButtons, b)
+		task.spawn(function()
+			local t0 = os.clock()
+			while os.clock() - t0 < lockAt and token == V.pickerToken do
+				b.Text = list[math.random(#list)].name
+				task.wait(.07)
+			end
+			if token ~= V.pickerToken then return end
+			b.Text = final
+			if not affordable then
+				b.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+				b.TextColor3 = Color3.fromRGB(150, 150, 150)
+				return
+			end
+			b.Active, b.AutoButtonColor = true, true
+			b.MouseButton1Click:Connect(function()
+				if picked or token ~= V.pickerToken then return end -- only ONE option per summon
+				picked = true
+				for _, x in ipairs(V.menuButtons) do
+					if x:IsA("TextButton") then x.Active = false x.AutoButtonColor = false end
+				end
+				b.BackgroundColor3 = K.GOLD
+				b.TextColor3 = Color3.new(0, 0, 0)
+				V.choiceEvt:Fire(def)
+			end)
+		end)
+	end
+	header("BLESSINGS  (cost souls)", Color3.fromRGB(120, 200, 255))
+	for i, d in ipairs(bl) do card(d, false, K.BLESSINGS, K.REEL_LOCK + (i - 1) * .3) end
+	header("CURSES  (earn souls)", Color3.fromRGB(255, 110, 110))
+	for i, d in ipairs(cu) do card(d, true, K.CURSES, K.REEL_LOCK + (i + 2) * .3) end
+end
+
+-- on-screen buttons (right side, above the jump button)
+V.abilityBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, .5, -20), Size = UDim2.fromOffset(130, 52),
+	BackgroundColor3 = Color3.fromRGB(0, 90, 220), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 16, Visible = false, Text = "MISSILE (Q)",
+}, V.gui)
+corner(V.abilityBtn, 10)
+V.abilityBtn.MouseButton1Click:Connect(function() useMissile() end)
+V.glideBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -16, .5, 0), Size = UDim2.fromOffset(130, 52),
+	BackgroundColor3 = Color3.fromRGB(40, 150, 200), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 16, Visible = false, Text = "GLIDE (G)",
+}, V.gui)
+corner(V.glideBtn, 10)
+V.glideBtn.MouseButton1Click:Connect(function() startGlide() end)
+
+-- TUNG toggle menu (next to the Roblox top bar). Scripts can't add to Roblox's own menu.
+K.MENU_X = 385 -- just right of the shop button; nudge this number left/right to line it up
+V.panelOpen = false
+V.menuBtn = new("TextButton", {
+	Position = UDim2.fromOffset(K.MENU_X, 4), Size = UDim2.fromOffset(110, 36), Text = "BLESSINGS",
+	BackgroundColor3 = Color3.fromRGB(25, 25, 25), BackgroundTransparency = .2, TextColor3 = K.GOLD,
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false,
+}, V.gui)
+corner(V.menuBtn)
+V.panel = new("ScrollingFrame", {
+	Position = UDim2.fromOffset(K.MENU_X, 46), Size = UDim2.fromOffset(170, 230), BackgroundTransparency = 1,
+	BorderSizePixel = 0, ScrollBarThickness = 6, CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false,
+}, V.gui)
+new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, V.panel)
+V.menuBtn.MouseButton1Click:Connect(function() V.panelOpen = not V.panelOpen V.panel.Visible = V.panelOpen end)
+V.panelButtons = {}
+K.TOGGLES = { -- {key, label, unlocked?, number shown on the button}
+	{"speed", "Speed", function() return speedBonus > 0 end, function() return V.lv.speed end},
+	{"jump", "Jump", function() return jumpBonus > 0 end, function() return V.lv.jump end},
+	{"esp", "ESP", function() return espTier > 0 end, function() return V.lv.esp end},
+	{"mdur", "Missile Time", function() return V.lv.mdur > 0 end, function() return V.lv.mdur end},
+	{"mspeed", "Missile Speed", function() return V.lv.mspeed > 0 end, function() return V.lv.mspeed end},
+	{"mcd", "Missile Cooldown", function() return V.lv.mcd > 0 end, function() return V.lv.mcd end},
+	{"mphase", "Missile Phase", function() return hasPhase end},
+	{"mjump", "Multi Jump", function() return hasDouble end, function() return V.lv.mjump + 1 end},
+	{"glide", "Glide", function() return hasGlide end},
+	{"gdur", "Glide Time", function() return V.lv.gdur > 0 end, function() return V.lv.gdur end},
+	{"magnet", "Soul Magnet", function() return hasMagnet end},
+	{"drone", "Drone", function() return hasDrone end},
+	{"dronepark", "Drone Park", function() return hasDronePark end},
+	{"dronemount", "Drone Mount", function() return hasDroneMount end},
+}
+
+---------------------------------------------------------------- Curses (5 minutes, survive death)
+V.punishing = false -- set by the punishment (stage 4); curses are ignored while true
+V.curses = {}       -- family -> {expires, greater, name}
+V.nextTrip = 0
+local function curseOn(f)
+	local c = V.curses[f]
+	if c and c.expires > os.clock() then return c end
+end
+
+-- Blind Spot overlay: four edge gradients. Frames are not Active, so touches pass straight through.
+V.overlayGui = new("ScreenGui", {Name = "DemonCurseOverlay", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = -5}, V.lp:WaitForChild("PlayerGui"))
+V.blindEdges = {}
+for _, e in ipairs({
+	{"L", Vector2.new(0, 0), UDim2.fromScale(0, 0), 0, true}, {"R", Vector2.new(1, 0), UDim2.fromScale(1, 0), 180, true},
+	{"T", Vector2.new(0, 0), UDim2.fromScale(0, 0), 90, false}, {"B", Vector2.new(0, 1), UDim2.fromScale(0, 1), 270, false},
+}) do
+	local f = new("Frame", {AnchorPoint = e[2], Position = e[3], BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Visible = false}, V.overlayGui)
+	new("UIGradient", {
+		Rotation = e[4],
+		Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, .05), NumberSequenceKeypoint.new(1, 1)}),
+	}, f)
+	V.blindEdges[e[1]] = {frame = f, side = e[5]}
+end
+local function setBlind(c)
+	for _, e in pairs(V.blindEdges) do
+		e.frame.Visible = c ~= nil
+		if c then
+			local k = c.greater and 1 or 0
+			if e.side then e.frame.Size = UDim2.fromScale(.22 + .14 * k, 1)       -- left / right: share of the width
+			else e.frame.Size = UDim2.fromScale(1, .3 + .16 * k) end             -- top / bottom: share of the height
+		end
+	end
+end
+
+K.CURSE_ORDER = {"heavy", "blind", "unsteady", "trip"}
+local function refreshCurses() setBlind(curseOn("blind")) end
+
+-- One purple orb per active curse circles you. HOLD an orb (mouse or finger): it slows down and shows the curse + time left.
+V.orbFolder = new("Folder", {Name = "DemonCurseOrbs"}, workspace)
+V.orbs = {}
+K.ORBIT_R, K.ORBIT_SPEED, K.HELD_SLOW = 4.5, 1.6, .08
+local function destroyOrb(f)
+	local o = V.orbs[f]
+	if not o then return end
+	V.orbs[f] = nil
+	if o.endConn then o.endConn:Disconnect() end
+	o.part:Destroy()
+end
+local function makeOrb(f, c)
+	local size = c.greater and 1.6 or 1.1
+	local part = new("Part", {
+		Shape = Enum.PartType.Ball, Size = Vector3.new(size, size, size), Color = Color3.fromRGB(150, 60, 230),
+		Material = Enum.Material.Neon, Transparency = .1, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+	}, V.orbFolder)
+	new("PointLight", {Color = Color3.fromRGB(170, 90, 255), Range = 8, Brightness = 1.5}, part)
+	local bb = new("BillboardGui", {Adornee = part, Size = UDim2.fromOffset(170, 80), AlwaysOnTop = true, LightInfluence = 0, MaxDistance = 250}, part)
+	local btn = new("TextButton", { -- big invisible touch target on top of the orb
+		AnchorPoint = Vector2.new(.5, .5), Position = UDim2.new(.5, 0, 0, 40), Size = UDim2.fromOffset(56, 56),
+		BackgroundTransparency = 1, Text = "",
+	}, bb)
+	local lbl = new("TextLabel", {
+		Position = UDim2.new(0, 0, 0, 72), Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = Color3.fromRGB(40, 10, 70),
+		BackgroundTransparency = .3, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13,
+		TextWrapped = true, Visible = false,
+	}, bb)
+	corner(lbl, 6)
+	local o = {part = part, lbl = lbl, angle = math.random() * 6.28, held = false, greater = c.greater, name = c.name}
+	local heldInput
+	btn.InputBegan:Connect(function(input)
+		if heldInput then return end
+		if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			heldInput, o.held = input, true
+		end
+	end)
+	o.endConn = UIS.InputEnded:Connect(function(input)
+		if input == heldInput then heldInput, o.held, lbl.Visible = nil, false, false end
+	end)
+	V.orbs[f] = o
+end
+
+RS.Heartbeat:Connect(function(dt)
+	local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
+	for idx, f in ipairs(K.CURSE_ORDER) do
+		local c = curseOn(f)
+		local o = V.orbs[f]
+		if o and (not c or o.greater ~= c.greater) then destroyOrb(f) o = nil end
+		if c and not o then makeOrb(f, c) o = V.orbs[f] end
+		if o then
+			o.angle += dt * K.ORBIT_SPEED * (o.held and K.HELD_SLOW or 1)
+			if root then
+				local a = o.angle + (idx - 1) * (math.pi / 2)
+				o.part.Position = root.Position + Vector3.new(math.cos(a) * K.ORBIT_R, 1 + math.sin(o.angle * 1.7 + idx) * .6, math.sin(a) * K.ORBIT_R)
+			end
+			if o.held then
+				local left = math.max(0, math.ceil(c.expires - os.clock()))
+				o.lbl.Visible = true
+				o.lbl.Text = string.format("%s\n%d:%02d left", c.name, left // 60, left % 60)
+			end
+		end
+	end
+end)
+local function addCurse(def)
+	V.curses[def.family] = {expires = os.clock() + K.CURSE_TIME, greater = def.greater, name = def.name}
+	if def.family == "trip" then V.nextTrip = os.clock() + (def.greater and 5 or 9) end
+end
+
+-- one slow loop expires curses (no per-curse timers to leak)
+task.spawn(function()
+	while true do
+		task.wait(.5)
+		local changed = false
+		for f, c in pairs(V.curses) do
+			if c.expires <= os.clock() then V.curses[f] = nil changed = true end
+		end
+		if changed then sync() else refreshCurses() end
+	end
+end)
+
+-- Trip: only while actually running on the ground, then a cooldown
+V.runFor = 0
+RS.Heartbeat:Connect(function(dt)
+	local t = curseOn("trip")
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (t and hum) or hum.Health <= 0 then V.runFor = 0 return end
+	local running = hum.MoveDirection.Magnitude > .1 and hum.FloorMaterial ~= Enum.Material.Air and hum.WalkSpeed >= 8
+		and not (busy or missileBusy or gliding or pilotingDrone or mountedDrone or V.punishing)
+		and hum:GetState() ~= Enum.HumanoidStateType.FallingDown
+	V.runFor = running and V.runFor + dt or 0
+	if running and V.runFor > 1 and os.clock() >= V.nextTrip then
+		V.runFor = 0
+		V.nextTrip = os.clock() + (t.greater and math.random(5, 9) or math.random(9, 16))
+		pcall(function() hum:ChangeState(Enum.HumanoidStateType.FallingDown) end)
+		task.delay(1.2, function() -- stand back up (fallback in case the state does not recover by itself)
+			if hum.Parent and hum.Health > 0 and not mountedDrone then
+				pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+			end
+		end)
+	end
+end)
+
+local function applyBuffs()
+	local hum = V.lp.Character and V.lp.Character:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	local speed = V.on.speed and (K.BASE_SPEED + speedBonus) or K.BASE_SPEED
+	local jump = V.on.jump and (K.BASE_JUMP + jumpBonus) or K.BASE_JUMP
+	if not V.punishing then
+		local h, u = curseOn("heavy"), curseOn("unsteady")
+		if h then speed = math.max(K.MIN_SPEED, speed - (h.greater and 8 or 4)) end
+		if u then jump = math.max(K.MIN_JUMP, jump - (u.greater and 25 or 15)) end
+	end
+	hum.UseJumpPower = true
+	hum.WalkSpeed = speed
+	hum.JumpPower = jump
+end
+
+local function refreshPanel()
+	for _, b in ipairs(V.panelButtons) do b:Destroy() end
+	V.panelButtons = {}
+	local any = false
+	for i, t in ipairs(K.TOGGLES) do
+		if t[3]() then
+			any = true
+			local key = t[1]
+			local b = new("TextButton", {
+				Size = UDim2.new(1, -24, 0, 38), LayoutOrder = i, Text = t[2] .. ": " .. (V.on[key] and "ON" or "OFF"),
+				BackgroundColor3 = V.on[key] and Color3.fromRGB(30, 90, 40) or Color3.fromRGB(40, 40, 40),
+				TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 12, TextWrapped = true,
+			}, V.panel)
+			corner(b)
+			new("UIPadding", {PaddingRight = UDim.new(0, 24)}, b)
+			local n = t[4] and t[4]()
+			if n then -- small level number on the button
+				new("TextLabel", {
+					AnchorPoint = Vector2.new(1, .5), Position = UDim2.new(1, 20, .5, 0), Size = UDim2.fromOffset(22, 18),
+					BackgroundTransparency = 1, Text = tostring(n), TextColor3 = K.GOLD, Font = Enum.Font.GothamBlack, TextSize = 15,
+				}, b)
+			end
+			b.MouseButton1Click:Connect(function()
+				V.on[key] = not V.on[key]
+				sync()
+			end)
+			table.insert(V.panelButtons, b)
+		end
+	end
+	V.menuBtn.Visible = any
+	V.panel.Visible = any and V.panelOpen
+	V.abilityBtn.Visible = hasMissile
+	if droneBtn then droneBtn.Visible = hasDrone and V.on.drone end
+	V.glideBtn.Visible = hasGlide and V.on.glide
+	V.gbar.Visible = hasGlide and V.on.glide
+end
+
+-- recompute every buff variable from the levels, then refresh all the UI
+sync = function()
+	speedBonus, jumpBonus = 0, 0
+	for _, v in ipairs(speedSteps) do speedBonus += v end
+	for _, v in ipairs(jumpSteps) do jumpBonus += v end
+	espTier = V.lv.esp
+	hasMissile, hasPhase = V.lv.missile > 0, V.lv.mphase > 0
+	missileTime = K.BASE_MTIME + K.DUR_STEP * V.lv.mdur
+	missileSpeed = K.BASE_MSPEED + K.MSPEED_STEP * V.lv.mspeed
+	missileCd = math.max(K.MIN_CD, K.BASE_MCD - K.CD_STEP * V.lv.mcd)
+	hasDouble, hasTriple = V.lv.mjump >= 1, V.lv.mjump >= 2
+	hasGlide, hasMulti, hasMagnet = V.lv.glide > 0, V.lv.multi > 0, V.lv.magnet > 0
+	hasDrone, hasDronePark, hasDroneMount = V.lv.drone > 0, V.lv.dronepark > 0, V.lv.dronemount > 0
+	if hasDrone and ensureDrone then ensureDrone() end -- the idle-hover loop then parents/positions it automatically
+	mercy = V.lv.mercy
+	V.glideMax = K.GLIDE_TIME + (V.on.gdur and K.GDUR_STEP * V.lv.gdur or 0)
+	V.glideEnergy = math.min(V.glideEnergy, V.glideMax)
+	refresh()
+	refreshPanel()
+	applyBuffs()
+	refreshCurses()
+	refreshAdmin()
+end
+
+local function resetAll()
+	if pilotingDrone and stopPilotReturn then stopPilotReturn() end
+	if mountedDrone and unmountDrone then unmountDrone() end
+	droneParked = false
+	if droneModel then droneModel:Destroy(); droneModel = nil end
+	summons = 0
+	for k in pairs(V.lv) do V.lv[k] = 0 end
+	speedSteps, jumpSteps = {}, {}
+	for k in pairs(V.on) do V.on[k] = false end
+	V.panelOpen = false
+	sync()
+end
+
+local killedByTung, pendingBabies = false, false
+local function onDeath()
+	if ritualStop then ritualStop() end -- a half-finished ritual ends when you die
+	pilotingDrone = false -- stop any drone control immediately; resetAll()/mercy below decide if you keep the drone itself
+	mountedDrone = false
+	if V.droneSeat then V.droneSeat:Destroy(); V.droneSeat = nil end
+	if K.DEATH_WIPES_ALL or killedByTung then
+		if V.lv.mercy > 0 then
+			V.lv.mercy -= 1 -- Mercy: keep everything, baby Tungs rain down when you respawn
+			pendingBabies = true
+			sync()
+		else
+			resetAll() -- lose every buff, summon fee back to 5
+		end
+	end
+	killedByTung = false
+end
+local function hookDeath(char)
+	local h = char:WaitForChild("Humanoid", 10)
+	if h then h.Died:Connect(onDeath) end
+end
+if V.lp.Character then task.spawn(hookDeath, V.lp.Character) end
+V.lp.CharacterAdded:Connect(function(char)
+	task.spawn(hookDeath, char)
+	if gliding then stopGlide() end
+	task.wait(.5)
+	applyBuffs()
+	local h = char:FindFirstChildOfClass("Humanoid")
+	if h then cam.CameraSubject = h end
+	if pendingBabies then
+		pendingBabies = false
+		char:WaitForChild("HumanoidRootPart", 5)
+		task.wait(1)
+		spawnBabies()
+	end
+end)
+UIS.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.Q then useMissile() end
+	if input.KeyCode == Enum.KeyCode.G then startGlide() end
+end)
+
+---------------------------------------------------------------- Souls (client-side)
+-- coinFolder keeps its old name because every raycast filter in the script already ignores it.
+V.coinFolder = new("Folder", {Name = "LocalSouls"}, workspace)
+local natural, deathSouls, pendingSpawns = {}, {}, {} -- natural souls / souls from player deaths / respawn timers
+local function soulMult() return V.lv.multi >= 2 and 3 or (V.lv.multi == 1 and 2 or 1) end
+
+-- 3D ghost: round head, thin tapering tail, no arms, black oval eyes, open "scream" mouth.
+-- Every part is an ellipsoid (a Block with a Sphere mesh), positioned each frame so the tail can sway and lag.
+K.MINSZ = .05
+local function sz(v, k) return Vector3.new(math.max(K.MINSZ, v.X * k), math.max(K.MINSZ, v.Y * k), math.max(K.MINSZ, v.Z * k)) end
+K.TAIL = { -- {size, y offset}
+	{Vector3.new(1.9, 2.1, 1.9), -1.5}, {Vector3.new(1.5, 1.8, 1.5), -2.3}, {Vector3.new(1.15, 1.5, 1.15), -2.95},
+	{Vector3.new(.85, 1.2, .85), -3.5}, {Vector3.new(.6, .95, .6), -3.95}, {Vector3.new(.4, .8, .4), -4.3},
+}
+local function buildSoul()
+	local m = Instance.new("Model")
+	m.Name = "Soul"
+	local function blob(size, color, transp, mat)
+		local p = new("Part", {
+			Size = size, Color = color, Material = mat or Enum.Material.SmoothPlastic, Transparency = transp,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+		new("SpecialMesh", {MeshType = Enum.MeshType.Sphere}, p)
+		return p
+	end
+	local black = Color3.new(0, 0, 0)
+	local rigid, tail = {}, {}
+	local function add(part, off, rot, size) table.insert(rigid, {part = part, off = off, rot = rot or CFrame.new(), size = size}) end
+	local headSize = Vector3.new(2.4, 2.6, 2.4)
+	local head = blob(headSize, Color3.fromRGB(200, 222, 255), .15, Enum.Material.Neon)
+	new("PointLight", {Color = Color3.fromRGB(170, 200, 255), Range = 10, Brightness = 1.2}, head)
+	add(head, Vector3.zero, nil, headSize)
+	for _, sx in ipairs({-1, 1}) do
+		local es = Vector3.new(.4, .8, .25)
+		add(blob(es, black, 0), Vector3.new(sx * .5, .35, -1.08), nil, es)                                       -- eyes
+	end
+	local ms = Vector3.new(.7, 1.0, .25)
+	add(blob(ms, black, 0), Vector3.new(0, -.55, -1.08), nil, ms)                                                -- screaming mouth
+	for i, t in ipairs(K.TAIL) do
+		table.insert(tail, {part = blob(t[1], Color3.fromRGB(200, 222, 255), .2 + i * .07, Enum.Material.Neon), size = t[1], y = t[2]})
+	end
+	return m, rigid, tail
+end
+
+local function popScale(age) -- tiny -> overshoot -> normal
+	if age >= .45 then return 1 end
+	local k = age / .45 - 1
+	return math.max(.05, 1 + 2.70158 * k * k * k + 1.70158 * k * k)
+end
+
+local function layoutSoul(s, t, lookAt)
+	local sc = s.scale
+	local d = lookAt - s.pos
+	d = Vector3.new(d.X, 0, d.Z)
+	if d.Magnitude > .01 then s.face = d.Unit end
+	local base = CFrame.lookAt(s.pos, s.pos + s.face)
+	local resize = s.lastSc ~= sc
+	s.lastSc = sc
+	for _, r in ipairs(s.rigid) do
+		if resize then r.part.Size = sz(r.size, sc) end
+		r.part.CFrame = base * CFrame.new(r.off * sc) * r.rot
+	end
+	local vl = base:VectorToObjectSpace(s.vel)
+	for i, tl in ipairs(s.tail) do
+		if resize then tl.part.Size = sz(tl.size, sc) end
+		-- each segment swings a little later than the one above it, and trails behind when the soul is moving
+		local sway = math.sin(t * 2.6 - i * .7) * .16 * i
+		local lagX = math.clamp(-vl.X * .05 * i, -1.2, 1.2)
+		local lagZ = math.clamp(-vl.Z * .05 * i, -1.2, 1.2)
+		tl.part.CFrame = base * CFrame.new(Vector3.new(sway + lagX, tl.y, lagZ + math.cos(t * 2.1 - i * .7) * .05 * i) * sc)
+	end
+end
+
+local function makeSoul(kind, pos)
+	local m, rigid, tail = buildSoul()
+	m.Parent = V.coinFolder
+	return {kind = kind, model = m, rigid = rigid, tail = tail, pos = pos, base = pos, vel = Vector3.zero,
+		scale = .05, born = os.clock(), phase = math.random() * 6.28, face = Vector3.new(0, 0, -1), amount = 1}
+end
+
+-- natural souls: random surface within SOUL_RADIUS
+local function spawnNatural()
+	local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
+	if not root then return false end
+	local ang, dist = math.random() * math.pi * 2, math.random(15, K.SOUL_RADIUS)
+	local origin = root.Position + Vector3.new(math.cos(ang) * dist, 100, math.sin(ang) * dist)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {V.lp.Character, V.coinFolder}
+	local hit = workspace:Raycast(origin, Vector3.new(0, -300, 0), params)
+	if not hit or hit.Normal.Y < .3 then return false end
+	table.insert(natural, makeSoul("natural", hit.Position + Vector3.new(0, 3, 0)))
+	return true
+end
+
+-- souls from OTHER players' deaths: spawn at the body, pop, then gain momentum toward you
+local function spawnDeathSoul(pos, survivedSecs)
+	if #deathSouls >= 30 then table.remove(deathSouls, 1).model:Destroy() end -- never let them pile up forever
+	local s = makeSoul("death", pos)
+	s.amount = 1 + math.floor(survivedSecs / K.DEATH_SOUL_STEP) -- <5min 1, 5-10min 2, 10-15min 3 ...
+	s.vel = Vector3.new(math.random(-6, 6), math.random(10, 16), math.random(-6, 6))
+	table.insert(deathSouls, s)
+end
+
+local function collectEffect(pos)
+	pcall(function()
+		local snd = new("Sound", {SoundId = K.SOUL_SOUND_ID, Volume = .7}, V.gui)
+		snd:Play()
+		Debris:AddItem(snd, 3)
+	end)
+	local p = new("Part", {
+		Shape = Enum.PartType.Ball, Size = Vector3.new(1, 1, 1), Position = pos, Color = Color3.fromRGB(200, 225, 255), Material = Enum.Material.Neon,
+		Transparency = .2, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+	}, workspace)
+	TS:Create(p, TweenInfo.new(.4), {Size = Vector3.new(6, 6, 6), Transparency = 1}):Play()
+	Debris:AddItem(p, .5)
+end
+local function collectSoul(s, list, i)
+	souls += s.amount * soulMult()
+	refresh()
+	collectEffect(s.pos)
+	s.model:Destroy()
+	table.remove(list, i)
+	if s.kind == "natural" then table.insert(pendingSpawns, os.clock() + coinRespawn) end
+end
+
+-- keeps ~coinTarget natural souls alive: respawn timers, and re-place any that you left far behind
+task.spawn(function()
+	while true do
+		task.wait(.5)
+		local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
+		if root then
+			for i = #natural, 1, -1 do
+				local s = natural[i]
+				if (s.base - root.Position).Magnitude > K.SOUL_RADIUS * 1.6 then -- out of range: relocate near you right away
+					s.model:Destroy()
+					table.remove(natural, i)
+					table.insert(pendingSpawns, 0)
+				end
+			end
+			while #natural > coinTarget do table.remove(natural).model:Destroy() end
+			while #natural + #pendingSpawns > coinTarget and #pendingSpawns > 0 do table.remove(pendingSpawns) end
+			while #natural + #pendingSpawns < coinTarget do table.insert(pendingSpawns, 0) end
+			for i = #pendingSpawns, 1, -1 do
+				if pendingSpawns[i] <= os.clock() and #natural < coinTarget and spawnNatural() then
+					table.remove(pendingSpawns, i)
+				end
+			end
+		end
+	end
+end)
+
+-- one loop animates + collects everything
+RS.Heartbeat:Connect(function(dt)
+	local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
+	-- while piloting the drone, it collects natural souls instead of your (frozen) body
+	local collectPos = (pilotingDrone and droneCF) and droneCF.Position or (root and root.Position)
+	local canCollect = not busy and not missileBusy
+	local now = os.clock()
+	local faceAt = collectPos
+	for i = #natural, 1, -1 do
+		local s = natural[i]
+		if collectPos and hasMagnet and V.on.magnet then -- Soul Magnet pulls nearby natural souls
+			local d = collectPos - s.base
+			if d.Magnitude < K.MAGNET_RADIUS and d.Magnitude > .1 then
+				s.base += d.Unit * math.min(d.Magnitude, K.MAGNET_SPEED * dt)
+			end
+		end
+		s.pos = s.base + Vector3.new(0, math.sin(now * 2 + s.phase) * .4, 0)
+		s.scale = popScale(now - s.born)
+		layoutSoul(s, now, faceAt or s.pos)
+		if collectPos and canCollect and (collectPos - s.base).Magnitude < 5 then collectSoul(s, natural, i) end
+	end
+	for i = #deathSouls, 1, -1 do
+		local s = deathSouls[i]
+		local age = now - s.born
+		if age > 120 then
+			s.model:Destroy()
+			table.remove(deathSouls, i)
+		else
+			if root and age > .5 then -- after the pop, accelerate toward the player
+				local to = root.Position + Vector3.new(0, 1, 0) - s.pos
+				if to.Magnitude > .1 then s.vel += to.Unit * 70 * dt end
+				if s.vel.Magnitude > 85 then s.vel = s.vel.Unit * 85 end
+			else
+				s.vel *= math.max(0, 1 - 2 * dt)
+			end
+			s.pos += s.vel * dt
+			s.scale = popScale(age)
+			layoutSoul(s, now, root and root.Position or s.pos)
+			local nearBody = root and (s.pos - root.Position).Magnitude < 4
+			local nearDrone = pilotingDrone and droneCF and (s.pos - droneCF.Position).Magnitude < 5 -- the drone can grab them too
+			if canCollect and age > .5 and (nearBody or nearDrone) then collectSoul(s, deathSouls, i) end
+		end
+	end
+end)
+
+-- watch every OTHER player's death (survival time = time since we saw them spawn)
+V.tracked = {}
+local function trackPlayer(p)
+	if p == V.lp or V.tracked[p] then return end
+	local rec = {spawnAt = os.clock()}
+	V.tracked[p] = rec
+	local function onChar(char)
+		rec.spawnAt = os.clock()
+		if rec.died then rec.died:Disconnect() rec.died = nil end
+		local hum = char:WaitForChild("Humanoid", 10)
+		if not hum or V.tracked[p] ~= rec then return end
+		rec.died = hum.Died:Connect(function()
+			local r = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Head")
+			if r then spawnDeathSoul(r.Position, os.clock() - rec.spawnAt) end
+		end)
+	end
+	rec.added = p.CharacterAdded:Connect(onChar)
+	if p.Character then task.spawn(onChar, p.Character) end
+end
+Players.PlayerAdded:Connect(trackPlayer)
+for _, p in ipairs(Players:GetPlayers()) do trackPlayer(p) end
+Players.PlayerRemoving:Connect(function(p)
+	local rec = V.tracked[p]
+	if rec then
+		if rec.died then rec.died:Disconnect() end
+		if rec.added then rec.added:Disconnect() end
+		V.tracked[p] = nil
+	end
+end)
+
+---------------------------------------------------------------- Admin panel (owner accounts only)
+V.isOwner = table.find(K.OWNER_USER_IDS, V.lp.UserId) ~= nil or RS:IsStudio()
+K.ADMIN_BUFFS = {
+	{"speed", "Speed"}, {"jump", "Jump"}, {"esp", "ESP tier"}, {"missile", "Missile"},
+	{"mdur", "Missile Time"}, {"mspeed", "Missile Speed"}, {"mcd", "Missile Cooldown"}, {"mphase", "Missile Phase"},
+	{"mjump", "Extra Jumps"}, {"glide", "Glide"}, {"gdur", "Glide Time"},
+	{"magnet", "Soul Magnet"}, {"multi", "Fortune (1=x2, 2=x3)"}, {"mercy", "Mercy"},
+	{"drone", "Drone"}, {"dronepark", "Drone Park"}, {"dronemount", "Drone Mount"},
+}
+refreshAdmin = function() end
+
+if V.isOwner then
+	local adminSuper = false
+	local adminLabels = {}
+	local adminBtn = new("TextButton", {
+		Position = UDim2.fromOffset(K.MENU_X + 118, 4), Size = UDim2.fromOffset(70, 36), Text = "ADMIN",
+		BackgroundColor3 = Color3.fromRGB(120, 20, 20), TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBlack, TextSize = 14,
+	}, V.gui)
+	corner(adminBtn)
+	local win = new("Frame", {
+		AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromOffset(330, 330),
+		BackgroundColor3 = Color3.fromRGB(20, 20, 20), Visible = false,
+	}, V.gui)
+	corner(win, 12)
+	new("UIStroke", {Color = Color3.fromRGB(200, 50, 50), Thickness = 2}, win)
+	new("TextLabel", {
+		Position = UDim2.fromOffset(8, 4), Size = UDim2.new(1, -16, 0, 28), BackgroundTransparency = 1, Text = "ADMIN PANEL",
+		TextColor3 = Color3.fromRGB(255, 90, 90), Font = Enum.Font.GothamBlack, TextSize = 16,
+	}, win)
+	local list = new("ScrollingFrame", {
+		Position = UDim2.fromOffset(8, 36), Size = UDim2.new(1, -16, 1, -44), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 6, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+	}, win)
+	new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, list)
+	adminBtn.MouseButton1Click:Connect(function() win.Visible = not win.Visible end)
+
+	local order = 0
+	local function nextOrder() order += 1 return order end
+	local function header(text)
+		new("TextLabel", {
+			Size = UDim2.new(1, -14, 0, 22), BackgroundTransparency = 1, Text = text, TextColor3 = K.GOLD,
+			Font = Enum.Font.GothamBold, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
+		}, list)
+	end
+	local function wideButton(text, cb)
+		local b = new("TextButton", {
+			Size = UDim2.new(1, -14, 0, 36), Text = text, BackgroundColor3 = Color3.fromRGB(60, 60, 60),
+			TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13, LayoutOrder = nextOrder(),
+		}, list)
+		corner(b)
+		b.MouseButton1Click:Connect(function() cb(b) end)
+		return b
+	end
+	local function inputRow(label, default, btnText, cb)
+		local row = new("Frame", {Size = UDim2.new(1, -14, 0, 38), BackgroundTransparency = 1, LayoutOrder = nextOrder()}, list)
+		new("TextLabel", {
+			Size = UDim2.fromOffset(100, 38), BackgroundTransparency = 1, Text = label, TextColor3 = Color3.new(1, 1, 1),
+			Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
+		}, row)
+		local box = new("TextBox", {
+			Position = UDim2.fromOffset(104, 0), Size = UDim2.fromOffset(70, 38), Text = tostring(default),
+			BackgroundColor3 = Color3.fromRGB(50, 50, 50), TextColor3 = Color3.new(1, 1, 1),
+			Font = Enum.Font.GothamBold, TextSize = 15, ClearTextOnFocus = false,
+		}, row)
+		corner(box)
+		local b = new("TextButton", {
+			Position = UDim2.fromOffset(180, 0), Size = UDim2.new(1, -180, 1, 0), Text = btnText,
+			BackgroundColor3 = Color3.fromRGB(180, 130, 0), TextColor3 = Color3.new(0, 0, 0),
+			Font = Enum.Font.GothamBold, TextSize = 14,
+		}, row)
+		corner(b)
+		b.MouseButton1Click:Connect(function()
+			local v = tonumber(box.Text)
+			if v then cb(v) end
+		end)
+	end
+
+	header("Souls")
+	inputRow("Give souls", 100, "GIVE", function(v)
+		souls = math.max(0, souls + math.floor(v))
+		refresh()
+	end)
+	inputRow("Spawn souls on map", 10, "SPAWN", function(v)
+		local want, made = math.min(math.floor(v), 100), 0
+		for _ = 1, want * 4 do
+			if made >= want then break end
+			if spawnNatural() then made += 1 end
+		end
+	end)
+	inputRow("Souls at once", coinTarget, "SET", function(v)
+		coinTarget = math.clamp(math.floor(v), 0, 200) -- the upkeep loop adds/removes souls to match
+	end)
+	inputRow("Spawn every (s)", coinRespawn, "SET", function(v) coinRespawn = math.clamp(v, .2, 60) end)
+	wideButton("Clear all souls on map", function()
+		for _, s in ipairs(natural) do s.model:Destroy() end
+		for _, s in ipairs(deathSouls) do s.model:Destroy() end
+		table.clear(natural)
+		table.clear(deathSouls)
+		table.clear(pendingSpawns)
+	end)
+	local summonLbl = new("TextLabel", {
+		Size = UDim2.new(1, -14, 0, 24), BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
+		TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
+	}, list)
+	local forceBtn
+	local function refreshSummonInfo()
+		summonLbl.Text = string.format("Summons done: %d   (this 3-min window: %d/%d)", summonTotal, summonCount, K.SUMMON_LIMIT)
+		if forceBtn then forceBtn.Text = "Next summon = lava obby: " .. (forcePunish and "ON" or "OFF") end
+	end
+	forceBtn = wideButton("Next summon = lava obby: OFF", function() forcePunish = not forcePunish refreshSummonInfo() end)
+	wideButton("Reset summon counter + lockout", function() summonCount, windowStart, lockoutUntil = 0, 0, 0 refreshSummonInfo() end)
+	refreshSummonInfo()
+	task.spawn(function() -- keeps the numbers live while the panel is open
+		while summonLbl.Parent do
+			task.wait(1)
+			refreshSummonInfo()
+		end
+	end)
+
+	header("Blessings (- / + stacks them)")
+	wideButton("Speed/Jump step size: NORMAL", function(b)
+		adminSuper = not adminSuper
+		b.Text = "Speed/Jump step size: " .. (adminSuper and "SUPER" or "NORMAL")
+	end)
+	for _, bf in ipairs(K.ADMIN_BUFFS) do
+		local key = bf[1]
+		local row = new("Frame", {Size = UDim2.new(1, -14, 0, 36), BackgroundTransparency = 1, LayoutOrder = nextOrder()}, list)
+		adminLabels[key] = new("TextLabel", {
+			Size = UDim2.new(1, -100, 1, 0), BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1),
+			Font = Enum.Font.GothamBold, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+		local minus = new("TextButton", {
+			Position = UDim2.new(1, -92, 0, 0), Size = UDim2.fromOffset(44, 36), Text = "-",
+			BackgroundColor3 = Color3.fromRGB(120, 40, 40), TextColor3 = Color3.new(1, 1, 1),
+			Font = Enum.Font.GothamBlack, TextSize = 20,
+		}, row)
+		local plus = new("TextButton", {
+			Position = UDim2.new(1, -44, 0, 0), Size = UDim2.fromOffset(44, 36), Text = "+",
+			BackgroundColor3 = Color3.fromRGB(40, 120, 50), TextColor3 = Color3.new(1, 1, 1),
+			Font = Enum.Font.GothamBlack, TextSize = 20,
+		}, row)
+		corner(minus)
+		corner(plus)
+		plus.MouseButton1Click:Connect(function()
+			if grant(key, adminSuper) then
+				sync()
+				if key == "glide" or key == "gdur" then V.glideEnergy = V.glideMax end
+			end
+		end)
+		minus.MouseButton1Click:Connect(function()
+			if revoke(key) then sync() end
+		end)
+	end
+	wideButton("Reset ALL blessings", function() resetAll() end)
+
+	refreshAdmin = function()
+		for _, bf in ipairs(K.ADMIN_BUFFS) do
+			adminLabels[bf[1]].Text = bf[2] .. "   " .. V.lv[bf[1]]
+		end
+	end
+	refreshAdmin()
+end
+
+---------------------------------------------------------------- Demon summoning (reusable)
+K.DEMON_MUSIC_ID = ""  -- put an ominous "rbxassetid://..." here. Empty = no music (I can't verify asset IDs from here)
+K.RITUAL_LINES = {
+	"i call the flame within the dark",
+	"hear my plea and leave your mark",
+	"rise up red and spark the spark",
+}
+K.RITUAL_HEIGHTS = {4, 9, K.FLOAT_HEIGHT} -- each correct line floats you higher
+K.RITUAL_IDLE, K.RITUAL_SINK = 5, 1.2    -- seconds without the next line before you start sinking / sinking speed (studs per second)
+
+-- small message under the HUD
+V.toastLbl = new("TextLabel", {
+	AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 104), Size = UDim2.fromOffset(300, 0),
+	AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = .4,
+	TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 14, TextWrapped = true, Visible = false,
+}, V.gui)
+corner(V.toastLbl, 8)
+new("UIPadding", {PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8)}, V.toastLbl)
+V.toastToken = 0
+local function toast(text, secs)
+	V.toastToken += 1
+	local tk = V.toastToken
+	V.toastLbl.Text, V.toastLbl.Visible = text, true
+	task.delay(secs or 3, function() if tk == V.toastToken then V.toastLbl.Visible = false end end)
+end
+
+-- red screen flash (used by lightning + explosions)
+V.flashFrame = new("Frame", {
+	Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(255, 40, 40), BackgroundTransparency = 1, BorderSizePixel = 0, Active = false,
+}, V.gui)
+local function flash(strength)
+	V.flashFrame.BackgroundTransparency = 1 - (strength or .3)
+	TS:Create(V.flashFrame, TweenInfo.new(.3), {BackgroundTransparency = 1}):Play()
+end
+
+-- ===== environment: save the original Lighting/Sky/Atmosphere, darken it, restore it exactly =====
+V.Env = {}
+K.LIGHT_PROPS = {"Ambient", "Brightness", "ColorShift_Bottom", "ColorShift_Top", "EnvironmentDiffuseScale", "EnvironmentSpecularScale",
+	"ExposureCompensation", "FogColor", "FogEnd", "FogStart", "OutdoorAmbient", "ClockTime"}
+local envSaved, envTweens, envTemp, envToken = nil, {}, {}, 0
+local function envCancel()
+	for _, t in ipairs(envTweens) do t:Cancel() end
+	envTweens = {}
+end
+local function envTween(obj, t, goal)
+	local tw = TS:Create(obj, TweenInfo.new(t, Enum.EasingStyle.Sine), goal)
+	tw:Play()
+	table.insert(envTweens, tw)
+end
+function V.Env.darken(t)
+	envToken += 1
+	if not envSaved then -- only ever saved ONCE, so overlapping calls can never overwrite the real original
+		envSaved = {light = {}, skies = {}, atmos = {}}
+		for _, p in ipairs(K.LIGHT_PROPS) do pcall(function() envSaved.light[p] = Lighting[p] end) end
+		for _, d in ipairs(Lighting:GetChildren()) do
+			if d:IsA("Sky") then
+				envSaved.skies[d] = {CelestialBodiesShown = d.CelestialBodiesShown}
+			elseif d:IsA("Atmosphere") then
+				envSaved.atmos[d] = {Density = d.Density, Color = d.Color, Decay = d.Decay, Haze = d.Haze, Glare = d.Glare, Offset = d.Offset}
+			end
+		end
+	end
+	envCancel()
+	pcall(function()
+		envTween(Lighting, t, {
+			Ambient = Color3.fromRGB(35, 0, 0), OutdoorAmbient = Color3.fromRGB(25, 0, 0), Brightness = .4, ClockTime = 0,
+			ExposureCompensation = -1, FogColor = Color3.fromRGB(40, 0, 0), FogStart = 0, FogEnd = 350, ColorShift_Top = Color3.fromRGB(80, 0, 0),
+		})
+	end)
+	for sky in pairs(envSaved.skies) do if sky.Parent then sky.CelestialBodiesShown = false end end
+	for atm in pairs(envSaved.atmos) do
+		if atm.Parent then
+			envTween(atm, t, {Density = .55, Color = Color3.fromRGB(70, 10, 10), Decay = Color3.fromRGB(40, 0, 0), Haze = 3, Glare = 0})
+		end
+	end
+	if #envTemp == 0 then -- temporary helpers, destroyed on restore
+		local atm = new("Atmosphere", {Density = 0, Color = Color3.fromRGB(70, 10, 10), Decay = Color3.fromRGB(40, 0, 0), Haze = 2, Glare = 0}, Lighting)
+		local ccx = new("ColorCorrectionEffect", {TintColor = Color3.fromRGB(255, 190, 190), Saturation = 0, Contrast = 0, Brightness = 0}, Lighting)
+		envTemp = {atm, ccx}
+	end
+	envTween(envTemp[1], t, {Density = .5})
+	envTween(envTemp[2], t, {Saturation = -.25, Contrast = .15, Brightness = -.05})
+end
+function V.Env.restore(t, instant)
+	if not envSaved then return end
+	envToken += 1
+	local token, saved = envToken, envSaved
+	envCancel()
+	local function finish()
+		if token ~= envToken then return end -- a newer darken/restore took over
+		for p, v in pairs(saved.light) do pcall(function() Lighting[p] = v end) end
+		for sky, s in pairs(saved.skies) do if sky.Parent then for k, v in pairs(s) do sky[k] = v end end end
+		for atm, s in pairs(saved.atmos) do if atm.Parent then for k, v in pairs(s) do atm[k] = v end end end
+		for _, i in ipairs(envTemp) do i:Destroy() end
+		envTemp = {}
+		if envSaved == saved then envSaved = nil end
+	end
+	if instant or t <= 0 then finish() return end
+	pcall(function() envTween(Lighting, t, saved.light) end)
+	for atm, s in pairs(saved.atmos) do if atm.Parent then envTween(atm, t, s) end end
+	if envTemp[1] then envTween(envTemp[1], t, {Density = 0}) end
+	if envTemp[2] then envTween(envTemp[2], t, {Saturation = 0, Contrast = 0, Brightness = 0}) end
+	task.delay(t + .15, finish)
+end
+
+-- ===== effects =====
+local function lightningBolt(center)
+	local ang, dist = math.random() * math.pi * 2, math.random(20, 80)
+	local g = center + Vector3.new(math.cos(ang) * dist, 0, math.sin(ang) * dist)
+	local rp = RaycastParams.new()
+	rp.FilterDescendantsInstances = {V.lp.Character}
+	local hit = workspace:Raycast(g + Vector3.new(0, 150, 0), Vector3.new(0, -500, 0), rp)
+	local gy = hit and hit.Position.Y or (center.Y - K.FLOAT_HEIGHT)
+	local pts = {Vector3.new(g.X + math.random(-25, 25), gy + 220, g.Z + math.random(-25, 25))}
+	local bottom = Vector3.new(g.X, gy, g.Z)
+	local segs = 9
+	for i = 1, segs - 1 do
+		pts[#pts + 1] = pts[1]:Lerp(bottom, i / segs) + Vector3.new(math.random(-7, 7), 0, math.random(-7, 7))
+	end
+	pts[#pts + 1] = bottom
+	for i = 1, #pts - 1 do
+		local a, b = pts[i], pts[i + 1]
+		local p = new("Part", {
+			Size = Vector3.new(.8, .8, (b - a).Magnitude), CFrame = CFrame.lookAt((a + b) / 2, b), Color = Color3.fromRGB(255, 30, 30),
+			Material = Enum.Material.Neon, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, workspace)
+		Debris:AddItem(p, .18)
+	end
+	flash(.25)
+end
+local function startStorm(center) -- returns a stop function
+	local alive = true
+	task.spawn(function()
+		while alive do
+			pcall(lightningBolt, center)
+			task.wait(.25 + math.random() * .55)
+		end
+	end)
+	return function() alive = false end
+end
+
+local function bigExplosion(pos)
+	pcall(function() -- Roblox's own rocket-style Explosion (visual + its default sound); pressure/joint damage OFF
+		local e = Instance.new("Explosion")
+		e.Position, e.BlastRadius, e.BlastPressure = pos, 22, 0
+		e.DestroyJointRadiusPercent = 0
+		e.ExplosionType = Enum.ExplosionType.NoCraters
+		e.Parent = workspace
+	end)
+	local w = new("Part", {
+		Shape = Enum.PartType.Ball, Size = Vector3.new(2, 2, 2), Position = pos, Color = Color3.fromRGB(255, 60, 20), Material = Enum.Material.Neon,
+		Transparency = .3, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+	}, workspace)
+	TS:Create(w, TweenInfo.new(.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = Vector3.new(80, 80, 80), Transparency = 1}):Play()
+	Debris:AddItem(w, .7)
+	flash(.5)
+end
+
+local function startMusic() -- returns a stop function
+	if K.DEMON_MUSIC_ID == "" then return function() end end
+	local s = new("Sound", {SoundId = K.DEMON_MUSIC_ID, Looped = true, Volume = 0}, V.gui)
+	s:Play()
+	TS:Create(s, TweenInfo.new(2), {Volume = .6}):Play()
+	return function()
+		TS:Create(s, TweenInfo.new(1.5), {Volume = 0}):Play()
+		task.delay(1.6, function() s:Destroy() end)
+	end
+end
+
+-- the glowing red fireball. returns the model and a destroy function (stops its own loop)
+local function spawnOrb(pos)
+	local m = Instance.new("Model")
+	m.Name = "DemonOrb"
+	local function ball(size, color, transp)
+		return new("Part", {
+			Shape = Enum.PartType.Ball, Size = Vector3.new(size, size, size), Position = pos, Color = color, Material = Enum.Material.Neon,
+			Transparency = transp, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+	end
+	local core = ball(.5, Color3.fromRGB(255, 20, 20), 0)
+	local shell = ball(.6, Color3.fromRGB(255, 110, 10), .6)
+	m.PrimaryPart = core
+	new("Fire", {Size = 22, Heat = 15, Color = Color3.fromRGB(255, 40, 0), SecondaryColor = Color3.fromRGB(255, 160, 0)}, core)
+	new("PointLight", {Color = Color3.fromRGB(255, 40, 20), Range = 45, Brightness = 4}, core)
+	new("ParticleEmitter", {
+		Rate = 40, Lifetime = NumberRange.new(.6, 1.2), Speed = NumberRange.new(4, 8), SpreadAngle = Vector2.new(180, 180),
+		LightEmission = 1, Color = ColorSequence.new(Color3.fromRGB(255, 60, 20), Color3.fromRGB(255, 170, 40)),
+		Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 1.6), NumberSequenceKeypoint.new(1, 0)}),
+		Transparency = NumberSequence.new(0, 1), Acceleration = Vector3.new(0, 3, 0),
+	}, core)
+	m.Parent = workspace
+	TS:Create(core, TweenInfo.new(.6, Enum.EasingStyle.Back), {Size = Vector3.new(5, 5, 5)}):Play()
+	TS:Create(shell, TweenInfo.new(.6, Enum.EasingStyle.Back), {Size = Vector3.new(6.6, 6.6, 6.6)}):Play()
+	local t0 = os.clock()
+	local conn = RS.Heartbeat:Connect(function()
+		local t = os.clock() - t0
+		local p = pos + Vector3.new(0, math.sin(t * 1.8) * .8, 0)
+		core.Position, shell.Position = p, p
+		shell.Transparency = .55 + math.sin(t * 5) * .1
+	end)
+	return m, function()
+		conn:Disconnect()
+		m:Destroy()
+	end
+end
+
+-- ===== ritual: three chat lines make you float higher =====
+V.ritual = {stage = 0, lastLine = 0, h = 0, target = 0, bp = nil, conn = nil, start = nil, locked = false, active = false}
+
+ritualStop = function() -- safe to call any number of times
+	if V.ritual.conn then V.ritual.conn:Disconnect() V.ritual.conn = nil end
+	if V.ritual.bp then V.ritual.bp:Destroy() V.ritual.bp = nil end
+	local hum = V.lp.Character and V.lp.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		pcall(function()
+			hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		end)
+	end
+	if V.ritual.active then
+		V.ritual.active = false
+		busy = false
+		applyBuffs()
+	end
+	V.ritual.stage, V.ritual.locked, V.ritual.h, V.ritual.target = 0, false, 0, 0
+end
+
+local function ritualStart(root, hum)
+	V.ritual.active, busy = true, true
+	V.ritual.start = root.Position
+	V.ritual.bp = new("BodyPosition", {MaxForce = Vector3.new(1e6, 1e6, 1e6), P = 3000, D = 500, Position = root.Position}, root)
+	hum.WalkSpeed, hum.UseJumpPower, hum.JumpPower = 0, true, 0
+	pcall(function() -- no falling pose while floating
+		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+		hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		hum:ChangeState(Enum.HumanoidStateType.Running)
+	end)
+	V.ritual.conn = RS.Heartbeat:Connect(function(dt)
+		if hum.Health <= 0 or not root.Parent or not V.ritual.bp then ritualStop() return end
+		local sinking = not V.ritual.locked and os.clock() - V.ritual.lastLine > K.RITUAL_IDLE
+		if sinking then V.ritual.target = math.max(0, V.ritual.target - K.RITUAL_SINK * dt) end
+		V.ritual.h += (V.ritual.target - V.ritual.h) * math.min(1, 2.5 * dt)
+		if sinking and V.ritual.target <= 0 and V.ritual.h < .15 then ritualStop() return end -- back on the ground: ritual resets
+		local bob = math.sin(os.clock() * 2.5) * K.BOB_AMOUNT * math.min(1, V.ritual.h / 4)
+		V.ritual.bp.Position = V.ritual.start + Vector3.new(0, V.ritual.h + bob, 0)
+	end)
+end
+
+---------------------------------------------------------------- Punishment (6th summon within 3 minutes)
+K.LAVA_DELAY, K.LAVA_SPEED = 4, 2.4         -- seconds before the lava starts rising, studs per second
+K.STEPS, K.STEP_H, K.ARENA_R, K.ARENA_Y = 16, 3.6, 16, 3000
+
+-- a demonic hand: built upright from its wrist (origin) along +Y, length L
+local function buildHand(L)
+	local m = Instance.new("Model")
+	m.Name = "DemonHand"
+	local dark, red = Color3.fromRGB(70, 8, 8), Color3.fromRGB(255, 40, 30)
+	local function part(shape, size, cf, color, mat)
+		return new("Part", {
+			Shape = shape, Size = size, CFrame = cf, Color = color, Material = mat or Enum.Material.SmoothPlastic,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+	end
+	part(Enum.PartType.Cylinder, Vector3.new(L, 1, 1), CFrame.new(0, L / 2, 0) * CFrame.Angles(0, 0, math.pi / 2), dark)
+	part(Enum.PartType.Block, Vector3.new(2, .7, 1.8), CFrame.new(0, L + .3, 0), dark)
+	for i, x in ipairs({-.75, -.25, .25, .75}) do
+		local f = CFrame.new(x, L + 1.4, 0) * CFrame.Angles(0, 0, -x * .35)
+		part(Enum.PartType.Block, Vector3.new(.35, 1.6, .35), f, dark)
+		part(Enum.PartType.Block, Vector3.new(.25, .5, .25), f * CFrame.new(0, .95, 0), red, Enum.Material.Neon)
+	end
+	m.WorldPivot = CFrame.new()
+	return m
+end
+
+-- the lava pit: a disc, a spiral staircase of platforms, a rising lava slab and a beam over the exit
+local function buildArena(center)
+	local m = Instance.new("Model")
+	m.Name = "DemonArena"
+	local function part(shape, size, cf, color, mat, collide)
+		return new("Part", {
+			Shape = shape, Size = size, CFrame = cf, Color = color, Material = mat or Enum.Material.Slate,
+			Anchored = true, CanCollide = collide or false, CanTouch = false, CanQuery = false,
+		}, m)
+	end
+	part(Enum.PartType.Cylinder, Vector3.new(2, 26, 26), CFrame.new(center - Vector3.new(0, 1, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+		Color3.fromRGB(45, 12, 12), nil, true)
+	local lastTop
+	for i = 1, K.STEPS do
+		local a = i * (math.pi * 2 / 8)
+		local topY = center.Y + i * K.STEP_H
+		local pos = Vector3.new(center.X + math.cos(a) * K.ARENA_R, topY - .75, center.Z + math.sin(a) * K.ARENA_R)
+		part(Enum.PartType.Block, Vector3.new(9, 1.5, 9), CFrame.new(pos) * CFrame.Angles(0, -a, 0), Color3.fromRGB(60, 18, 18), nil, true)
+		lastTop = Vector3.new(pos.X, topY, pos.Z)
+	end
+	local exitPos = lastTop + Vector3.new(0, 4, 0)
+	part(Enum.PartType.Ball, Vector3.new(5, 5, 5), CFrame.new(exitPos), Color3.fromRGB(255, 80, 80), Enum.Material.Neon).Transparency = .3
+	part(Enum.PartType.Cylinder, Vector3.new(120, 4, 4), CFrame.new(exitPos + Vector3.new(0, 60, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+		Color3.fromRGB(255, 70, 70), Enum.Material.Neon).Transparency = .5
+	local lava = part(Enum.PartType.Block, Vector3.new(160, 2, 160), CFrame.new(center), Color3.fromRGB(255, 80, 0), Enum.Material.Neon)
+	new("PointLight", {Color = Color3.fromRGB(255, 90, 0), Range = 60, Brightness = 3}, lava)
+	m.Parent = workspace
+	return m, exitPos, lava
+end
+
+local function runPunishment()
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or not V.ritual.bp then ritualStop() return end
+	local cleanups = {}
+	local function onCleanup(f) table.insert(cleanups, f) end
+	local function alive() return hum.Health > 0 and root.Parent ~= nil end
+	local fade = function(a, t) TS:Create(V.flashFrame, TweenInfo.new(t), {BackgroundTransparency = a}):Play() end
+
+	-- body parts that normally collide, so we can let you sink through the ground and give collision back
+	local solidParts, collideOff = {}, false
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") and d.CanCollide then table.insert(solidParts, d) end
+	end
+	local function setCollide(on_)
+		collideOff = not on_
+		for _, d in ipairs(solidParts) do if d.Parent then d.CanCollide = on_ end end
+	end
+	onCleanup(function() if collideOff then setCollide(true) end end)
+
+	V.punishing = true
+	applyBuffs()
+	local ok, err = pcall(function()
+		local floorPos = V.ritual.start
+		local rp = RaycastParams.new()
+		rp.FilterDescendantsInstances = {char, V.coinFolder}
+		local hit = workspace:Raycast(floorPos + Vector3.new(0, 5, 0), Vector3.new(0, -800, 0), rp)
+		local gy = hit and hit.Position.Y or floorPos.Y - 3
+		local ground = Vector3.new(floorPos.X, gy + .15, floorPos.Z)
+
+		V.Env.darken(2)
+		onCleanup(function() V.Env.restore(0, true) end)
+		toast("You called too often. The demon is angry.", 4)
+
+		-- red portal opens beneath you
+		local portal = new("Part", {
+			Shape = Enum.PartType.Cylinder, Size = Vector3.new(.3, 1, 1), CFrame = CFrame.new(ground) * CFrame.Angles(0, 0, math.pi / 2),
+			Color = Color3.fromRGB(200, 10, 10), Material = Enum.Material.Neon, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, workspace)
+		new("PointLight", {Color = Color3.fromRGB(255, 20, 20), Range = 40, Brightness = 4}, portal)
+		onCleanup(function() portal:Destroy() end)
+		TS:Create(portal, TweenInfo.new(.9, Enum.EasingStyle.Back), {Size = Vector3.new(.3, 18, 18)}):Play()
+		task.wait(1)
+		if not alive() then return end
+
+		-- hands rise and grab you, then drag you down
+		local feetY = V.ritual.start.Y + V.ritual.h - 2.5
+		local L = math.max(8, feetY - gy)
+		local hands = {}
+		for i = 1, 5 do
+			local h = buildHand(L)
+			h.Parent = workspace
+			table.insert(hands, {model = h, ang = i * (math.pi * 2 / 5)})
+		end
+		onCleanup(function() for _, h in ipairs(hands) do h.model:Destroy() end end)
+		local RADIUS = 3
+		local function placeHands(tipY) -- tip of every hand converges on the point above the portal at height tipY
+			for _, h in ipairs(hands) do
+				local base = Vector3.new(ground.X + math.cos(h.ang) * RADIUS, tipY - L, ground.Z + math.sin(h.ang) * RADIUS)
+				local up = (Vector3.new(ground.X, tipY, ground.Z) - base).Unit
+				local right = up:Cross(Vector3.new(0, 0, 1)).Unit
+				h.model:PivotTo(CFrame.fromMatrix(base, right, up))
+			end
+		end
+		local function tween(from, to, dur, fn)
+			local t0 = os.clock()
+			while alive() do
+				local k = math.min(1, (os.clock() - t0) / dur)
+				fn(from + (to - from) * (k * k * (3 - 2 * k)))
+				if k >= 1 then break end
+				RS.Heartbeat:Wait()
+			end
+		end
+		-- reach
+		tween(gy - 1, feetY, 1.4, placeHands)
+		if not alive() then return end
+
+		-- drag: stop the float loop, drive the body ourselves and let it sink through the ground
+		if V.ritual.conn then V.ritual.conn:Disconnect() V.ritual.conn = nil end
+		setCollide(false)
+		local bp = V.ritual.bp
+		local startY = bp.Position.Y
+		local endY = gy - 10
+		fade(.2, 1.8)
+		tween(startY, endY, 2.2, function(y)
+			bp.Position = Vector3.new(floorPos.X, y, floorPos.Z)
+			placeHands(y - 2.5)
+		end)
+		if not alive() then return end
+		fade(0, .3)
+		task.wait(.3)
+
+		-- the pit
+		local center = Vector3.new(ground.X, K.ARENA_Y, ground.Z)
+		local arena, exitPos, lava = buildArena(center)
+		onCleanup(function() arena:Destroy() end)
+		V.ritual.bp = nil
+		bp:Destroy()
+		for _, h in ipairs(hands) do h.model.Parent = nil end
+		pcall(function()
+			hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		end)
+		setCollide(true)
+		root.CFrame = CFrame.new(center + Vector3.new(0, 3.5, 0))
+		root.AssemblyLinearVelocity = Vector3.zero
+		applyBuffs() -- punishing = true: base speed/jump, curses ignored
+		fade(1, 1)
+		toast("Climb! Reach the red beam before the lava gets you.", 5)
+
+		local lavaStart = center.Y - 4
+		local t0, escaped = os.clock(), false
+		while true do
+			RS.Heartbeat:Wait()
+			if not alive() then return end
+			local el = os.clock() - t0
+			local lavaTop = lavaStart + math.max(0, el - K.LAVA_DELAY) * K.LAVA_SPEED
+			lava.Position = Vector3.new(center.X, lavaTop - 1, center.Z)
+			if root.Position.Y - 3 < lavaTop or el > 150 then hum.Health = 0 return end -- failed: you die
+			if (root.Position - exitPos).Magnitude < 7 then escaped = true break end
+		end
+		if not escaped then return end
+
+		-- escaped: back to the first portal, rise out, get launched
+		fade(0, .4)
+		task.wait(.5)
+		arena:Destroy()
+		setCollide(false)
+		for _, h in ipairs(hands) do h.model.Parent = workspace end
+		local bp2 = new("BodyPosition", {MaxForce = Vector3.new(1e6, 1e6, 1e6), P = 3000, D = 500, Position = Vector3.new(ground.X, gy - 10, ground.Z)}, root)
+		onCleanup(function() bp2:Destroy() end)
+		root.CFrame = CFrame.new(ground.X, gy - 10, ground.Z)
+		root.AssemblyLinearVelocity = Vector3.zero
+		fade(1, .6)
+		tween(gy - 10, gy + 3, 1.6, function(y)
+			bp2.Position = Vector3.new(ground.X, y, ground.Z)
+			placeHands(y - 2.5)
+		end)
+		bp2:Destroy()
+		setCollide(true)
+		for _, h in ipairs(hands) do h.model:Destroy() end
+		hands = {}
+		bigExplosion(ground)
+		lockoutUntil = os.clock() + K.LOCKOUT
+		root.AssemblyLinearVelocity = Vector3.new(0, 170, 0) -- launched high
+		task.spawn(function() -- one bounce when you land
+			local t1, wasAir = os.clock(), false
+			while os.clock() - t1 < 12 do
+				task.wait(.1)
+				if not alive() then return end
+				if hum.FloorMaterial == Enum.Material.Air then wasAir = true
+				elseif wasAir then root.AssemblyLinearVelocity = Vector3.new(0, 70, 0) return end
+			end
+		end)
+		task.wait(.5)
+	end)
+	if not ok then warn("[Demon] punishment error: " .. tostring(err)) end
+	for i = #cleanups, 1, -1 do pcall(cleanups[i]) end
+	TS:Create(V.flashFrame, TweenInfo.new(.5), {BackgroundTransparency = 1}):Play()
+	V.punishing = false
+	ritualStop()
+	summonCount, windowStart = 0, 0
+end
+
+-- paying: the souls physically leave your body, fly into the orb, and only then does the blessing arrive
+local function paySoulsToOrb(count, orbPos, root, hum)
+	if count <= 0 then return true end
+	local n = math.min(count, 12) -- at most 12 visible souls; each one carries its share of the price
+	local per, extra = math.floor(count / n), count % n
+	local live, spawned, taken = {}, 0, 0
+	local t0 = os.clock()
+	while (spawned < n or #live > 0) and hum.Health > 0 and root.Parent do
+		local dt = RS.Heartbeat:Wait()
+		local now = os.clock()
+		if spawned < n and now - t0 >= spawned * .12 then
+			spawned += 1
+			local a = spawned / n * math.pi * 2
+			local s = makeSoul("fx", root.Position + Vector3.new(0, 1, 0))
+			s.vel = Vector3.new(math.cos(a) * 10, 12, math.sin(a) * 10)
+			local take = per + (spawned <= extra and 1 or 0)
+			souls -= take -- leaves your counter the moment it leaves your body
+			taken += take
+			refresh()
+			table.insert(live, s)
+		end
+		for i = #live, 1, -1 do
+			local s = live[i]
+			local age = now - s.born
+			local to = orbPos - s.pos
+			if age > .35 and to.Magnitude < 3 then
+				s.model:Destroy()
+				table.remove(live, i)
+				flash(.1)
+			else
+				if age > .35 then -- after the pop, get pulled into the orb
+					s.vel += to.Unit * 130 * dt
+					if s.vel.Magnitude > 95 then s.vel = s.vel.Unit * 95 end
+				else
+					s.vel *= math.max(0, 1 - 2 * dt)
+				end
+				s.pos += s.vel * dt
+				s.scale = popScale(age) * math.clamp(to.Magnitude / 12, .15, 1) -- shrinks as it is swallowed
+				layoutSoul(s, now, orbPos)
+			end
+		end
+	end
+	local done = #live == 0 and spawned >= n and hum.Health > 0
+	for _, s in ipairs(live) do s.model:Destroy() end
+	if not done then souls += taken refresh() end -- interrupted (e.g. you died): everything is refunded
+	return done
+end
+
+-- the whole cinematic. Everything it creates registers a cleanup, so errors/death can't leave anything behind.
+local function beginSummon()
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 or not V.ritual.bp then ritualStop() return end
+	-- summon limit: more than SUMMON_LIMIT summons inside SUMMON_WINDOW seconds -> punishment instead
+	local now = os.clock()
+	if summonCount == 0 or now - windowStart > K.SUMMON_WINDOW then windowStart, summonCount = now, 0 end
+	if forcePunish or summonCount >= K.SUMMON_LIMIT then
+		forcePunish = false
+		summonTotal += 1
+		runPunishment()
+		return
+	end
+	summonCount += 1
+	summonTotal += 1
+	local cleanups = {}
+	local function onCleanup(f) table.insert(cleanups, f) end
+	local function alive() return hum.Health > 0 and root.Parent ~= nil end
+	local restored = false
+
+	local ok, err = pcall(function()
+		local floorPos = V.ritual.start
+		local top = floorPos + Vector3.new(0, K.FLOAT_HEIGHT, 0)
+
+		-- sky darkens + red lightning
+		V.Env.darken(2.5)
+		onCleanup(function() if not restored then V.Env.restore(0, true) end end)
+		onCleanup(startStorm(top))
+		task.wait(3)
+		if not alive() then return end
+
+		-- explosion, then the fireball
+		local look = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+		look = look.Magnitude > .01 and look.Unit or Vector3.new(0, 0, -1)
+		local orbPos = top + look * 14 + Vector3.new(0, 1, 0)
+		bigExplosion(orbPos)
+		local _, destroyOrb = spawnOrb(orbPos)
+		onCleanup(destroyOrb)
+		onCleanup(startMusic())
+
+		-- first summon ever: Mercy
+		if not V.gotFirstSummon then
+			V.gotFirstSummon = true
+			V.lv.mercy += K.MERCY_BONUS
+			sync()
+			toast("The demon grants you " .. K.MERCY_BONUS .. " Mercy.", 4)
+		end
+		task.wait(1)
+		if not alive() then return end
+
+		-- slot machine: pick ONE blessing or curse
+		showPicker()
+		V.menu.Visible = true
+		onCleanup(function() V.pickerToken += 1 V.menu.Visible = false V.cancelBtn.Visible = false end)
+		local died = hum.Died:Connect(function() V.choiceEvt:Fire(nil) end)
+		local chosen = V.choiceEvt.Event:Wait()
+		died:Disconnect()
+		V.pickerToken += 1
+		V.menu.Visible = false
+		V.cancelBtn.Visible = false
+		if not chosen or chosen == "cancel" or not alive() then chosen = nil end
+
+		-- payment (blessing) or reward (curse)
+		if chosen then
+			if chosen.family then
+				souls += chosen.reward
+				addCurse(chosen)
+			else
+				local price = blessingPrice(chosen)
+				if souls >= price and paySoulsToOrb(price, orbPos, root, hum) then
+					grant(chosen.key, chosen.greater)
+				else
+					chosen = nil
+				end
+			end
+			if chosen then summons += 1 end
+			refresh()
+			sync()
+			if chosen and chosen.key == "glide" then V.glideEnergy = V.glideMax end
+			task.wait(.8)
+		end
+
+		-- the orb explodes, the sky comes back
+		bigExplosion(orbPos)
+		destroyOrb()
+		restored = true
+		V.Env.restore(2.5)
+		task.wait(2.8)
+		if not alive() then return end
+
+		-- float gently back down
+		if V.ritual.conn then V.ritual.conn:Disconnect() V.ritual.conn = nil end
+		local rp = RaycastParams.new()
+		rp.FilterDescendantsInstances = {char, V.coinFolder}
+		local bp = V.ritual.bp
+		local ground = bp and workspace:Raycast(bp.Position, Vector3.new(0, -800, 0), rp)
+		if ground then
+			local destY = ground.Position.Y + hum.HipHeight + root.Size.Y / 2 + 1
+			local dist = math.max(0, bp.Position.Y - destY)
+			local tw = TS:Create(bp, TweenInfo.new(math.clamp(dist / 5, 1.5, 7), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+				{Position = Vector3.new(bp.Position.X, destY, bp.Position.Z)})
+			tw:Play()
+			tw.Completed:Wait()
+		end
+	end)
+	if not ok then warn("[Demon] summon error: " .. tostring(err)) end
+	for i = #cleanups, 1, -1 do pcall(cleanups[i]) end
+	ritualStop()
+end
+
+local function normalize(text)
+	local s = text:lower():gsub("[^%a%s]", ""):gsub("%s+", " ")
+	return (s:match("^%s*(.-)%s*$"))
+end
+local function onChat(text)
+	local s = normalize(text)
+	if s == K.COIN_PHRASE and (table.find(K.OWNER_USER_IDS, V.lp.UserId) or RS:IsStudio()) then
+		souls += K.COIN_AMOUNT
+		refresh()
+		return
+	end
+	local idx = table.find(K.RITUAL_LINES, s)
+	if not idx or V.ritual.locked or idx ~= V.ritual.stage + 1 then return end -- lines must come in order (this also ignores duplicate chat events)
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	if idx == 1 then
+		if os.clock() < lockoutUntil then
+			local left = math.ceil(lockoutUntil - os.clock())
+			toast(string.format("The demon will not answer for %d:%02d.", left // 60, left % 60), 3)
+			return
+		end
+		if gliding then stopGlide() end
+		if busy or missileBusy or pilotingDrone or mountedDrone then
+			toast("Finish what you are doing first.", 2.5)
+			return
+		end
+		ritualStart(root, hum)
+	end
+	V.ritual.stage, V.ritual.lastLine, V.ritual.target = idx, os.clock(), K.RITUAL_HEIGHTS[idx]
+	if idx == #K.RITUAL_LINES then
+		V.ritual.locked = true
+		task.spawn(beginSummon)
+	end
+end
+V.lp.Chatted:Connect(onChat)
+pcall(function()
+	TCS.MessageReceived:Connect(function(m)
+		if m.TextSource and m.TextSource.UserId == V.lp.UserId then onChat(m.Text) end
+	end)
+end)
+
+---------------------------------------------------------------- Baby Tung Tungs (Mercy reward)
+local function buildBaby(pos)
+	local function part(shape, size, cf, color, mat, solid)
+		return new("Part", {
+			Shape = shape, Size = size, CFrame = cf, Color = color, Material = mat,
+			CanCollide = solid or false, CanTouch = false, CanQuery = false, Massless = not solid,
+		})
+	end
+	local base = CFrame.new(pos)
+	local body = part(Enum.PartType.Cylinder, Vector3.new(2.4, 1.1, 1.1), base * CFrame.Angles(0, 0, math.pi / 2),
+		Color3.fromRGB(150, 100, 50), Enum.Material.Wood, true)
+	body.CanQuery = true
+	-- bouncy
+	body.CustomPhysicalProperties = PhysicalProperties.new(.7, .3, .9, 1, 1)
+	local white, black, dark = Color3.new(1, 1, 1), Color3.new(0, 0, 0), Color3.fromRGB(105, 68, 34)
+	local extras = {}
+	for _, sx in ipairs({-1, 1}) do
+		table.insert(extras, part(Enum.PartType.Ball, Vector3.new(.5, .5, .5), base * CFrame.new(sx * .28, .6, -.48), white, Enum.Material.SmoothPlastic))
+		table.insert(extras, part(Enum.PartType.Ball, Vector3.new(.22, .22, .22), base * CFrame.new(sx * .28, .6, -.68), black, Enum.Material.SmoothPlastic))
+		table.insert(extras, part(Enum.PartType.Cylinder, Vector3.new(1, .22, .22), base * CFrame.new(sx * .25, -1.6, 0) * CFrame.Angles(0, 0, math.pi / 2), dark, Enum.Material.Wood))
+	end
+	table.insert(extras, part(Enum.PartType.Block, Vector3.new(.5, .1, .1), base * CFrame.new(0, .15, -.56), black, Enum.Material.SmoothPlastic))
+	for _, p in ipairs(extras) do
+		p.Parent = body
+		new("WeldConstraint", {Part0 = body, Part1 = p}, p)
+	end
+	return body
+end
+
+spawnBabies = function()
+	local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	local center = root.Position
+	for _ = 1, K.BABY_COUNT do
+		local b = buildBaby(center + Vector3.new(math.random(-20, 20), math.random(45, 70), math.random(-20, 20)))
+		b.Parent = workspace
+		Debris:AddItem(b, K.BABY_DESPAWN) -- they just fall, bounce, then vanish
+		task.wait(.15)
+	end
+end
+
+---------------------------------------------------------------- Missile ability
+local function buildMissile()
+	local m = Instance.new("Model")
+	local function part(shape, size, cf)
+		return new("Part", {
+			Shape = shape, Size = size, CFrame = cf, Color = K.BLUE, Material = Enum.Material.Neon,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+	end
+	local body = part(Enum.PartType.Cylinder, Vector3.new(6, 1.4, 1.4), CFrame.new())
+	part(Enum.PartType.Ball, Vector3.new(1.4, 1.4, 1.4), CFrame.new(3, 0, 0))
+	part(Enum.PartType.Block, Vector3.new(1.2, .15, 3), CFrame.new(-2.4, 0, 0))
+	part(Enum.PartType.Block, Vector3.new(1.2, 3, .15), CFrame.new(-2.4, 0, 0))
+	m.PrimaryPart = body
+	return m
+end
+
+local function afterimage(missile)
+	local g = missile:Clone()
+	for _, d in ipairs(g:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Transparency = .35
+			TS:Create(d, TweenInfo.new(.7), {Transparency = 1}):Play()
+		end
+	end
+	g.Parent = workspace
+	Debris:AddItem(g, .8)
+end
+
+useMissile = function()
+	if missileBusy then
+		-- press again while steering to stop early
+		if planning and os.clock() - planStart > .4 then stopRequested = true end
+		return
+	end
+	if busy or not hasMissile then return end
+	if os.clock() - V.lastMissile < eCd() then return end
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	if gliding then stopGlide() end
+	missileBusy = true
+	local duration, speed, phase = eTime(), eSpeed(), ePhase()
+
+	-- freeze everyone else (on your screen) and tint the world blue
+	local frozen, tracks = {}, {}
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local c = pl ~= V.lp and pl.Character
+		if c then
+			local r = c:FindFirstChild("HumanoidRootPart")
+			if r then table.insert(frozen, {root = r, cf = r.CFrame}) end
+			local h = c:FindFirstChildOfClass("Humanoid")
+			local an = h and h:FindFirstChildOfClass("Animator")
+			if an then
+				for _, t in ipairs(an:GetPlayingAnimationTracks()) do
+					t:AdjustSpeed(0)
+					table.insert(tracks, t)
+				end
+			end
+		end
+	end
+	local freezeConn = RS.Heartbeat:Connect(function()
+		for _, f in ipairs(frozen) do
+			if f.root.Parent then
+				f.root.CFrame = f.cf
+				f.root.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+	end)
+	root.Anchored = true
+	tint(true)
+
+	-- planning phase: steer a ghost missile with the camera
+	local missile = buildMissile()
+	local dir = cam.CFrame.LookVector
+	local pos = root.Position + Vector3.new(0, 1.5, 0)
+	missile:PivotTo(CFrame.lookAt(pos, pos + dir) * CFrame.Angles(0, math.pi / 2, 0))
+	missile.Parent = workspace
+	cam.CameraSubject = missile.PrimaryPart
+
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {char, V.coinFolder}
+	local path = {}
+	local elapsed, acc, lastGhost, hit = 0, 0, 0, false
+	planning, stopRequested, planStart = true, false, os.clock()
+	while elapsed < duration and not hit and not stopRequested do
+		local dt = RS.Heartbeat:Wait()
+		if hum.Health <= 0 then break end
+		elapsed += dt
+		acc += dt
+		setFlight("PLAN", duration - elapsed)
+		while acc >= K.STEP and not hit do
+			acc -= K.STEP
+			dir = dir:Lerp(cam.CFrame.LookVector, math.min(1, K.MISSILE_TURN * K.STEP)).Unit
+			local move = dir * speed * K.STEP
+			if not phase and workspace:Raycast(pos, move + dir * 1.5, params) then
+				hit = true
+			else
+				pos += move
+				table.insert(path, {pos = pos, dir = dir})
+			end
+		end
+		missile:PivotTo(CFrame.lookAt(pos, pos + dir) * CFrame.Angles(0, math.pi / 2, 0))
+		if os.clock() - lastGhost > .04 then
+			lastGhost = os.clock()
+			afterimage(missile)
+		end
+	end
+
+	-- back to normal
+	planning = false
+	missile:Destroy()
+	cam.CameraSubject = hum
+	freezeConn:Disconnect()
+	for _, t in ipairs(tracks) do pcall(function() t:AdjustSpeed(1) end) end
+	tint(false)
+
+	-- your real body flies the exact path you planned
+	if hum.Health > 0 and #path > 1 then
+		hum.PlatformStand = true
+		-- NOT anchored: the client owns an unanchored character, so its movement replicates and other players see it fly
+		root.Anchored = false
+		local parts = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") and d.CanCollide then table.insert(parts, d) end
+		end
+		local a0 = new("Attachment", {Position = Vector3.new(1.5, 0, 0)}, root)
+		local a1 = new("Attachment", {Position = Vector3.new(-1.5, 0, 0)}, root)
+		local trail = new("Trail", {
+			Attachment0 = a0, Attachment1 = a1, Color = ColorSequence.new(K.BLUE), LightEmission = 1,
+			Lifetime = .8, Transparency = NumberSequence.new(.2, 1),
+		}, root)
+		local i, acc2 = 1, 0
+		while i <= #path and hum.Health > 0 do
+			acc2 += RS.Heartbeat:Wait()
+			setFlight("FLY", (#path - i + 1) * K.STEP)
+			for _, d in ipairs(parts) do d.CanCollide = false end
+			while acc2 >= K.STEP and i <= #path do
+				acc2 -= K.STEP
+				local e = path[i]
+				i += 1
+				-- lie flat like a missile: head points along the flight direction
+				root.CFrame = CFrame.lookAt(e.pos, e.pos + e.dir) * CFrame.Angles(-math.pi / 2, 0, 0)
+				root.AssemblyLinearVelocity = e.dir * speed -- real velocity so it replicates smoothly
+				root.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+		local last = path[#path]
+		local flat = Vector3.new(last.dir.X, 0, last.dir.Z)
+		if flat.Magnitude < .01 then flat = Vector3.new(0, 0, -1) end
+		local landing = last.pos + Vector3.new(0, 2, 0)
+		if phase then
+			-- if you ended inside something, pop up to the first free spot
+			local op = OverlapParams.new()
+			op.FilterDescendantsInstances = {char, V.coinFolder}
+			for _ = 1, 60 do
+				if #workspace:GetPartBoundsInBox(CFrame.new(landing), Vector3.new(4, 6, 4), op) == 0 then break end
+				landing += Vector3.new(0, 4, 0)
+			end
+		end
+		root.CFrame = CFrame.lookAt(landing, landing + flat)
+		root.AssemblyLinearVelocity = Vector3.zero
+		for _, d in ipairs(parts) do d.CanCollide = true end
+		hum.PlatformStand = false
+		task.delay(1, function() trail:Destroy() a0:Destroy() a1:Destroy() end)
+	end
+	V.flightLbl.Visible = false
+	root.Anchored = false
+	V.lastMissile = os.clock()
+	missileBusy = false
+end
+
+---------------------------------------------------------------- Double / triple jump
+UIS.JumpRequest:Connect(function()
+	if gliding then stopGlide() return end
+	local mj = maxJumps()
+	if mj < 2 or busy or missileBusy then return end
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	if hum.FloorMaterial ~= Enum.Material.Air then return end
+	if airTime < .15 or os.clock() - lastExtraJump < .25 or jumpsUsed >= mj - 1 then return end
+	jumpsUsed += 1
+	lastExtraJump = os.clock()
+	local v = root.AssemblyLinearVelocity
+	root.AssemblyLinearVelocity = Vector3.new(v.X, hum.JumpPower, v.Z)
+	hum:ChangeState(Enum.HumanoidStateType.Jumping)
+end)
+
+---------------------------------------------------------------- Glide
+-- Press GLIDE (or G) in the air. Camera pitch steers: look down = dive and speed up,
+-- look up = climb and slow down. Too slow, out of meter, or touching ground/walls = cancel.
+local glideModel, glideConn, glideDir, glideSpeed = nil, nil, Vector3.new(0, 0, -1), K.GLIDE_START
+
+local function buildGlider(char, root)
+	local m = Instance.new("Model")
+	m.Name = "TungGlider"
+	-- all white. root-local: back = +Z (the glider sits there), head = +Y, wide = X
+	local function part(size, cf)
+		local p = new("Part", {
+			Size = size, CFrame = root.CFrame * cf, Color = Color3.new(1, 1, 1), Material = Enum.Material.SmoothPlastic,
+			Massless = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+		new("WeldConstraint", {Part0 = root, Part1 = p}, p)
+		return p
+	end
+	part(Vector3.new(2.2, 7, .3), CFrame.new(0, .6, 2.4))                       -- centre body
+	part(Vector3.new(1.4, 1.8, .2), CFrame.new(0, -3.6, 2.4))                   -- tail
+	part(Vector3.new(.35, .35, 2), CFrame.new(0, 3, 1.5))                       -- brace to your back
+	for _, s in ipairs({-1, 1}) do
+		part(Vector3.new(6, 5.5, .2), CFrame.new(s * 3.6, 0, 2.4) * CFrame.Angles(0, 0, -s * .3))     -- swept wings
+		part(Vector3.new(3.2, 3, .2), CFrame.new(s * 7, -1.6, 2.4) * CFrame.Angles(0, 0, -s * .5))   -- wing tips
+		part(Vector3.new(.3, .3, 2.2), CFrame.new(s * 1.1, .8, 1.4))                                  -- struts
+	end
+	m.Parent = char
+	return m
+end
+
+stopGlide = function()
+	if not gliding then return end
+	gliding = false
+	if glideConn then glideConn:Disconnect() glideConn = nil end
+	if glideModel then glideModel:Destroy() glideModel = nil end
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 then
+		local flat = Vector3.new(glideDir.X, 0, glideDir.Z)
+		if flat.Magnitude < .01 then flat = Vector3.new(0, 0, -1) end
+		root.CFrame = CFrame.lookAt(root.Position, root.Position + flat) -- stand upright again
+		root.AssemblyLinearVelocity = flat.Unit * math.min(glideSpeed, 40)
+		hum.PlatformStand = false
+		pcall(function() hum:ChangeState(Enum.HumanoidStateType.Freefall) end)
+	end
+end
+
+startGlide = function()
+	if gliding then stopGlide() return end
+	if not (hasGlide and V.on.glide) or busy or missileBusy then return end
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	if hum.FloorMaterial ~= Enum.Material.Air or V.glideEnergy < 1 then return end -- must be airborne
+
+	gliding = true
+	local look = cam.CFrame.LookVector
+	glideDir = Vector3.new(look.X, math.clamp(look.Y, -.6, .2), look.Z).Unit
+	local v = root.AssemblyLinearVelocity
+	glideSpeed = math.clamp(Vector3.new(v.X, 0, v.Z).Magnitude, K.GLIDE_START, K.GLIDE_MAX)
+	hum.PlatformStand = true
+	glideModel = buildGlider(char, root)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {char, V.coinFolder}
+
+	glideConn = RS.Heartbeat:Connect(function(dt)
+		if hum.Health <= 0 or not root.Parent then stopGlide() return end
+		local l = cam.CFrame.LookVector
+		local target = Vector3.new(l.X, math.clamp(l.Y, -.85, .45), l.Z).Unit
+		glideDir = glideDir:Lerp(target, math.min(1, 3 * dt)).Unit
+		-- dive = faster, climb = slower
+		glideSpeed = math.min(K.GLIDE_MAX, glideSpeed + (-glideDir.Y * K.GLIDE_ACCEL - K.GLIDE_DRAG) * dt)
+		V.glideEnergy -= dt
+		if glideSpeed < K.GLIDE_MIN or V.glideEnergy <= 0 then stopGlide() return end
+
+		local pos = root.Position
+		local ahead = workspace:Raycast(pos, glideDir * (glideSpeed * dt + 3), params)
+		local below = glideDir.Y <= .05 and workspace:Raycast(pos, Vector3.new(0, -5, 0), params)
+		if ahead or below then stopGlide() return end
+
+		-- lie flat like the missile, glider on your back
+		root.CFrame = CFrame.lookAt(pos, pos + glideDir) * CFrame.Angles(-math.pi / 2, 0, 0)
+		root.AssemblyLinearVelocity = glideDir * glideSpeed + Vector3.new(0, -K.GLIDE_SINK, 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+	end)
+end
+
+-- meter recharge, jump bookkeeping, button labels
+droneBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, .5), Position = UDim2.new(1, -16, .5, -150), Size = UDim2.fromOffset(130, 52),
+	BackgroundColor3 = Color3.fromRGB(60, 0, 140), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false, Text = "DRONE (E)",
+}, V.gui)
+new("UICorner", {CornerRadius = UDim.new(0, 10)}, droneBtn)
+K.DRONE_HOLD = .45
+V.dronePressT = -99
+handleDroneInput = function(down)
+	if not hasDrone or not V.on.drone then return end
+	if down then V.dronePressT = os.clock() return end
+	local held = os.clock() - V.dronePressT > K.DRONE_HOLD
+	if pilotingDrone then
+		if held and hasDronePark then stopPilotPark() else stopPilotReturn() end
+	elseif mountedDrone then
+		unmountDrone()
+	else
+		if held and hasDroneMount then mountDrone() else startPilot() end
+	end
+end
+V.dronePressInput = nil
+droneBtn.InputBegan:Connect(function(input)
+	if V.dronePressInput then return end
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		V.dronePressInput = input
+		handleDroneInput(true)
+	end
+end)
+UIS.InputEnded:Connect(function(input)
+	if input == V.dronePressInput then
+		V.dronePressInput = nil
+		handleDroneInput(false)
+	end
+end)
+UIS.InputBegan:Connect(function(i, gp) if not gp and i.KeyCode == Enum.KeyCode.E then handleDroneInput(true) end end)
+UIS.InputEnded:Connect(function(i) if i.KeyCode == Enum.KeyCode.E then handleDroneInput(false) end end)
+
+
+RS.Heartbeat:Connect(function(dt)
+	local hum = V.lp.Character and V.lp.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		if hum.FloorMaterial == Enum.Material.Air then
+			airTime += dt
+		else
+			airTime, jumpsUsed = 0, 0
+			if not gliding and V.glideEnergy < V.glideMax then
+				V.glideEnergy = math.min(V.glideMax, V.glideEnergy + K.GLIDE_RECHARGE * dt)
+			end
+		end
+	end
+	V.gfill.Size = UDim2.fromScale(math.clamp(V.glideEnergy / V.glideMax, 0, 1), 1)
+	V.glideBtn.Text = gliding and "STOP GLIDE" or "GLIDE (G)"
+	if hasMissile then
+		local left = eCd() - (os.clock() - V.lastMissile)
+		if missileBusy then V.abilityBtn.Text = planning and "STOP" or "ACTIVE"
+		elseif left > 0 then V.abilityBtn.Text = "MISSILE " .. math.ceil(left) .. "s"
+		else V.abilityBtn.Text = "MISSILE (Q)" end
+	end
+end)
+
+---------------------------------------------------------------- Drone ability
+K.DRONE_SCALE = .7                           -- overall drone size (1 = the old, bigger one)
+K.DRONE_FOLLOW_OFFSET = CFrame.new(4, .8, 0) -- relative to your HumanoidRootPart: sticks to your right side
+K.DRONE_FOLLOW_LERP = 6                      -- how snappily the idle drone catches up to you / flies back
+K.DRONE_PILOT_SPEED = 55
+K.DRONE_MOUNT_SPEED = 45
+K.DRONE_ACCEL, K.DRONE_BRAKE = 3.5, 4.2         -- horizontal: how fast it speeds up / brakes (bigger = snappier, less drift)
+K.DRONE_VACCEL, K.DRONE_VBRAKE = 2.6, 4.5       -- up/down momentum
+K.DRONE_TILT = .4                             -- max lean in radians
+K.DRONE_CAM_LAG, K.DRONE_CAM_LAG_V = 5, 3.5     -- camera catch-up speed (bigger = tighter)
+K.DRONE_SIT_OFFSET = CFrame.new(0, 1.7, 0)   -- where your root sits relative to the drone while mounted (tweak if you float/sink)
+K.PROP_SPIN = 45                             -- propeller spin speed (radians/second)
+K.DRONE_BLUE = Color3.fromRGB(35, 105, 225)   -- the drone's blue
+K.DRONE_FADE = .12                       -- extra transparency added to every drone part
+K.RING_BLUE = Color3.fromRGB(60, 140, 255)   -- brighter blue for pulses so they read clearly
+V.mountCollideParts = {}
+local droneProps, droneSpin = {}, 0
+V.dronePhys = {vel = Vector3.zero, tiltP = 0, tiltR = 0, camPos = nil, cam = nil, camConn = nil}
+V.mountSitTrack = nil
+
+local function getCam() return workspace.CurrentCamera end
+
+-- Smooth, rounded drone: puck body + dome + camera eye, four arms ending in motor balls with spinning propellers.
+local function buildDrone()
+	local k = K.DRONE_SCALE
+	local m = Instance.new("Model")
+	m.Name = "SoulDrone"
+	droneProps = {}
+	local Cyl, Ball, Block = Enum.PartType.Cylinder, Enum.PartType.Ball, Enum.PartType.Block
+	local up = CFrame.Angles(0, 0, math.pi / 2) -- stands a cylinder upright
+	local fwd = CFrame.Angles(0, math.pi / 2, 0) -- lays a cylinder along the front/back axis
+	local function part(shape, size, cf, transparency, color)
+		return new("Part", { -- every single part is translucent blue
+			Shape = shape, Size = size, CFrame = cf, Color = color or K.DRONE_BLUE, Material = Enum.Material.SmoothPlastic, Reflectance = .08,
+			Transparency = transparency or .4, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, m)
+	end
+	m.PrimaryPart = part(Block, Vector3.new(.5, .5, .5), CFrame.new(), 1) -- invisible pivot
+	-- softened-box body: two overlapping slabs + four round corner posts (no sharp edges, not a sphere)
+	local W, H, D, r = 3.2 * k, 1.2 * k, 3.2 * k, .55 * k
+	part(Block, Vector3.new(W - 2 * r, H, D), CFrame.new(), .4)
+	part(Block, Vector3.new(W, H, D - 2 * r), CFrame.new(), .4)
+	for _, o in ipairs({Vector3.new(1, 0, 1), Vector3.new(-1, 0, 1), Vector3.new(1, 0, -1), Vector3.new(-1, 0, -1)}) do
+		part(Cyl, Vector3.new(H, 2 * r, 2 * r), CFrame.new(o.X * (W / 2 - r), 0, o.Z * (D / 2 - r)) * up, .4)
+	end
+	-- camera bump on the front (-Z) with a darker blue lens
+	part(Cyl, Vector3.new(.6 * k, 1.5 * k, 1.5 * k), CFrame.new(0, .05 * k, -(D / 2) - .1 * k) * fwd, .35)
+	part(Cyl, Vector3.new(.3 * k, 1.0 * k, 1.0 * k), CFrame.new(0, .05 * k, -(D / 2) - .42 * k) * fwd, .12, Color3.fromRGB(12, 40, 130))
+	part(Ball, Vector3.new(.3 * k, .3 * k, .3 * k), CFrame.new(.2 * k, .25 * k, -(D / 2) - .58 * k), .1, Color3.fromRGB(160, 210, 255))
+	-- four arms going diagonally UP from the body corners, a propeller on each
+	for _, o in ipairs({Vector3.new(1, 0, 1), Vector3.new(-1, 0, 1), Vector3.new(1, 0, -1), Vector3.new(-1, 0, -1)}) do
+		local near = Vector3.new(o.X * (W / 2 - r * .6), H / 2 - .1 * k, o.Z * (D / 2 - r * .6))
+		local hub = near + Vector3.new(o.X * 1.4 * k, 1.7 * k, o.Z * 1.4 * k)
+		local dir, mid = hub - near, (hub + near) / 2
+		part(Cyl, Vector3.new(dir.Magnitude, .34 * k, .34 * k), CFrame.lookAt(mid, mid + dir.Unit) * CFrame.Angles(0, math.pi / 2, 0), .45) -- arm
+		part(Ball, Vector3.new(.8 * k, .8 * k, .8 * k), CFrame.new(hub), .35)                                                                 -- motor
+		local top = hub + Vector3.new(0, .5 * k, 0)
+		part(Cyl, Vector3.new(.08 * k, 3.1 * k, 3.1 * k), CFrame.new(top) * up, .85)                                                          -- soft rotor disc
+		for i = 0, 1 do
+			local rel = CFrame.new(top) * CFrame.Angles(0, i * math.pi / 2, 0)
+			local blade = part(Cyl, Vector3.new(3.0 * k, .18 * k, .18 * k), rel, .5, Color3.fromRGB(70, 120, 230))
+			table.insert(droneProps, {part = blade, rel = rel, dir = (o.X * o.Z > 0) and 1 or -1})
+		end
+	end
+	local glow = new("Highlight", {
+		Adornee = m, FillColor = Color3.fromRGB(40, 100, 255), OutlineColor = K.RING_BLUE,
+		FillTransparency = .5, OutlineTransparency = 0, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Enabled = false,
+	}, m)
+	return m, glow
+end
+
+V.droneHighlight = nil
+ensureDrone = function()
+	if droneModel then return true end
+	local ok, mOrErr, glow = pcall(function()
+		local m, g = buildDrone()
+		return m, g
+	end)
+	if not ok then
+		warn("[TungSahur] Drone failed to build: " .. tostring(mOrErr))
+		return false
+	end
+	droneModel = mOrErr
+	V.droneHighlight = glow
+	return true
+end
+
+-- every place that moves the drone goes through this, so the propellers always spin
+local function placeDrone(cf, dt)
+	dt = dt or 1 / 60
+	local lvl = cf:VectorToObjectSpace(V.dronePhys.vel)
+	local tp = math.clamp(lvl.Z / K.DRONE_PILOT_SPEED, -1, 1) * K.DRONE_TILT   -- flying forward (-Z) -> nose down
+	local tr = math.clamp(-lvl.X / K.DRONE_PILOT_SPEED, -1, 1) * K.DRONE_TILT  -- flying right -> bank right
+	local a = 1 - math.exp(-8 * dt)
+	V.dronePhys.tiltP += (tp - V.dronePhys.tiltP) * a
+	V.dronePhys.tiltR += (tr - V.dronePhys.tiltR) * a
+	local full = cf * CFrame.Angles(V.dronePhys.tiltP, 0, V.dronePhys.tiltR)
+	droneModel:PivotTo(full)
+	droneSpin += dt * K.PROP_SPIN
+	for _, p in ipairs(droneProps) do
+		p.part.CFrame = full * p.rel * CFrame.Angles(0, droneSpin * p.dir, 0)
+	end
+end
+
+-- acceleration + momentum: the velocity eases toward what you ask for, and eases to a stop (a little drift) when you let go
+local function stepDroneVel(mv, speed, dt)
+	local input = mv.Magnitude > .01
+	local target = input and mv.Unit * speed * math.min(1, mv.Magnitude) or Vector3.zero
+	local v = V.dronePhys.vel
+	local ah = 1 - math.exp(-(input and K.DRONE_ACCEL or K.DRONE_BRAKE) * dt)
+	local av = 1 - math.exp(-(input and K.DRONE_VACCEL or K.DRONE_VBRAKE) * dt)
+	local nv = Vector3.new(v.X + (target.X - v.X) * ah, v.Y + (target.Y - v.Y) * av, v.Z + (target.Z - v.Z) * ah)
+	if not input and nv.Magnitude < .3 then nv = Vector3.zero end
+	V.dronePhys.vel = nv
+	return nv
+end
+
+-- the camera follows an invisible point that lags behind the drone (the drone moves first, the camera catches up)
+local function stopDroneCam()
+	if V.dronePhys.camConn then V.dronePhys.camConn:Disconnect() V.dronePhys.camConn = nil end
+	if V.dronePhys.cam then V.dronePhys.cam:Destroy() V.dronePhys.cam = nil end
+end
+local function startDroneCam(yOff)
+	stopDroneCam()
+	local p0 = droneCF.Position + Vector3.new(0, yOff, 0)
+	V.dronePhys.camPos = p0
+	local f = new("Part", {Name = "DroneCam", Size = Vector3.new(.5, .5, .5), Transparency = 1, Anchored = true,
+		CanCollide = false, CanTouch = false, CanQuery = false, Position = p0}, workspace)
+	V.dronePhys.cam = f
+	getCam().CameraSubject = f
+	V.dronePhys.camConn = RS.RenderStepped:Connect(function(dt)
+		if not droneCF then return end
+		local target = droneCF.Position + Vector3.new(0, yOff, 0)
+		local ah, av = 1 - math.exp(-K.DRONE_CAM_LAG * dt), 1 - math.exp(-K.DRONE_CAM_LAG_V * dt)
+		local p = V.dronePhys.camPos
+		p = Vector3.new(p.X + (target.X - p.X) * ah, p.Y + (target.Y - p.Y) * av, p.Z + (target.Z - p.Z) * ah)
+		V.dronePhys.camPos = p
+		f.Position = p
+	end)
+end
+
+-- a ring that pulses outward at the point a phasing drone passes through something
+V.lastPhasePulse = 0
+local function phasePulse(pos, norm)
+	if os.clock() - V.lastPhasePulse < .12 then return end -- don't spawn one every single frame
+	V.lastPhasePulse = os.clock()
+	local ok, err = pcall(function()
+		norm = (norm and norm.Magnitude > 0) and norm.Unit or Vector3.yAxis
+		local upGuess = (math.abs(norm.Y) > .9) and Vector3.xAxis or Vector3.yAxis
+		local tangent = norm:Cross(upGuess).Unit
+		local okCf, cf = pcall(function() return CFrame.fromMatrix(pos, norm, tangent) end)
+		if not okCf then cf = CFrame.new(pos) end
+		local r = new("Part", {
+			Shape = Enum.PartType.Cylinder, Size = Vector3.new(.1, .6, .6), Color = K.RING_BLUE, Material = Enum.Material.Neon,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, Transparency = .1, CFrame = cf,
+		}, workspace)
+		TS:Create(r, TweenInfo.new(.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = Vector3.new(.06, 8, 8), Transparency = 1}):Play()
+		Debris:AddItem(r, .6)
+	end)
+	if not ok then warn("[TungSahur] phasePulse failed: " .. tostring(err)) end
+end
+
+-- idle behaviour: when nobody is piloting/mounting it, the drone hovers at your right side (or stays put if parked)
+RS.Heartbeat:Connect(function(dt)
+	if not (hasDrone and V.on.drone and droneModel) then return end
+	local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	if pilotingDrone or mountedDrone then return end -- those modes position the drone themselves
+	local target = droneParked and droneCF or (root.CFrame * K.DRONE_FOLLOW_OFFSET)
+	local prev = droneCF and droneCF.Position
+	droneCF = droneCF and droneCF:Lerp(target, math.min(1, K.DRONE_FOLLOW_LERP * dt)) or target
+	if prev then V.dronePhys.vel = (droneCF.Position - prev) / math.max(dt, 1 / 240) end
+	placeDrone(droneCF, dt)
+	if droneModel.Parent ~= workspace then droneModel.Parent = workspace end
+end)
+RS.Heartbeat:Connect(function()
+	if V.dronePhys.cam and not pilotingDrone and not mountedDrone then
+		stopDroneCam()
+		local h = V.lp.Character and V.lp.Character:FindFirstChildOfClass("Humanoid")
+		if h then getCam().CameraSubject = h end
+	end
+	if droneModel and not (hasDrone and V.on.drone) and droneModel.Parent and not pilotingDrone and not mountedDrone then
+		droneModel.Parent = nil -- toggled off in the TUNG menu (but never yank it out from under active use)
+	end
+end)
+
+-- ===== parked pulse: a sonar ring on a BillboardGui with AlwaysOnTop, so it is genuinely visible through walls =====
+V.pulseGui = nil
+local function clearPulseGui()
+	if V.pulseGui then V.pulseGui:Destroy(); V.pulseGui = nil end
+end
+local function spawnRing()
+	if not (droneModel and droneModel.PrimaryPart) then return end
+	if not V.pulseGui or not V.pulseGui.Parent then
+		V.pulseGui = new("BillboardGui", {
+			Name = "DronePulse", Adornee = droneModel.PrimaryPart, AlwaysOnTop = true, LightInfluence = 0,
+			Size = UDim2.new(18, 0, 18, 0), MaxDistance = 5000,
+		}, droneModel.PrimaryPart)
+		local dot = new("Frame", {
+			AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromScale(.07, .07),
+			BackgroundColor3 = K.RING_BLUE, BackgroundTransparency = .1, BorderSizePixel = 0,
+		}, V.pulseGui)
+		new("UICorner", {CornerRadius = UDim.new(.5, 0)}, dot)
+	end
+	local ring = new("Frame", {
+		AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromScale(.08, .08),
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+	}, V.pulseGui)
+	new("UICorner", {CornerRadius = UDim.new(.5, 0)}, ring)
+	local stroke = new("UIStroke", {Color = K.RING_BLUE, Thickness = 4, Transparency = 0}, ring)
+	TS:Create(ring, TweenInfo.new(1.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = UDim2.fromScale(1, 1)}):Play()
+	TS:Create(stroke, TweenInfo.new(1.1), {Transparency = 1}):Play()
+	Debris:AddItem(ring, 1.2)
+end
+
+local function droneParkGlowLoop()
+	task.spawn(function()
+		while droneParked and droneModel and droneModel.Parent do
+			local ok, err = pcall(spawnRing)
+			if not ok then warn("[TungSahur] park pulse failed: " .. tostring(err)) end
+			if V.droneHighlight then
+				pcall(function()
+					V.droneHighlight.FillTransparency, V.droneHighlight.OutlineTransparency = .2, 0
+					TS:Create(V.droneHighlight, TweenInfo.new(.9), {FillTransparency = .85, OutlineTransparency = .5}):Play()
+				end)
+			end
+			task.wait(.9)
+		end
+		clearPulseGui()
+	end)
+end
+
+-- ===== flight input: the normal Roblox controls (WASD on PC, the regular thumbstick on mobile) =====
+local touchUp, touchDown = false, false
+V.upBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -16, 1, -92), Size = UDim2.fromOffset(60, 60),
+	Text = "UP", BackgroundColor3 = Color3.fromRGB(0, 60, 180), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false,
+}, V.gui)
+corner(V.upBtn, 30)
+V.downBtn = new("TextButton", {
+	AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -84, 1, -92), Size = UDim2.fromOffset(60, 60),
+	Text = "DOWN", BackgroundColor3 = Color3.fromRGB(0, 60, 180), TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBlack, TextSize = 14, Visible = false,
+}, V.gui)
+corner(V.downBtn, 30)
+V.upBtn.MouseButton1Down:Connect(function() touchUp = true end)
+V.upBtn.MouseButton1Up:Connect(function() touchUp = false end)
+V.upBtn.MouseLeave:Connect(function() touchUp = false end)
+V.downBtn.MouseButton1Down:Connect(function() touchDown = true end)
+V.downBtn.MouseButton1Up:Connect(function() touchDown = false end)
+V.downBtn.MouseLeave:Connect(function() touchDown = false end)
+
+local function showFlightControls(v)
+	V.upBtn.Visible, V.downBtn.Visible = v, v
+	if not v then touchUp, touchDown = false, false end
+end
+
+-- Roblox's own ControlModule gives us the stick/keys exactly like normal movement, on every platform
+V.controlModule = nil
+task.spawn(function()
+	pcall(function()
+		local pm = require(V.lp:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 10))
+		V.controlModule = pm:GetControls()
+	end)
+end)
+
+-- Movement is level with the camera's HEADING (tilting the camera does nothing to the drone).
+-- Up/Down only happen when you ask for them: Space / Ctrl, or the UP / DOWN buttons.
+local function readFlightInput(hum)
+	local c = getCam().CFrame
+	local f, r = c.LookVector, c.RightVector
+	local fl = Vector3.new(f.X, 0, f.Z)
+	if fl.Magnitude < .05 then fl = Vector3.new(c.UpVector.X, 0, c.UpVector.Z) * (f.Y < 0 and 1 or -1) end
+	fl = fl.Magnitude > .01 and fl.Unit or Vector3.new(0, 0, -1)
+	local rl = Vector3.new(r.X, 0, r.Z)
+	rl = rl.Magnitude > .01 and rl.Unit or Vector3.new(1, 0, 0)
+	local right, fwd, got = 0, 0, false
+	if V.controlModule then
+		local ok, v = pcall(function() return V.controlModule:GetMoveVector() end)
+		if ok and typeof(v) == "Vector3" then right, fwd, got = v.X, -v.Z, true end
+	end
+	if not got and hum and hum.MoveDirection.Magnitude > .01 then
+		local md = hum.MoveDirection
+		fwd, right, got = md:Dot(fl), md:Dot(rl), true
+	end
+	if not got then
+		if UIS:IsKeyDown(Enum.KeyCode.W) then fwd += 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.S) then fwd -= 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.D) then right += 1 end
+		if UIS:IsKeyDown(Enum.KeyCode.A) then right -= 1 end
+	end
+	local vert = ((UIS:IsKeyDown(Enum.KeyCode.Space) or touchUp) and 1 or 0) - ((UIS:IsKeyDown(Enum.KeyCode.LeftControl) or touchDown) and 1 or 0)
+	return fl * fwd + rl * right + Vector3.yAxis * vert
+end
+
+-- Which way the drone faces. Like a normal character it only turns toward where you MOVE (level), and
+-- looking around with the camera never turns it.
+V.droneFace = Vector3.new(0, 0, -1)
+local function resetFace()
+	local l = droneCF and droneCF.LookVector or Vector3.new(0, 0, -1)
+	local flat = Vector3.new(l.X, 0, l.Z)
+	V.droneFace = flat.Magnitude > .01 and flat.Unit or Vector3.new(0, 0, -1)
+end
+local function turnToward(mv, dt)
+	local flat = Vector3.new(mv.X, 0, mv.Z)
+	if flat.Magnitude < .05 then return end
+	local mixed = V.droneFace:Lerp(flat.Unit, math.min(1, 10 * dt))
+	V.droneFace = mixed.Magnitude > .01 and mixed.Unit or flat.Unit
+end
+
+-- Walls and floors BLOCK you while mounted (the piloted drone is the one that phases through everything).
+K.MOUNT_RADIUS = 2.4
+local function moveSolid(pos, delta, params)
+	local dist = delta.Magnitude
+	if dist < 1e-4 then return pos end
+	local hit = workspace:Spherecast(pos, K.MOUNT_RADIUS, delta.Unit * (dist + .05), params)
+	if not hit then return pos + delta end
+	local slid = delta - hit.Normal * delta:Dot(hit.Normal) -- slide along what you hit
+	if slid.Magnitude < 1e-4 then return pos end
+	if workspace:Spherecast(pos, K.MOUNT_RADIUS, slid.Unit * (slid.Magnitude + .05), params) then return pos end
+	return pos + slid
+end
+
+-- Tap from idle: control the drone directly from its point of view. Noclips through everything.
+startPilot = function()
+	if pilotingDrone or mountedDrone or busy or missileBusy or gliding then return end
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	if not ensureDrone() then return end
+	if not droneCF then droneCF = root.CFrame * K.DRONE_FOLLOW_OFFSET end
+	resetFace()
+	pilotingDrone, droneParked = true, false
+	clearPulseGui()
+	droneBtn.Text = "RETURN (E)"
+	if V.droneHighlight then V.droneHighlight.Enabled = false end
+	hum.WalkSpeed, hum.JumpPower = 0, 0
+	hum.PlatformStand = true
+	root.Anchored = true
+	startDroneCam(0)
+	showFlightControls(true)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {char, V.coinFolder}
+
+	local conn
+	conn = RS.Heartbeat:Connect(function(dt)
+		if not pilotingDrone then conn:Disconnect() return end
+		local ok, err = pcall(function()
+			local mv = readFlightInput(hum)
+			local pos = droneCF.Position
+			local delta = stepDroneVel(mv, K.DRONE_PILOT_SPEED, dt) * dt
+			if delta.Magnitude > 1e-3 then
+				local hit = workspace:Raycast(pos, delta.Unit * (delta.Magnitude + 1), params)
+				if hit then phasePulse(hit.Position, hit.Normal) end -- you phase through it; the pulse just marks where
+			end
+			if mv.Magnitude > .01 then turnToward(mv, dt) end
+			-- level, and turned only by your movement: looking around with the camera leaves the drone alone
+			droneCF = CFrame.lookAt(pos + delta, pos + delta + V.droneFace)
+			placeDrone(droneCF, dt)
+		end)
+		if not ok then warn("[TungSahur] pilot tick failed: " .. tostring(err)) end
+	end)
+end
+
+local function endPilotCommon()
+	pilotingDrone = false
+	droneBtn.Text = "DRONE (E)"
+	showFlightControls(false)
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if hum then hum.PlatformStand = false; applyBuffs() end
+	if root then root.Anchored = false end
+	stopDroneCam()
+	getCam().CameraSubject = hum
+end
+
+-- Tap while piloting: stop, and the drone flies itself back to your side (the idle-follow loop handles the flight).
+stopPilotReturn = function()
+	if not pilotingDrone then return end
+	droneParked = false
+	endPilotCommon()
+end
+
+-- Hold while piloting (needs Drone Park): stop, but leave the drone exactly where it is, with a sonar pulse that
+-- shows through walls. Tapping again later re-enters piloting it from right where you left it.
+stopPilotPark = function()
+	if not pilotingDrone then return end
+	droneParked = true
+	endPilotCommon()
+	droneBtn.Text = "DRONE (parked)"
+	if V.droneHighlight then V.droneHighlight.Enabled = true end
+	droneParkGlowLoop()
+end
+
+-- Hold from idle (needs Drone Mount): sit on the drone and fly it with your own body, in Roblox's default sit pose.
+-- (No Seat weld: your body is carried directly each frame, the same way the missile flight carries it.)
+mountDrone = function()
+	if mountedDrone or pilotingDrone or busy or missileBusy or gliding then return end
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then return end
+	if not ensureDrone() then return end
+	if droneParked then -- mounting a parked drone: call it to you first
+		droneParked = false
+		clearPulseGui()
+		if V.droneHighlight then V.droneHighlight.Enabled = false end
+		droneCF = root.CFrame * K.DRONE_FOLLOW_OFFSET
+	end
+	if not droneCF then droneCF = root.CFrame * K.DRONE_FOLLOW_OFFSET end
+	resetFace()
+	local solidParams = RaycastParams.new()
+	solidParams.FilterDescendantsInstances = {char, droneModel, V.coinFolder}
+
+	local ok, err = pcall(function()
+		V.mountCollideParts = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") and d.CanCollide then table.insert(V.mountCollideParts, d); d.CanCollide = false end
+		end
+		hum.WalkSpeed, hum.JumpPower = 0, 0
+		hum.PlatformStand = false
+		hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		root.Anchored = false
+		hum.Sit = true -- Roblox's own sit state: the default Animate script plays the default sit animation (R6 or R15)
+		-- belt and braces: also play the default sit animation directly, in case the game's Animate script doesn't
+		local animate = char:FindFirstChild("Animate")
+		local sitAnim = animate and animate:FindFirstChild("sit") and animate.sit:FindFirstChild("SitAnim")
+		local id = sitAnim and sitAnim.AnimationId
+			or ((hum.RigType == Enum.HumanoidRigType.R15) and "rbxassetid://2506281703" or "rbxassetid://178130996")
+		local a = Instance.new("Animation")
+		a.AnimationId = id
+		local animator = hum:FindFirstChildOfClass("Animator")
+		V.mountSitTrack = animator and animator:LoadAnimation(a) or hum:LoadAnimation(a)
+		V.mountSitTrack.Priority = Enum.AnimationPriority.Action
+		V.mountSitTrack.Looped = true
+		V.mountSitTrack:Play()
+	end)
+	if not ok then
+		warn("[TungSahur] Mount setup hit an error (continuing anyway): " .. tostring(err))
+	end
+
+	mountedDrone = true
+	startDroneCam(1.5)
+	droneBtn.Text = "DISMOUNT (E)"
+	showFlightControls(true)
+
+	local conn
+	conn = RS.Heartbeat:Connect(function(dt)
+		if not mountedDrone then conn:Disconnect() return end
+		local ok2, err2 = pcall(function()
+			local mv = readFlightInput(hum)
+			local pos = droneCF.Position
+			local want = stepDroneVel(mv, K.DRONE_MOUNT_SPEED, dt) * dt
+			local newPos = moveSolid(pos, want, solidParams) -- walls and floors stop you
+			local vel = (newPos - pos) / math.max(dt, 1 / 240)
+			if vel.Magnitude < V.dronePhys.vel.Magnitude - 1 then V.dronePhys.vel = vel end -- bumped into something: momentum stops
+			pos = newPos
+			if mv.Magnitude > .01 then turnToward(mv, dt) end
+			droneCF = CFrame.lookAt(pos, pos + V.droneFace) -- level so you sit upright; the camera never turns it
+			placeDrone(droneCF, dt)
+			root.CFrame = droneCF * K.DRONE_SIT_OFFSET
+			root.AssemblyLinearVelocity = vel
+			root.AssemblyAngularVelocity = Vector3.zero
+			hum.Sit = true
+		end)
+		if not ok2 then warn("[TungSahur] mount tick failed: " .. tostring(err2)) end
+	end)
+end
+
+-- Tap while mounted: unmount. The drone resumes idle hover at your side on its own.
+unmountDrone = function()
+	if not mountedDrone then return end
+	mountedDrone = false
+	droneBtn.Text = "DRONE (E)"
+	showFlightControls(false)
+	local char = V.lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	stopDroneCam()
+	if hum then getCam().CameraSubject = hum end
+	if V.mountSitTrack then pcall(function() V.mountSitTrack:Stop() end); V.mountSitTrack = nil end
+	if hum then
+		pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end)
+		hum.Sit = false
+	end
+	for _, d in ipairs(V.mountCollideParts) do
+		if d and d.Parent then d.CanCollide = true end
+	end
+	V.mountCollideParts = {}
+	if root then root.AssemblyLinearVelocity = Vector3.zero end
+	if hum and hum.Health > 0 then applyBuffs() end
+end
+
+---------------------------------------------------------------- ESP (blue)
+local esp = {}
+local function destroyRec(rec)
+	if rec then rec.hl:Destroy() rec.bill:Destroy() rec.arrow:Destroy() end
+end
+
+local function build(p, c)
+	local hl = new("Highlight", {
+		Adornee = c, OutlineColor = K.BLUE, FillColor = K.BLUE,
+		DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, Enabled = false,
+	}, c)
+	local bill = new("BillboardGui", {
+		Adornee = c:FindFirstChild("Head") or c:FindFirstChild("HumanoidRootPart"),
+		Size = UDim2.fromOffset(120, 24), StudsOffset = Vector3.new(0, 2.5, 0), AlwaysOnTop = true, Enabled = false,
+	}, c)
+	new("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = p.DisplayName, TextColor3 = K.BLUE,
+		TextStrokeTransparency = 0, TextScaled = true, Font = Enum.Font.GothamBold,
+	}, bill)
+	local arrow = new("Frame", {
+		Size = UDim2.fromOffset(22, 22), AnchorPoint = Vector2.new(.5, .5), BackgroundColor3 = K.BLUE, Visible = false,
+	}, V.gui)
+	corner(arrow, 11)
+	new("Frame", {Size = UDim2.fromOffset(8, 14), Position = UDim2.new(.5, -4, 0, -10), BackgroundColor3 = K.BLUE, BorderSizePixel = 0}, arrow)
+	return {hl = hl, bill = bill, arrow = arrow, char = c}
+end
+
+Players.PlayerRemoving:Connect(function(p) destroyRec(esp[p]) esp[p] = nil end)
+
+RS.RenderStepped:Connect(function()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= V.lp then
+			local c = p.Character
+			local rec = esp[p]
+			if rec and rec.char ~= c then destroyRec(rec) rec = nil esp[p] = nil end
+			if c and not rec and c:FindFirstChild("HumanoidRootPart") then
+				rec = build(p, c)
+				esp[p] = rec
+			end
+			if rec then
+				local show = V.on.esp and espTier >= 1
+				rec.hl.Enabled = show
+				rec.hl.FillTransparency = espTier >= 3 and .5 or 1 -- chams at tier 3
+				rec.bill.Enabled = show and espTier >= 2         -- names at tier 2
+				local arrowShow = false
+				if show and espTier >= 4 then                     -- offscreen arrows at tier 4
+					local v, onScreen = cam:WorldToViewportPoint(c.HumanoidRootPart.Position)
+					if not onScreen then
+						local vs = cam.ViewportSize
+						local center = vs / 2
+						local d = Vector2.new(v.X, v.Y) - center
+						if v.Z < 0 then d = -d end
+						if d.Magnitude > 0 then
+							d = d.Unit
+							local r = math.min(vs.X, vs.Y) / 2 - 40
+							rec.arrow.Position = UDim2.fromOffset(center.X + d.X * r, center.Y + d.Y * r)
+							rec.arrow.Rotation = math.deg(math.atan2(d.Y, d.X)) + 90
+							arrowShow = true
+						end
+					end
+				end
+				rec.arrow.Visible = arrowShow
+			end
+		end
+	end
+end)
+
+sync()
