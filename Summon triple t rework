@@ -1,12 +1,13 @@
 -- LocalScript: put in StarterPlayer > StarterPlayerScripts
 -- DemonSummon: souls, Blessings/Curses, demon ritual + summon, ghost souls, summon limit + punishment, improved drone.
--- RITUAL: type these three lines in chat yourself, in order (letters only, case ignored):
+-- RITUAL: type these three lines in chat yourself, in order (letters only, case ignored). The Necrobloxicon book shows them:
 --   1) i call the flame within the dark
 --   2) hear my plea and leave your mark
 --   3) rise up red and spark the spark
 -- Secret soul phrase is COIN_PHRASE below (owner only).
 
-local K, V = {}, {} -- K = settings, V = state. Luau allows only 200 local variables per script, so they live in tables.
+local K, V = {}, {}
+V.Book = {state = "none", pentagramPos = nil} -- the Necrobloxicon system fills this in near the end of the script -- K = settings, V = state. Luau allows only 200 local variables per script, so they live in tables.
 local Players = game:GetService("Players")
 local RS = game:GetService("RunService")
 local TS = game:GetService("TweenService")
@@ -33,8 +34,20 @@ K.GLIDE_TIME, K.GLIDE_RECHARGE = 6, 1.5    -- seconds of glide, recharge per sec
 K.GLIDE_START, K.GLIDE_MIN, K.GLIDE_MAX = 45, 18, 120
 K.GLIDE_ACCEL, K.GLIDE_DRAG, K.GLIDE_SINK = 70, 5, 6   -- dive gains speed, climbing/level loses it
 K.COIN_COUNT, K.COIN_RESPAWN = 5, 30       -- natural souls alive at once, seconds until a collected one respawns (admin panel can change both)
+K.SOUL_MIN_RADIUS = 45                    -- ...but never closer than this
 K.SOUL_RADIUS = 120                     -- natural souls spawn within this many studs of you
-K.SOUL_SOUND_ID = "rbxasset://sounds/electronicpingshort.wav" -- collect sound (built-in Roblox file; swap for your own)
+-- ===== SOUND EFFECTS (tweak these) =====
+-- id: paste your own "rbxassetid://123456" (Creator Store -> Audio -> copy asset ID). "" = silent.
+-- volume: 0 to 10.  speed: 1 = normal, lower = deeper/slower, higher = squeakier.
+-- The defaults are built-in Roblox files, slowed down to sound heavier. I could not test them, so replace any that sound wrong.
+K.SOUNDS = {
+	explosion = {id = "rbxasset://sounds/impact_water.mp3",       volume = 3,   speed = .45}, -- summon / orb explosions
+	lightning = {id = "rbxasset://sounds/snap.wav",               volume = 1.5, speed = .6},  -- every red lightning strike
+	soul      = {id = "rbxasset://sounds/electronicpingshort.wav", volume = .7,  speed = 1},   -- picking up a soul
+	stinger   = {id = "rbxasset://sounds/glassbreak.wav",         volume = 2.5, speed = .7},  -- sharp hit when the lightning takes the orb away
+	scream    = {id = "rbxasset://sounds/uuhhh.mp3",              volume = 3,   speed = .4},  -- demon scream when the punishment portal opens
+	music     = {id = "",                                         volume = .6,  speed = 1},   -- ominous music while the demon is here
+}
 K.DEATH_SOUL_STEP = 300                 -- +1 soul per 5 minutes the dead player survived
 K.GDUR_STEP = 2                        -- glide duration upgrade (seconds per buy)
 K.DEATH_WIPES_ALL = true                -- true: ANY death wipes your buffs (Mercy saves them). false: only dying to Tung for not paying
@@ -478,6 +491,7 @@ local function destroyOrb(f)
 	V.orbs[f] = nil
 	if o.endConn then o.endConn:Disconnect() end
 	o.part:Destroy()
+	if o.bb then o.bb:Destroy() end
 end
 local function makeOrb(f, c)
 	local size = c.greater and 1.6 or 1.1
@@ -486,7 +500,10 @@ local function makeOrb(f, c)
 		Material = Enum.Material.Neon, Transparency = .1, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
 	}, V.orbFolder)
 	new("PointLight", {Color = Color3.fromRGB(170, 90, 255), Range = 8, Brightness = 1.5}, part)
-	local bb = new("BillboardGui", {Adornee = part, Size = UDim2.fromOffset(170, 80), AlwaysOnTop = true, LightInfluence = 0, MaxDistance = 250}, part)
+	local bb = new("BillboardGui", { -- must live in PlayerGui, otherwise it never receives taps/clicks
+		Adornee = part, Size = UDim2.fromOffset(170, 80), AlwaysOnTop = true, LightInfluence = 0, MaxDistance = 250,
+		ResetOnSpawn = false, Active = true,
+	}, V.lp:WaitForChild("PlayerGui"))
 	local btn = new("TextButton", { -- big invisible touch target on top of the orb
 		AnchorPoint = Vector2.new(.5, .5), Position = UDim2.new(.5, 0, 0, 40), Size = UDim2.fromOffset(56, 56),
 		BackgroundTransparency = 1, Text = "",
@@ -497,16 +514,17 @@ local function makeOrb(f, c)
 		TextWrapped = true, Visible = false,
 	}, bb)
 	corner(lbl, 6)
-	local o = {part = part, lbl = lbl, angle = math.random() * 6.28, held = false, greater = c.greater, name = c.name}
+	local o = {part = part, bb = bb, lbl = lbl, angle = math.random() * 6.28, held = false, showUntil = 0, greater = c.greater, name = c.name}
 	local heldInput
 	btn.InputBegan:Connect(function(input)
 		if heldInput then return end
 		if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
 			heldInput, o.held = input, true
+			o.showUntil = os.clock() + 9999
 		end
 	end)
 	o.endConn = UIS.InputEnded:Connect(function(input)
-		if input == heldInput then heldInput, o.held, lbl.Visible = nil, false, false end
+		if input == heldInput then heldInput, o.held = nil, false o.showUntil = os.clock() + 2.5 end -- a quick tap keeps the info up for 2.5s
 	end)
 	V.orbs[f] = o
 end
@@ -524,10 +542,12 @@ RS.Heartbeat:Connect(function(dt)
 				local a = o.angle + (idx - 1) * (math.pi / 2)
 				o.part.Position = root.Position + Vector3.new(math.cos(a) * K.ORBIT_R, 1 + math.sin(o.angle * 1.7 + idx) * .6, math.sin(a) * K.ORBIT_R)
 			end
-			if o.held then
+			if o.held or os.clock() < o.showUntil then
 				local left = math.max(0, math.ceil(c.expires - os.clock()))
 				o.lbl.Visible = true
-				o.lbl.Text = string.format("%s\n%d:%02d left", c.name, left // 60, left % 60)
+				o.lbl.Text = string.format("%s\n%d:%02d left", c.name, math.floor(left / 60), left % 60)
+			else
+				o.lbl.Visible = false
 			end
 		end
 	end
@@ -787,7 +807,7 @@ end
 local function spawnNatural()
 	local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
 	if not root then return false end
-	local ang, dist = math.random() * math.pi * 2, math.random(15, K.SOUL_RADIUS)
+	local ang, dist = math.random() * math.pi * 2, math.random(K.SOUL_MIN_RADIUS, K.SOUL_RADIUS)
 	local origin = root.Position + Vector3.new(math.cos(ang) * dist, 100, math.sin(ang) * dist)
 	local params = RaycastParams.new()
 	params.FilterDescendantsInstances = {V.lp.Character, V.coinFolder}
@@ -806,12 +826,16 @@ local function spawnDeathSoul(pos, survivedSecs)
 	table.insert(deathSouls, s)
 end
 
-local function collectEffect(pos)
+local function playSound(def)
+	if not def or not def.id or def.id == "" then return end
 	pcall(function()
-		local snd = new("Sound", {SoundId = K.SOUL_SOUND_ID, Volume = .7}, V.gui)
-		snd:Play()
-		Debris:AddItem(snd, 3)
+		local s = new("Sound", {SoundId = def.id, Volume = def.volume or 1, PlaybackSpeed = def.speed or 1}, V.gui)
+		s:Play()
+		Debris:AddItem(s, 8)
 	end)
+end
+local function collectEffect(pos)
+	playSound(K.SOUNDS.soul)
 	local p = new("Part", {
 		Shape = Enum.PartType.Ball, Size = Vector3.new(1, 1, 1), Position = pos, Color = Color3.fromRGB(200, 225, 255), Material = Enum.Material.Neon,
 		Transparency = .2, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
@@ -825,11 +849,13 @@ local function collectSoul(s, list, i)
 	collectEffect(s.pos)
 	s.model:Destroy()
 	table.remove(list, i)
-	if s.kind == "natural" then table.insert(pendingSpawns, os.clock() + coinRespawn) end
+	if s.kind == "natural" then table.insert(pendingSpawns, {t = os.clock() + coinRespawn}) end -- replaced no sooner than coinRespawn seconds from now
 end
 
--- keeps ~coinTarget natural souls alive: respawn timers, and re-place any that you left far behind
+-- keeps ~coinTarget natural souls alive. A collected soul is replaced coinRespawn seconds later, and replacements are
+-- spaced coinRespawn seconds apart, so they never pop back instantly. (The first fill and relocations are immediate.)
 task.spawn(function()
+	local nextAllowed = 0
 	while true do
 		task.wait(.5)
 		local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
@@ -839,15 +865,22 @@ task.spawn(function()
 				if (s.base - root.Position).Magnitude > K.SOUL_RADIUS * 1.6 then -- out of range: relocate near you right away
 					s.model:Destroy()
 					table.remove(natural, i)
-					table.insert(pendingSpawns, 0)
+					table.insert(pendingSpawns, {t = 0, immediate = true})
 				end
 			end
 			while #natural > coinTarget do table.remove(natural).model:Destroy() end
 			while #natural + #pendingSpawns > coinTarget and #pendingSpawns > 0 do table.remove(pendingSpawns) end
-			while #natural + #pendingSpawns < coinTarget do table.insert(pendingSpawns, 0) end
+			while #natural + #pendingSpawns < coinTarget do table.insert(pendingSpawns, {t = 0, immediate = true}) end
 			for i = #pendingSpawns, 1, -1 do
-				if pendingSpawns[i] <= os.clock() and #natural < coinTarget and spawnNatural() then
-					table.remove(pendingSpawns, i)
+				local p = pendingSpawns[i]
+				local now = os.clock()
+				if #natural < coinTarget and (p.immediate or (now >= p.t and now >= nextAllowed)) then
+					local ok = false
+					for _ = 1, 6 do if spawnNatural() then ok = true break end end
+					if ok then
+						table.remove(pendingSpawns, i)
+						if not p.immediate then nextAllowed = now + coinRespawn end
+					end
 				end
 			end
 		end
@@ -882,14 +915,18 @@ RS.Heartbeat:Connect(function(dt)
 			s.model:Destroy()
 			table.remove(deathSouls, i)
 		else
-			if root and age > .5 then -- after the pop, accelerate toward the player
+			if root and age > .5 then -- after the pop, speed up straight at the player (never overshoots, so it can't orbit)
 				local to = root.Position + Vector3.new(0, 1, 0) - s.pos
-				if to.Magnitude > .1 then s.vel += to.Unit * 70 * dt end
-				if s.vel.Magnitude > 85 then s.vel = s.vel.Unit * 85 end
+				local dist = to.Magnitude
+				s.speed = math.min(130, (s.speed or 12) + 170 * dt)
+				if dist > .05 then
+					s.vel = to.Unit * s.speed
+					s.pos += to.Unit * math.min(dist, s.speed * dt)
+				end
 			else
 				s.vel *= math.max(0, 1 - 2 * dt)
+				s.pos += s.vel * dt
 			end
-			s.pos += s.vel * dt
 			s.scale = popScale(age)
 			layoutSoul(s, now, root and root.Position or s.pos)
 			local nearBody = root and (s.pos - root.Position).Magnitude < 4
@@ -1095,7 +1132,6 @@ if V.isOwner then
 end
 
 ---------------------------------------------------------------- Demon summoning (reusable)
-K.DEMON_MUSIC_ID = ""  -- put an ominous "rbxassetid://..." here. Empty = no music (I can't verify asset IDs from here)
 K.RITUAL_LINES = {
 	"i call the flame within the dark",
 	"hear my plea and leave your mark",
@@ -1223,6 +1259,30 @@ local function lightningBolt(center)
 		Debris:AddItem(p, .18)
 	end
 	flash(.25)
+	playSound(K.SOUNDS.lightning)
+end
+-- one enormous red bolt from the sky onto target (the pentagram, the ground, or the orb)
+local function hugeBolt(target, sound)
+	local top = target + Vector3.new(math.random(-12, 12), 320, math.random(-12, 12))
+	local pts, segs = {top}, 14
+	for i = 1, segs - 1 do
+		pts[#pts + 1] = top:Lerp(target, i / segs) + Vector3.new(math.random(-9, 9), 0, math.random(-9, 9))
+	end
+	pts[#pts + 1] = target
+	for i = 1, #pts - 1 do
+		local a, b = pts[i], pts[i + 1]
+		local cf, len = CFrame.lookAt((a + b) / 2, b), (b - a).Magnitude
+		for _, spec in ipairs({{3.2, Color3.fromRGB(255, 30, 30), .15}, {1.2, Color3.fromRGB(255, 210, 210), 0}}) do
+			local p = new("Part", {
+				Size = Vector3.new(spec[1], spec[1], len), CFrame = cf, Color = spec[2], Material = Enum.Material.Neon, Transparency = spec[3],
+				Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+			}, workspace)
+			TS:Create(p, TweenInfo.new(.5), {Transparency = 1}):Play()
+			Debris:AddItem(p, .6)
+		end
+	end
+	flash(.9)
+	playSound(sound)
 end
 local function startStorm(center) -- returns a stop function
 	local alive = true
@@ -1236,6 +1296,7 @@ local function startStorm(center) -- returns a stop function
 end
 
 local function bigExplosion(pos)
+	playSound(K.SOUNDS.explosion)
 	pcall(function() -- Roblox's own rocket-style Explosion (visual + its default sound); pressure/joint damage OFF
 		local e = Instance.new("Explosion")
 		e.Position, e.BlastRadius, e.BlastPressure = pos, 22, 0
@@ -1253,10 +1314,11 @@ local function bigExplosion(pos)
 end
 
 local function startMusic() -- returns a stop function
-	if K.DEMON_MUSIC_ID == "" then return function() end end
-	local s = new("Sound", {SoundId = K.DEMON_MUSIC_ID, Looped = true, Volume = 0}, V.gui)
+	local def = K.SOUNDS.music
+	if not def.id or def.id == "" then return function() end end
+	local s = new("Sound", {SoundId = def.id, Looped = true, Volume = 0, PlaybackSpeed = def.speed or 1}, V.gui)
 	s:Play()
-	TS:Create(s, TweenInfo.new(2), {Volume = .6}):Play()
+	TS:Create(s, TweenInfo.new(2), {Volume = def.volume or .6}):Play()
 	return function()
 		TS:Create(s, TweenInfo.new(1.5), {Volume = 0}):Play()
 		task.delay(1.6, function() s:Destroy() end)
@@ -1313,6 +1375,7 @@ ritualStop = function() -- safe to call any number of times
 			hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 		end)
 	end
+	if V.ritual.animate then pcall(function() V.ritual.animate.Disabled = false end) V.ritual.animate = nil end -- animations come back
 	if V.ritual.active then
 		V.ritual.active = false
 		busy = false
@@ -1324,8 +1387,21 @@ end
 local function ritualStart(root, hum)
 	V.ritual.active, busy = true, true
 	V.ritual.start = root.Position
+	if V.Book.pentagramPos then -- Necrobloxicon ritual: you float above the pentagram
+		local p = V.Book.pentagramPos + Vector3.new(0, hum.HipHeight + root.Size.Y / 2 + .2, 0)
+		root.CFrame = CFrame.new(p) * (root.CFrame - root.CFrame.Position)
+		V.ritual.start = p
+	end
 	V.ritual.bp = new("BodyPosition", {MaxForce = Vector3.new(1e6, 1e6, 1e6), P = 3000, D = 500, Position = root.Position}, root)
 	hum.WalkSpeed, hum.UseJumpPower, hum.JumpPower = 0, true, 0
+	-- no character animations while floating: turn the Animate script off and keep every track stopped
+	local animate = root.Parent and root.Parent:FindFirstChild("Animate")
+	if animate then animate.Disabled = true V.ritual.animate = animate end
+	local animator = hum:FindFirstChildOfClass("Animator")
+	local function freeze()
+		for _, t in ipairs((animator or hum):GetPlayingAnimationTracks()) do t:Stop(0) end
+	end
+	freeze()
 	pcall(function() -- no falling pose while floating
 		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
 		hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
@@ -1333,6 +1409,7 @@ local function ritualStart(root, hum)
 	end)
 	V.ritual.conn = RS.Heartbeat:Connect(function(dt)
 		if hum.Health <= 0 or not root.Parent or not V.ritual.bp then ritualStop() return end
+		freeze()
 		local sinking = not V.ritual.locked and os.clock() - V.ritual.lastLine > K.RITUAL_IDLE
 		if sinking then V.ritual.target = math.max(0, V.ritual.target - K.RITUAL_SINK * dt) end
 		V.ritual.h += (V.ritual.target - V.ritual.h) * math.min(1, 2.5 * dt)
@@ -1343,32 +1420,114 @@ local function ritualStart(root, hum)
 end
 
 ---------------------------------------------------------------- Punishment (6th summon within 3 minutes)
-K.LAVA_DELAY, K.LAVA_SPEED = 4, 2.4         -- seconds before the lava starts rising, studs per second
-K.STEPS, K.STEP_H, K.ARENA_R, K.ARENA_Y = 16, 3.6, 16, 3000
+-- ===== TWEAKS for the lava obby =====
+K.LAVA_DELAY, K.LAVA_SPEED = 6, 2.1  -- seconds before the lava starts rising / how fast it rises (studs per second)
+K.OBBY_STEPS = 42                    -- number of platforms (more = longer)
+K.OBBY_CRUMBLE_EVERY = 5             -- every Nth platform (orange) crumbles about 1 second after you land on it
+K.ARENA_Y = 3000
 
--- a demonic hand: built upright from its wrist (origin) along +Y, length L
-local function buildHand(L)
+local HAND_SKIN, HAND_CLAW = Color3.fromRGB(78, 10, 10), Color3.fromRGB(255, 50, 30)
+local ARM_SEGS = 7
+
+-- a clawed demon hand: origin at the wrist, fingers along +Y, palm facing -Z, fingers curled into a grip
+local function buildHand()
 	local m = Instance.new("Model")
 	m.Name = "DemonHand"
-	local dark, red = Color3.fromRGB(70, 8, 8), Color3.fromRGB(255, 40, 30)
-	local function part(shape, size, cf, color, mat)
-		return new("Part", {
-			Shape = shape, Size = size, CFrame = cf, Color = color, Material = mat or Enum.Material.SmoothPlastic,
+	local function blob(size, cf, color, mat)
+		local p = new("Part", {
+			Size = size, CFrame = cf, Color = color or HAND_SKIN, Material = mat or Enum.Material.SmoothPlastic,
 			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
 		}, m)
+		new("SpecialMesh", {MeshType = Enum.MeshType.Sphere}, p)
+		return p
 	end
-	part(Enum.PartType.Cylinder, Vector3.new(L, 1, 1), CFrame.new(0, L / 2, 0) * CFrame.Angles(0, 0, math.pi / 2), dark)
-	part(Enum.PartType.Block, Vector3.new(2, .7, 1.8), CFrame.new(0, L + .3, 0), dark)
-	for i, x in ipairs({-.75, -.25, .25, .75}) do
-		local f = CFrame.new(x, L + 1.4, 0) * CFrame.Angles(0, 0, -x * .35)
-		part(Enum.PartType.Block, Vector3.new(.35, 1.6, .35), f, dark)
-		part(Enum.PartType.Block, Vector3.new(.25, .5, .25), f * CFrame.new(0, .95, 0), red, Enum.Material.Neon)
+	local function seg(len, r, cf, color, mat) -- a rounded finger bone along +Y from cf
+		blob(Vector3.new(2 * r, len + r, 2 * r), cf * CFrame.new(0, len / 2, 0), color, mat)
 	end
+	blob(Vector3.new(.95, .95, .95), CFrame.new(0, 0, 0))     -- wrist
+	blob(Vector3.new(1.7, 1.6, .8), CFrame.new(0, .85, 0))    -- palm
+	blob(Vector3.new(1.5, .6, .6), CFrame.new(0, .3, -.12))   -- heel of the hand
+	local function finger(x, y, lens, r, tilt, curls)
+		local cf = CFrame.new(x, y, -.15) * CFrame.Angles(0, 0, tilt)
+		for i = 1, 3 do
+			cf = cf * CFrame.Angles(-curls[i], 0, 0)
+			local rr = r * (1 - (i - 1) * .17)
+			seg(lens[i], rr, cf)
+			blob(Vector3.new(rr * 2.2, rr * 2.2, rr * 2.2), cf)                   -- knuckle
+			cf = cf * CFrame.new(0, lens[i], 0)
+		end
+		seg(.55, r * .38, cf * CFrame.Angles(-.4, 0, 0), HAND_CLAW, Enum.Material.Neon) -- glowing claw
+	end
+	finger(-.58, 1.5, {.55, .42, .34}, .17, .06, {.35, .95, .9})   -- pinky
+	finger(-.2, 1.55, {.78, .6, .46}, .19, .02, {.35, .95, .9})    -- ring
+	finger(.2, 1.55, {.85, .65, .5}, .19, -.02, {.35, .95, .9})    -- middle
+	finger(.58, 1.5, {.75, .58, .44}, .18, -.06, {.35, .95, .9})   -- index
+	-- thumb, off to the side
+	local tcf = CFrame.new(.82, .5, -.2) * CFrame.Angles(0, 0, -.95)
+	for i, spec in ipairs({{.6, .35}, {.5, .8}}) do
+		tcf = tcf * CFrame.Angles(-spec[2], 0, 0)
+		seg(spec[1], .21 * (1 - (i - 1) * .15), tcf)
+		tcf = tcf * CFrame.new(0, spec[1], 0)
+	end
+	seg(.5, .08, tcf * CFrame.Angles(-.4, 0, 0), HAND_CLAW, Enum.Material.Neon)
 	m.WorldPivot = CFrame.new()
 	return m
 end
 
--- the lava pit: a disc, a spiral staircase of platforms, a rising lava slab and a beam over the exit
+-- each hand grips a DIFFERENT part of the body
+local GRIP = {
+	{"LeftFoot", "Left Leg"}, {"RightFoot", "Right Leg"}, {"LeftLowerLeg", "Left Leg"}, {"RightUpperLeg", "Right Leg"},
+	{"LowerTorso", "Torso"}, {"LeftUpperArm", "Left Arm"}, {"RightUpperArm", "Right Arm"},
+}
+
+local function buildArm()
+	local armModel = Instance.new("Model")
+	armModel.Name = "DemonArm"
+	local parts = {}
+	for i = 1, ARM_SEGS do -- overlapping ellipsoids make a smooth, muscular arm that can bend
+		local p = new("Part", {
+			Size = Vector3.new(1, 1, 1), Color = HAND_SKIN, Material = Enum.Material.Slate,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+		}, armModel)
+		new("SpecialMesh", {MeshType = Enum.MeshType.Sphere}, p)
+		parts[i] = p
+	end
+	armModel.Parent = workspace
+	return armModel, parts
+end
+
+-- reach k: 0 = just emerging from the portal, 1 = gripping its target
+local function updateHand(h, root, ground, k)
+	local T = root.Position + h.off
+	local base = ground + Vector3.new(math.cos(h.ang) * 7, 0, math.sin(h.ang) * 7)
+	local d = Vector3.new(base.X - T.X, 0, base.Z - T.Z)
+	d = d.Magnitude > .1 and d.Unit or Vector3.new(math.cos(h.ang), 0, math.sin(h.ang))
+	local W = (base + Vector3.new(0, 1.5, 0)):Lerp(T + d * 1.0 + Vector3.new(0, -1.0, 0), k)
+	local ctrl = (base + W) / 2 + d * 3 + Vector3.new(0, 2, 0)
+	local pts = {}
+	for i = 0, ARM_SEGS do
+		local t = i / ARM_SEGS
+		pts[i] = base:Lerp(ctrl, t):Lerp(ctrl:Lerp(W, t), t)
+	end
+	for i = 1, ARM_SEGS do
+		local p1, p2 = pts[i - 1], pts[i]
+		local len = (p2 - p1).Magnitude
+		if len > .001 then
+			local th = 1.2 - .65 * ((i - .5) / ARM_SEGS) -- thick at the shoulder, slim at the wrist
+			h.armParts[i].Size = Vector3.new(th, th, len * 1.45)
+			h.armParts[i].CFrame = CFrame.lookAt((p1 + p2) / 2, p2)
+		end
+	end
+	local up = pts[ARM_SEGS] - pts[ARM_SEGS - 1]
+	up = up.Magnitude > .001 and up.Unit or Vector3.yAxis
+	local n = T - (W + up * .85) -- palm faces the body part it grips
+	n = n - up * n:Dot(up)
+	n = n.Magnitude > .05 and n.Unit or -d
+	local back = -n
+	h.model:PivotTo(CFrame.fromMatrix(W, up:Cross(back), up, back))
+end
+
+-- the lava pit: a disc, a long winding climb of shrinking platforms with growing gaps, crumbling platforms, rising lava
 local function buildArena(center)
 	local m = Instance.new("Model")
 	m.Name = "DemonArena"
@@ -1380,22 +1539,40 @@ local function buildArena(center)
 	end
 	part(Enum.PartType.Cylinder, Vector3.new(2, 26, 26), CFrame.new(center - Vector3.new(0, 1, 0)) * CFrame.Angles(0, 0, math.pi / 2),
 		Color3.fromRGB(45, 12, 12), nil, true)
-	local lastTop
-	for i = 1, K.STEPS do
-		local a = i * (math.pi * 2 / 8)
-		local topY = center.Y + i * K.STEP_H
-		local pos = Vector3.new(center.X + math.cos(a) * K.ARENA_R, topY - .75, center.Z + math.sin(a) * K.ARENA_R)
-		part(Enum.PartType.Block, Vector3.new(9, 1.5, 9), CFrame.new(pos) * CFrame.Angles(0, -a, 0), Color3.fromRGB(60, 18, 18), nil, true)
+	local crumbles = {}
+	local N = K.OBBY_STEPS
+	local topY, ang, prevR, prevW, lastTop = center.Y, math.random() * math.pi * 2, 0, 26, nil
+	for i = 1, N do
+		local f = i / N
+		local w = 8 - 3.5 * f + (math.random() - .5)               -- platforms shrink as you climb
+		topY += 2.4 + math.random()                                  -- each step up is 2.4 to 3.4 studs
+		local gap = 2.5 + 2.8 * f + math.random() * .5              -- gaps grow from ~2.5 to ~5.8 studs
+		local r, pos
+		if i == 1 then
+			r = 20.5
+			pos = Vector3.new(center.X + math.cos(ang) * r, 0, center.Z + math.sin(ang) * r)
+		else
+			r = math.clamp(prevR + (math.random() - .5) * 5, 16, 22)
+			local dist = prevW / 2 + w / 2 + gap
+			local cosd = (prevR * prevR + r * r - dist * dist) / (2 * prevR * r)
+			ang += math.acos(math.clamp(cosd, -1, 1))
+			pos = Vector3.new(center.X + math.cos(ang) * r, 0, center.Z + math.sin(ang) * r)
+		end
+		local crumble = i % K.OBBY_CRUMBLE_EVERY == 0 and i < N
+		local p = part(Enum.PartType.Block, Vector3.new(w, 1.5, w), CFrame.new(pos.X, topY - .75, pos.Z) * CFrame.Angles(0, -ang, 0),
+			crumble and Color3.fromRGB(170, 85, 30) or Color3.fromRGB(60, 18, 18), nil, true)
+		if crumble then table.insert(crumbles, {part = p, x = pos.X, z = pos.Z, top = topY, half = w / 2}) end
+		prevR, prevW = r, w
 		lastTop = Vector3.new(pos.X, topY, pos.Z)
 	end
 	local exitPos = lastTop + Vector3.new(0, 4, 0)
 	part(Enum.PartType.Ball, Vector3.new(5, 5, 5), CFrame.new(exitPos), Color3.fromRGB(255, 80, 80), Enum.Material.Neon).Transparency = .3
-	part(Enum.PartType.Cylinder, Vector3.new(120, 4, 4), CFrame.new(exitPos + Vector3.new(0, 60, 0)) * CFrame.Angles(0, 0, math.pi / 2),
-		Color3.fromRGB(255, 70, 70), Enum.Material.Neon).Transparency = .5
+	part(Enum.PartType.Cylinder, Vector3.new(500, 4, 4), CFrame.new(exitPos + Vector3.new(0, 240, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+		Color3.fromRGB(255, 70, 70), Enum.Material.Neon).Transparency = .5 -- tall beam so you can always see where to go
 	local lava = part(Enum.PartType.Block, Vector3.new(160, 2, 160), CFrame.new(center), Color3.fromRGB(255, 80, 0), Enum.Material.Neon)
 	new("PointLight", {Color = Color3.fromRGB(255, 90, 0), Range = 60, Brightness = 3}, lava)
 	m.Parent = workspace
-	return m, exitPos, lava
+	return m, exitPos, lava, crumbles
 end
 
 local function runPunishment()
@@ -1408,7 +1585,6 @@ local function runPunishment()
 	local function alive() return hum.Health > 0 and root.Parent ~= nil end
 	local fade = function(a, t) TS:Create(V.flashFrame, TweenInfo.new(t), {BackgroundTransparency = a}):Play() end
 
-	-- body parts that normally collide, so we can let you sink through the ground and give collision back
 	local solidParts, collideOff = {}, false
 	for _, d in ipairs(char:GetDescendants()) do
 		if d:IsA("BasePart") and d.CanCollide then table.insert(solidParts, d) end
@@ -1428,41 +1604,41 @@ local function runPunishment()
 		local hit = workspace:Raycast(floorPos + Vector3.new(0, 5, 0), Vector3.new(0, -800, 0), rp)
 		local gy = hit and hit.Position.Y or floorPos.Y - 3
 		local ground = Vector3.new(floorPos.X, gy + .15, floorPos.Z)
+		local feetOff = hum.HipHeight + root.Size.Y / 2
 
 		V.Env.darken(2)
 		onCleanup(function() V.Env.restore(0, true) end)
 		toast("You called too often. The demon is angry.", 4)
 
-		-- red portal opens beneath you
+		-- red portal opens beneath you, with a demon scream
 		local portal = new("Part", {
 			Shape = Enum.PartType.Cylinder, Size = Vector3.new(.3, 1, 1), CFrame = CFrame.new(ground) * CFrame.Angles(0, 0, math.pi / 2),
 			Color = Color3.fromRGB(200, 10, 10), Material = Enum.Material.Neon, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
 		}, workspace)
 		new("PointLight", {Color = Color3.fromRGB(255, 20, 20), Range = 40, Brightness = 4}, portal)
 		onCleanup(function() portal:Destroy() end)
-		TS:Create(portal, TweenInfo.new(.9, Enum.EasingStyle.Back), {Size = Vector3.new(.3, 18, 18)}):Play()
+		playSound(K.SOUNDS.scream)
+		TS:Create(portal, TweenInfo.new(.9, Enum.EasingStyle.Back), {Size = Vector3.new(.3, 22, 22)}):Play()
 		task.wait(1)
 		if not alive() then return end
 
-		-- hands rise and grab you, then drag you down
-		local feetY = V.ritual.start.Y + V.ritual.h - 2.5
-		local L = math.max(8, feetY - gy)
+		-- seven hands spread around the portal, each reaching for a different part of your body
 		local hands = {}
-		for i = 1, 5 do
-			local h = buildHand(L)
-			h.Parent = workspace
-			table.insert(hands, {model = h, ang = i * (math.pi * 2 / 5)})
-		end
-		onCleanup(function() for _, h in ipairs(hands) do h.model:Destroy() end end)
-		local RADIUS = 3
-		local function placeHands(tipY) -- tip of every hand converges on the point above the portal at height tipY
-			for _, h in ipairs(hands) do
-				local base = Vector3.new(ground.X + math.cos(h.ang) * RADIUS, tipY - L, ground.Z + math.sin(h.ang) * RADIUS)
-				local up = (Vector3.new(ground.X, tipY, ground.Z) - base).Unit
-				local right = up:Cross(Vector3.new(0, 0, 1)).Unit
-				h.model:PivotTo(CFrame.fromMatrix(base, right, up))
+		for i, names in ipairs(GRIP) do
+			local tp
+			for _, nm in ipairs(names) do
+				local c = char:FindFirstChild(nm)
+				if c and c:IsA("BasePart") then tp = c break end
 			end
+			local off = tp and (tp.Position - root.Position) or Vector3.new(math.random(-1, 1), -math.random(0, 3), 0)
+			local armModel, armParts = buildArm()
+			local hm = buildHand()
+			hm.Parent = workspace
+			table.insert(hands, {model = hm, armModel = armModel, armParts = armParts, off = off, ang = i / #GRIP * math.pi * 2 + math.random() * .3})
 		end
+		onCleanup(function() for _, h in ipairs(hands) do h.model:Destroy() h.armModel:Destroy() end end)
+		local function updateAll(k) for _, h in ipairs(hands) do updateHand(h, root, ground, k) end end
+		local function setHandsParent(p) for _, h in ipairs(hands) do h.model.Parent = p h.armModel.Parent = p end end
 		local function tween(from, to, dur, fn)
 			local t0 = os.clock()
 			while alive() do
@@ -1472,8 +1648,7 @@ local function runPunishment()
 				RS.Heartbeat:Wait()
 			end
 		end
-		-- reach
-		tween(gy - 1, feetY, 1.4, placeHands)
+		tween(0, 1, 1.6, updateAll) -- reach and grab
 		if not alive() then return end
 
 		-- drag: stop the float loop, drive the body ourselves and let it sink through the ground
@@ -1481,11 +1656,10 @@ local function runPunishment()
 		setCollide(false)
 		local bp = V.ritual.bp
 		local startY = bp.Position.Y
-		local endY = gy - 10
 		fade(.2, 1.8)
-		tween(startY, endY, 2.2, function(y)
+		tween(startY, gy - 10, 2.2, function(y)
 			bp.Position = Vector3.new(floorPos.X, y, floorPos.Z)
-			placeHands(y - 2.5)
+			updateAll(1)
 		end)
 		if not alive() then return end
 		fade(0, .3)
@@ -1493,21 +1667,21 @@ local function runPunishment()
 
 		-- the pit
 		local center = Vector3.new(ground.X, K.ARENA_Y, ground.Z)
-		local arena, exitPos, lava = buildArena(center)
+		local arena, exitPos, lava, crumbles = buildArena(center)
 		onCleanup(function() arena:Destroy() end)
 		V.ritual.bp = nil
 		bp:Destroy()
-		for _, h in ipairs(hands) do h.model.Parent = nil end
+		setHandsParent(nil)
 		pcall(function()
 			hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
 			hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 		end)
 		setCollide(true)
-		root.CFrame = CFrame.new(center + Vector3.new(0, 3.5, 0))
+		root.CFrame = CFrame.new(center + Vector3.new(0, feetOff + .5, 0))
 		root.AssemblyLinearVelocity = Vector3.zero
 		applyBuffs() -- punishing = true: base speed/jump, curses ignored
 		fade(1, 1)
-		toast("Climb! Reach the red beam before the lava gets you.", 5)
+		toast("Climb! Orange platforms crumble. Reach the red beam before the lava gets you.", 6)
 
 		local lavaStart = center.Y - 4
 		local t0, escaped = os.clock(), false
@@ -1517,7 +1691,19 @@ local function runPunishment()
 			local el = os.clock() - t0
 			local lavaTop = lavaStart + math.max(0, el - K.LAVA_DELAY) * K.LAVA_SPEED
 			lava.Position = Vector3.new(center.X, lavaTop - 1, center.Z)
-			if root.Position.Y - 3 < lavaTop or el > 150 then hum.Health = 0 return end -- failed: you die
+			local feetY = root.Position.Y - feetOff
+			if feetY < lavaTop or el > 240 then hum.Health = 0 return end -- failed: you die
+			for _, c in ipairs(crumbles) do
+				if not c.t then
+					if math.abs(root.Position.X - c.x) < c.half + .3 and math.abs(root.Position.Z - c.z) < c.half + .3 and math.abs(feetY - c.top) < 1.5 then
+						c.t = el
+					end
+				elseif not c.gone and el - c.t > .9 then
+					c.gone = true
+					c.part.CanCollide = false
+					TS:Create(c.part, TweenInfo.new(.3), {Transparency = 1}):Play()
+				end
+			end
 			if (root.Position - exitPos).Magnitude < 7 then escaped = true break end
 		end
 		if not escaped then return end
@@ -1527,7 +1713,7 @@ local function runPunishment()
 		task.wait(.5)
 		arena:Destroy()
 		setCollide(false)
-		for _, h in ipairs(hands) do h.model.Parent = workspace end
+		setHandsParent(workspace)
 		local bp2 = new("BodyPosition", {MaxForce = Vector3.new(1e6, 1e6, 1e6), P = 3000, D = 500, Position = Vector3.new(ground.X, gy - 10, ground.Z)}, root)
 		onCleanup(function() bp2:Destroy() end)
 		root.CFrame = CFrame.new(ground.X, gy - 10, ground.Z)
@@ -1535,11 +1721,11 @@ local function runPunishment()
 		fade(1, .6)
 		tween(gy - 10, gy + 3, 1.6, function(y)
 			bp2.Position = Vector3.new(ground.X, y, ground.Z)
-			placeHands(y - 2.5)
+			updateAll(1)
 		end)
 		bp2:Destroy()
 		setCollide(true)
-		for _, h in ipairs(hands) do h.model:Destroy() end
+		for _, h in ipairs(hands) do h.model:Destroy() h.armModel:Destroy() end
 		hands = {}
 		bigExplosion(ground)
 		lockoutUntil = os.clock() + K.LOCKOUT
@@ -1623,6 +1809,7 @@ local function beginSummon()
 	if forcePunish or summonCount >= K.SUMMON_LIMIT then
 		forcePunish = false
 		summonTotal += 1
+		if V.Book.onSummonEnd then pcall(V.Book.onSummonEnd, false) end
 		runPunishment()
 		return
 	end
@@ -1631,23 +1818,31 @@ local function beginSummon()
 	local cleanups = {}
 	local function onCleanup(f) table.insert(cleanups, f) end
 	local function alive() return hum.Health > 0 and root.Parent ~= nil end
-	local restored = false
+	local restored, finished = false, false
 
 	local ok, err = pcall(function()
 		local floorPos = V.ritual.start
 		local top = floorPos + Vector3.new(0, K.FLOAT_HEIGHT, 0)
 
-		-- sky darkens + red lightning
-		V.Env.darken(2.5)
-		onCleanup(function() if not restored then V.Env.restore(0, true) end end)
-		onCleanup(startStorm(top))
-		task.wait(3)
+		-- you are floating fully and the sky is still normal for a moment
+		task.wait(1.2)
 		if not alive() then return end
 
-		-- explosion, then the fireball
+		-- then the sky darkens and red lightning starts
+		V.Env.darken(2.5)
+		onCleanup(function() if not restored then V.Env.restore(0, true) end end)
+		local stopStorm = startStorm(top)
+		onCleanup(stopStorm)
+		task.wait(2.8)
+		if not alive() then return end
+
+		-- a HUGE bolt hits the pentagram (or the ground under you); the red strikes stop, the explosion happens, the orb appears
 		local look = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
 		look = look.Magnitude > .01 and look.Unit or Vector3.new(0, 0, -1)
 		local orbPos = top + look * 14 + Vector3.new(0, 1, 0)
+		hugeBolt(V.Book.pentagramPos or (floorPos - Vector3.new(0, 3, 0)), K.SOUNDS.lightning)
+		task.wait(.35)
+		stopStorm()
 		bigExplosion(orbPos)
 		local _, destroyOrb = spawnOrb(orbPos)
 		onCleanup(destroyOrb)
@@ -1695,7 +1890,10 @@ local function beginSummon()
 			task.wait(.8)
 		end
 
-		-- the orb explodes, the sky comes back
+		-- a big red lightning strike (with a stinger) takes the orb away, then the explosion, then the sky comes back
+		finished = true
+		hugeBolt(orbPos, K.SOUNDS.stinger)
+		task.wait(.3)
 		bigExplosion(orbPos)
 		destroyOrb()
 		restored = true
@@ -1720,6 +1918,7 @@ local function beginSummon()
 	end)
 	if not ok then warn("[Demon] summon error: " .. tostring(err)) end
 	for i = #cleanups, 1, -1 do pcall(cleanups[i]) end
+	if V.Book.onSummonEnd then pcall(V.Book.onSummonEnd, finished) end
 	ritualStop()
 end
 
@@ -1743,7 +1942,7 @@ local function onChat(text)
 	if idx == 1 then
 		if os.clock() < lockoutUntil then
 			local left = math.ceil(lockoutUntil - os.clock())
-			toast(string.format("The demon will not answer for %d:%02d.", left // 60, left % 60), 3)
+			toast(string.format("The demon will not answer for %d:%02d.", math.floor(left / 60), left % 60), 3)
 			return
 		end
 		if gliding then stopGlide() end
@@ -1765,6 +1964,397 @@ pcall(function()
 		if m.TextSource and m.TextSource.UserId == V.lp.UserId then onChat(m.Text) end
 	end)
 end)
+
+---------------------------------------------------------------- The Necrobloxicon
+-- ===== TWEAKS =====
+K.BOOK_SPAWN_MIN, K.BOOK_SPAWN_MAX = 150, 260  -- how far from you the book appears (it only spawns while you don't own it)
+K.BOOK_DARK_DIST = 90      -- closer than this: the sky turns dark and the book glows red
+K.BOOK_FLOAT_DIST = 45     -- closer than this: it floats upright
+K.BOOK_OPEN_DIST = 20      -- closer than this: it opens and floats to you
+K.BOOK_ARMED_TIMEOUT = 180 -- seconds you can wait at the pentagram before the ritual fades (you keep the book)
+
+local function initBook()
+	local Book, lp = V.Book, V.lp
+	local playerGui = lp:WaitForChild("PlayerGui")
+	local PAPER, INK, BLOOD = Color3.fromRGB(214, 186, 138), Color3.fromRGB(70, 40, 24), Color3.fromRGB(120, 20, 20)
+	local startClock = os.clock()
+	local W, armed -- W = the book lying in the world; armed = the pentagram ritual in progress
+
+	-- ===== the book as 3D parts (also used for the dropped book) =====
+	local function buildBookModel()
+		local m = Instance.new("Model")
+		m.Name = "NecroBook"
+		local function p(size, color, mat, name)
+			return new("Part", {Name = name, Size = size, Color = color, Material = mat or Enum.Material.SmoothPlastic,
+				Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false}, m)
+		end
+		local parts = {
+			bottom = p(Vector3.new(3, .25, 4), Color3.fromRGB(14, 10, 10), nil, "Bottom"),
+			pages = p(Vector3.new(2.8, .8, 3.8), Color3.fromRGB(205, 178, 130), nil, "Pages"),
+			top = p(Vector3.new(3, .25, 4), Color3.fromRGB(14, 10, 10), nil, "Top"),
+			sigil = p(Vector3.new(1.1, .06, 1.1), Color3.fromRGB(255, 40, 40), Enum.Material.Neon, "Sigil"),
+		}
+		new("PointLight", {Color = Color3.fromRGB(255, 40, 40), Range = 6, Brightness = 0}, parts.pages)
+		return m, parts
+	end
+	local function placeBook(parts, cf, openT)
+		local ang = math.pi * .92 * openT
+		local topRel = CFrame.new(-1.5, .2, 0) * CFrame.Angles(0, 0, ang) * CFrame.new(1.5, .85, 0) -- hinged at the spine
+		parts.bottom.CFrame = cf
+		parts.pages.CFrame = cf * CFrame.new(0, .525, 0)
+		parts.top.CFrame = cf * topRel
+		parts.sigil.CFrame = cf * topRel * CFrame.new(0, .16, 0)
+	end
+
+	-- ===== the book viewer: an old two-page spread. Lines on the LEFT page, the seal on the RIGHT, a spine between =====
+	-- Every element gets an explicit ZIndex (Global mode) so nothing can end up hidden behind a page.
+	local viewer = new("ScreenGui", {Name = "NecroBook", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 6, Enabled = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Global}, playerGui)
+	local frame = new("Frame", {AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromScale(.94, .8), BackgroundTransparency = 1}, viewer)
+	new("UISizeConstraint", {MaxSize = Vector2.new(780, 540), MinSize = Vector2.new(300, 200)}, frame)
+	new("UIAspectRatioConstraint", {AspectRatio = 1.45, AspectType = Enum.AspectType.ScaleWithParentSize, DominantAxis = Enum.DominantAxis.Width}, frame)
+	local function rect(parent, props)
+		props.BorderSizePixel = 0
+		return new("Frame", props, parent)
+	end
+	local COVER = Color3.fromRGB(14, 10, 10)
+	local cover = rect(frame, {Size = UDim2.fromScale(1, 1), BackgroundColor3 = COVER, ZIndex = 1})
+	corner(cover, 18)
+	new("UIStroke", {Color = Color3.fromRGB(90, 15, 15), Thickness = 2}, cover)
+	local layers = {} -- the stack of pages behind the open spread
+	for i = 1, 4 do
+		layers[i] = rect(frame, {
+			Position = UDim2.new(0, 14 + i * 3, 0, 14 + i * 3), Size = UDim2.new(1, -28, 1, -28), ZIndex = 1 + i,
+			BackgroundColor3 = Color3.fromRGB(176 - i * 6, 146 - i * 6, 100 - i * 5),
+		})
+		corner(layers[i], 4)
+	end
+	local inner = rect(frame, {Position = UDim2.new(0, 14, 0, 14), Size = UDim2.new(1, -28, 1, -28), BackgroundTransparency = 1, ZIndex = 6})
+
+	-- an old sheet of paper: stained gradient, ragged bitten edges, age spots
+	local function makePage(parent, pos, size, seed, edges) -- edges = which sides are torn: top/bottom/left/right
+		local pg = rect(parent, {Position = pos, Size = size, BackgroundColor3 = PAPER, ZIndex = 8})
+		new("UIGradient", {
+			Color = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.fromRGB(226, 198, 150)), ColorSequenceKeypoint.new(.5, Color3.fromRGB(206, 176, 126)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(180, 146, 98))}), Rotation = 25 + seed * 40,
+		}, pg)
+		new("UIStroke", {Color = Color3.fromRGB(110, 78, 44), Thickness = 1.5, Transparency = .3}, pg)
+		local rng = Random.new(seed * 101)
+		for side, torn in pairs(edges) do
+			if torn then
+				for _ = 1, 26 do
+					local t, w, depth = rng:NextNumber(), rng:NextInteger(3, 12), rng:NextInteger(2, 7)
+					local n = rect(pg, {BackgroundColor3 = COVER, ZIndex = 9, Rotation = rng:NextInteger(-25, 25)})
+					if side == "top" then n.AnchorPoint, n.Position, n.Size = Vector2.new(.5, 0), UDim2.new(t, 0, 0, -1), UDim2.fromOffset(w, depth)
+					elseif side == "bottom" then n.AnchorPoint, n.Position, n.Size = Vector2.new(.5, 1), UDim2.new(t, 0, 1, 1), UDim2.fromOffset(w, depth)
+					elseif side == "left" then n.AnchorPoint, n.Position, n.Size = Vector2.new(0, .5), UDim2.new(0, -1, t, 0), UDim2.fromOffset(depth, w)
+					else n.AnchorPoint, n.Position, n.Size = Vector2.new(1, .5), UDim2.new(1, 1, t, 0), UDim2.fromOffset(depth, w) end
+				end
+			end
+		end
+		for _ = 1, 12 do -- age spots
+			local s = rng:NextInteger(5, 18)
+			local spot = rect(pg, {AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(rng:NextNumber(), rng:NextNumber()), Size = UDim2.fromOffset(s, s),
+				BackgroundColor3 = Color3.fromRGB(140, 100, 55), BackgroundTransparency = .78, ZIndex = 9})
+			new("UICorner", {CornerRadius = UDim.new(1, 0)}, spot)
+		end
+		return pg
+	end
+	local function label(parent, text, y, h, color, maxSize)
+		local t = new("TextLabel", {
+			AnchorPoint = Vector2.new(.5, 0), Position = UDim2.fromScale(.5, y), Size = UDim2.fromScale(.86, h), BackgroundTransparency = 1,
+			Text = text, TextColor3 = color, Font = Enum.Font.Antique, TextScaled = true, TextWrapped = true, ZIndex = 12,
+		}, parent)
+		new("UITextSizeConstraint", {MaxTextSize = maxSize, MinTextSize = 6}, t)
+		return t
+	end
+	local function fillLines(pg)
+		label(pg, "The Necrobloxicon", .06, .11, INK, 28)
+		label(pg, "Speak these words aloud, in order:", .19, .09, INK, 17)
+		for i, line in ipairs(K.RITUAL_LINES) do label(pg, line, .31 + (i - 1) * .17, .14, BLOOD, 24) end
+		label(pg, "Type them in the chat.", .84, .07, INK, 14)
+	end
+
+	-- left page (lines), spine, right page (the seal)
+	local left = makePage(inner, UDim2.new(0, 0, 0, 0), UDim2.new(.5, -2, 1, 0), 1, {top = true, bottom = true, left = true})
+	local right = makePage(inner, UDim2.new(.5, 2, 0, 0), UDim2.new(.5, -2, 1, 0), 2, {top = true, bottom = true, right = true})
+	fillLines(left)
+	rect(inner, {AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 0), Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = Color3.fromRGB(60, 38, 22), ZIndex = 11})
+	for _, side in ipairs({-1, 1}) do -- soft shadow either side of the spine
+		local sh = rect(inner, {AnchorPoint = Vector2.new(side == -1 and 1 or 0, 0), Position = UDim2.new(.5, side * 2, 0, 0), Size = UDim2.new(0, 18, 1, 0),
+			BackgroundColor3 = Color3.fromRGB(60, 38, 22), ZIndex = 10})
+		new("UIGradient", {Transparency = side == -1 and NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, .5)})
+			or NumberSequence.new({NumberSequenceKeypoint.new(0, .5), NumberSequenceKeypoint.new(1, 1)})}, sh)
+	end
+	label(right, "The Seal", .06, .11, INK, 28)
+	label(right, "Touch it to begin.", .86, .07, INK, 14)
+	local seal = new("Frame", {AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromScale(.74, .64), BackgroundTransparency = 1, ZIndex = 12}, right)
+	new("UIAspectRatioConstraint", {AspectRatio = 1, AspectType = Enum.AspectType.ScaleWithParentSize, DominantAxis = Enum.DominantAxis.Width}, seal)
+	local ring = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 12}, seal)
+	new("UICorner", {CornerRadius = UDim.new(1, 0)}, ring)
+	local ringStroke = new("UIStroke", {Color = Color3.fromRGB(255, 45, 45), Thickness = 4}, ring)
+	TS:Create(ringStroke, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Transparency = .75}):Play() -- glow pulse
+	local pts = {}
+	for k = 0, 4 do
+		local a = math.rad(-90 + 72 * k)
+		pts[k] = Vector2.new(.5 + .46 * math.cos(a), .5 + .46 * math.sin(a))
+	end
+	for k = 0, 4 do
+		local a, b = pts[k], pts[(k + 2) % 5]
+		local d = b - a
+		rect(seal, {AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale((a.X + b.X) / 2, (a.Y + b.Y) / 2), Size = UDim2.fromScale(d.Magnitude, .02),
+			Rotation = math.deg(math.atan2(d.Y, d.X)), BackgroundColor3 = Color3.fromRGB(255, 45, 45), ZIndex = 13})
+	end
+	local sealBtn = new("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 15}, seal)
+
+	-- after a finished summon the book is only the single page with the three lines
+	local soloBack = rect(frame, {AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(.5, .5), Size = UDim2.fromScale(.6, 1), BackgroundColor3 = COVER, BackgroundTransparency = .35, ZIndex = 1})
+	corner(soloBack, 18)
+	local solo = makePage(frame, UDim2.fromScale(.2, .04), UDim2.fromScale(.6, .92), 3, {top = true, bottom = true, left = true, right = true})
+	solo.ZIndex = 8
+	fillLines(solo)
+	local closeBtn = new("TextButton", {AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -2, 0, 2), Size = UDim2.fromOffset(32, 32),
+		Text = "X", Font = Enum.Font.GothamBlack, TextSize = 16, TextColor3 = Color3.new(1, 1, 1), BackgroundColor3 = Color3.fromRGB(90, 15, 15), ZIndex = 30}, frame)
+	corner(closeBtn, 16)
+
+	local function render(full)
+		cover.Visible, inner.Visible = full, full
+		for _, l in ipairs(layers) do l.Visible = full end
+		soloBack.Visible, solo.Visible = not full, not full
+	end
+	local function openViewer()
+		render(Book.state ~= "page")
+		viewer.Enabled = true
+	end
+	local function closeViewer() viewer.Enabled = false end
+
+	-- the tool in your inventory (client-side; re-created after respawn so you keep it when you die)
+	local function removeTool() if Book.tool then Book.tool:Destroy() Book.tool = nil end end
+	local function giveTool()
+		removeTool()
+		if Book.state == "none" then return end
+		local backpack = lp:FindFirstChildOfClass("Backpack")
+		if not backpack then return end
+		local t = Instance.new("Tool")
+		t.Name = Book.state == "full" and "Necrobloxicon" or "The Three Lines"
+		t.RequiresHandle, t.CanBeDropped, t.ToolTip = false, false, "Opens the book"
+		t.Equipped:Connect(openViewer)
+		t.Unequipped:Connect(closeViewer)
+		t.Parent = backpack
+		Book.tool = t
+	end
+	closeBtn.MouseButton1Click:Connect(function()
+		closeViewer()
+		local h = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+		if h then h:UnequipTools() end
+	end)
+
+	-- ===== the lines on screen (red, see-through, each somewhere else) =====
+	local linesGui = new("ScreenGui", {Name = "NecroLines", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 4, Enabled = false}, playerGui)
+	local POS = {Vector2.new(.62, .22), Vector2.new(.3, .45), Vector2.new(.68, .64)}
+	local lineLbls, lineState = {}, {}
+	for i, text in ipairs(K.RITUAL_LINES) do
+		local l = new("TextLabel", {
+			AnchorPoint = Vector2.new(.5, .5), Position = UDim2.fromScale(POS[i].X, POS[i].Y), Size = UDim2.fromScale(.42, .13),
+			BackgroundTransparency = 1, Text = text, TextColor3 = Color3.fromRGB(255, 40, 40), TextTransparency = 1,
+			Font = Enum.Font.Antique, TextScaled = true, TextWrapped = true, Active = false,
+		}, linesGui)
+		new("UITextSizeConstraint", {MaxTextSize = 28, MinTextSize = 10}, l)
+		lineLbls[i] = l
+	end
+	local function setLineStates(stage) -- next line to say = visible, said lines = ghosted, later lines = hidden
+		for i, l in ipairs(lineLbls) do
+			local want = (i == stage + 1) and .3 or (i <= stage and .88 or 1)
+			if lineState[i] ~= want then
+				lineState[i] = want
+				TS:Create(l, TweenInfo.new(.6), {TextTransparency = want}):Play()
+			end
+		end
+	end
+
+	-- ===== pentagram on the ground =====
+	local pentParts = {}
+	local function buildPentagram(center)
+		local function part(shape, size, cf, color, mat, transp)
+			local p = new("Part", {Shape = shape, Size = size, CFrame = cf, Color = color, Material = mat, Transparency = 1,
+				Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false}, workspace)
+			table.insert(pentParts, {part = p, target = transp})
+		end
+		local c = center + Vector3.new(0, .12, 0)
+		part(Enum.PartType.Cylinder, Vector3.new(.2, 19, 19), CFrame.new(c) * CFrame.Angles(0, 0, math.pi / 2), Color3.fromRGB(255, 30, 30), Enum.Material.Neon, .2)
+		part(Enum.PartType.Cylinder, Vector3.new(.22, 17.4, 17.4), CFrame.new(c + Vector3.new(0, .02, 0)) * CFrame.Angles(0, 0, math.pi / 2), Color3.fromRGB(20, 0, 0), Enum.Material.SmoothPlastic, .25)
+		local R, pt = 8, {}
+		for k = 0, 4 do
+			local a = math.rad(-90 + 72 * k)
+			pt[k] = c + Vector3.new(math.cos(a) * R, .15, math.sin(a) * R)
+		end
+		for k = 0, 4 do
+			local a, b = pt[k], pt[(k + 2) % 5]
+			part(Enum.PartType.Block, Vector3.new(.5, .15, (b - a).Magnitude), CFrame.lookAt((a + b) / 2, b), Color3.fromRGB(255, 40, 40), Enum.Material.Neon, .1)
+		end
+		for _, e in ipairs(pentParts) do TS:Create(e.part, TweenInfo.new(1.2), {Transparency = e.target}):Play() end
+	end
+	local function clearPentagram()
+		local old = pentParts
+		pentParts = {}
+		for _, e in ipairs(old) do
+			TS:Create(e.part, TweenInfo.new(.8), {Transparency = 1}):Play()
+			Debris:AddItem(e.part, .9)
+		end
+	end
+	local function disarm(restoreTool)
+		armed, Book.armed, Book.pentagramPos = nil, nil, nil
+		clearPentagram()
+		linesGui.Enabled = false
+		for i, l in ipairs(lineLbls) do lineState[i] = nil l.TextTransparency = 1 end
+		if restoreTool then giveTool() end
+	end
+	local function arm() -- the pentagram on the book's second page was clicked
+		local char = lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if Book.state ~= "full" or armed or not (hum and root) or hum.Health <= 0 then return end
+		if busy or missileBusy or pilotingDrone or mountedDrone or V.punishing or V.ritual.active then
+			toast("Finish what you are doing first.", 2.5)
+			return
+		end
+		if os.clock() < lockoutUntil then
+			toast("The demon will not answer yet.", 3)
+			return
+		end
+		local rp = RaycastParams.new()
+		rp.FilterDescendantsInstances = {char, V.coinFolder}
+		local hit = workspace:Raycast(root.Position, Vector3.new(0, -50, 0), rp)
+		if not hit then toast("Stand on solid ground first.", 2.5) return end
+		closeViewer()
+		hum:UnequipTools()
+		removeTool() -- the book leaves your inventory...
+		local center = hit.Position
+		armed = {t0 = os.clock(), center = center}
+		Book.armed, Book.pentagramPos = armed, center
+		local m, parts = buildBookModel() -- ...falls to the ground, sinks, and leaves a pentagram
+		m.Parent = workspace
+		task.spawn(function()
+			local top, bottom = center + Vector3.new(0, 10, 0), center + Vector3.new(0, .45, 0)
+			local t0 = os.clock()
+			while os.clock() - t0 < .55 do
+				local k = (os.clock() - t0) / .55
+				placeBook(parts, CFrame.new(top:Lerp(bottom, k * k)) * CFrame.Angles(0, k * 4, 0), 0)
+				RS.Heartbeat:Wait()
+			end
+			t0 = os.clock()
+			while os.clock() - t0 < 1.3 do
+				local k = (os.clock() - t0) / 1.3
+				placeBook(parts, CFrame.new(bottom - Vector3.new(0, 1.9 * k, 0)), 0)
+				for _, pp in pairs(parts) do pp.Transparency = k end
+				RS.Heartbeat:Wait()
+			end
+			m:Destroy()
+			if armed and armed.center == center then
+				buildPentagram(center)
+				linesGui.Enabled = true
+				setLineStates(0)
+			end
+		end)
+	end
+	sealBtn.MouseButton1Click:Connect(arm)
+
+	-- ===== the book lying in the world =====
+	local function removeWorld()
+		if W then
+			if W.dark and not V.ritual.active and not V.punishing then V.Env.restore(1.5) end
+			W.model:Destroy()
+			W = nil
+		end
+	end
+	local function spawnWorld(root)
+		local ang, dist = math.random() * math.pi * 2, math.random(K.BOOK_SPAWN_MIN, K.BOOK_SPAWN_MAX)
+		local rp = RaycastParams.new()
+		rp.FilterDescendantsInstances = {lp.Character, V.coinFolder}
+		local hit = workspace:Raycast(root.Position + Vector3.new(math.cos(ang) * dist, 150, math.sin(ang) * dist), Vector3.new(0, -400, 0), rp)
+		if not hit or hit.Normal.Y < .6 then return false end
+		local m, parts = buildBookModel()
+		m.Parent = workspace
+		W = {model = m, parts = parts, pos = hit.Position, upright = 0, open = 0, hover = .45, dark = false}
+		placeBook(parts, CFrame.new(hit.Position + Vector3.new(0, .45, 0)), 0)
+		return true
+	end
+	local function pickup()
+		removeWorld()
+		Book.state = "full"
+		giveTool()
+		openViewer() -- the page pops up on your screen
+		toast("You found the Necrobloxicon. It is in your inventory.", 5)
+	end
+	local function updateWorld(dt, root)
+		local flat = Vector3.new(root.Position.X - W.pos.X, 0, root.Position.Z - W.pos.Z)
+		local d = flat.Magnitude
+		local stage = d > K.BOOK_DARK_DIST and 0 or (d > K.BOOK_FLOAT_DIST and 1 or (d > K.BOOK_OPEN_DIST and 2 or 3))
+		local wantDark = stage >= 1
+		if wantDark ~= W.dark and not V.ritual.active and not V.punishing then -- near it, the sky turns dark
+			W.dark = wantDark
+			if wantDark then V.Env.darken(2) else V.Env.restore(2) end
+		end
+		W.upright += ((stage >= 2 and 1 or 0) - W.upright) * math.min(1, 2.2 * dt)
+		W.open += ((stage == 3 and 1 or 0) - W.open) * math.min(1, 2.5 * dt)
+		W.hover += ((stage >= 2 and 4.5 or .45) - W.hover) * math.min(1, 2.2 * dt)
+		if stage == 3 and d > .1 then W.pos += flat.Unit * math.min(d, 12 * dt) end -- floats toward you
+		local base = W.pos + Vector3.new(0, W.hover + math.sin(os.clock() * 2) * .15 * W.upright, 0)
+		local u = d > .1 and flat.Unit or Vector3.new(0, 0, 1)
+		local standing = CFrame.fromMatrix(base, u:Cross(Vector3.yAxis), u, Vector3.yAxis) -- upright, cover facing you
+		placeBook(W.parts, CFrame.new(base):Lerp(standing, W.upright), W.open)
+		local glow = math.clamp(1 - d / K.BOOK_DARK_DIST, 0, 1)
+		local light = W.parts.pages:FindFirstChildOfClass("PointLight")
+		light.Range, light.Brightness = 6 + 22 * glow, glow * 6
+		if stage == 3 and d < 4 then pickup() end
+	end
+
+	-- one loop for everything
+	RS.Heartbeat:Connect(function(dt)
+		local char = lp.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not root then return end
+		if Book.state == "none" then
+			if W then
+				if (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(W.pos.X, 0, W.pos.Z)).Magnitude > K.BOOK_SPAWN_MAX * 2 then
+					removeWorld() -- you wandered far away: it will reappear near you
+				else
+					updateWorld(dt, root)
+				end
+			elseif os.clock() - startClock > 8 and os.clock() - (Book.lastTry or 0) > 2 then
+				Book.lastTry = os.clock()
+				spawnWorld(root)
+			end
+		elseif W then
+			removeWorld()
+		end
+		if armed then
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			if not hum or hum.Health <= 0 then
+				disarm(true)
+			else
+				setLineStates(V.ritual.stage)
+				if not V.ritual.active and not V.ritual.locked
+					and (os.clock() - armed.t0 > K.BOOK_ARMED_TIMEOUT or (root.Position - armed.center).Magnitude > 70) then
+					disarm(true)
+					toast("The ritual fades. The book returns to you.", 3)
+				end
+			end
+		end
+	end)
+
+	-- called by the summon when it ends: a finished summon turns the book into just the page with the three lines
+	Book.onSummonEnd = function(finished)
+		if finished and Book.state == "full" then Book.state = "page" end
+		if armed then disarm(false) end
+		giveTool()
+	end
+	lp.CharacterAdded:Connect(function() -- you keep it when you die
+		task.wait(.6)
+		if not armed then giveTool() end
+	end)
+end
+initBook()
 
 ---------------------------------------------------------------- Baby Tung Tungs (Mercy reward)
 local function buildBaby(pos)
@@ -2156,7 +2746,7 @@ K.DRONE_MOUNT_SPEED = 45
 K.DRONE_ACCEL, K.DRONE_BRAKE = 3.5, 4.2         -- horizontal: how fast it speeds up / brakes (bigger = snappier, less drift)
 K.DRONE_VACCEL, K.DRONE_VBRAKE = 2.6, 4.5       -- up/down momentum
 K.DRONE_TILT = .4                             -- max lean in radians
-K.DRONE_CAM_LAG, K.DRONE_CAM_LAG_V = 5, 3.5     -- camera catch-up speed (bigger = tighter)
+K.DRONE_CAM_LAG, K.DRONE_CAM_LAG_V = 9, 6.5     -- camera catch-up speed (bigger = tighter)
 K.DRONE_SIT_OFFSET = CFrame.new(0, 1.7, 0)   -- where your root sits relative to the drone while mounted (tweak if you float/sink)
 K.PROP_SPIN = 45                             -- propeller spin speed (radians/second)
 K.DRONE_BLUE = Color3.fromRGB(35, 105, 225)   -- the drone's blue
@@ -2199,7 +2789,7 @@ local function buildDrone()
 	-- four arms going diagonally UP from the body corners, a propeller on each
 	for _, o in ipairs({Vector3.new(1, 0, 1), Vector3.new(-1, 0, 1), Vector3.new(1, 0, -1), Vector3.new(-1, 0, -1)}) do
 		local near = Vector3.new(o.X * (W / 2 - r * .6), H / 2 - .1 * k, o.Z * (D / 2 - r * .6))
-		local hub = near + Vector3.new(o.X * 1.4 * k, 1.7 * k, o.Z * 1.4 * k)
+		local hub = near + Vector3.new(o.X * 1.1 * k, 1.2 * k, o.Z * 1.1 * k)
 		local dir, mid = hub - near, (hub + near) / 2
 		part(Cyl, Vector3.new(dir.Magnitude, .34 * k, .34 * k), CFrame.lookAt(mid, mid + dir.Unit) * CFrame.Angles(0, math.pi / 2, 0), .45) -- arm
 		part(Ball, Vector3.new(.8 * k, .8 * k, .8 * k), CFrame.new(hub), .35)                                                                 -- motor
