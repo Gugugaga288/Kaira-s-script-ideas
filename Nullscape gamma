@@ -1,0 +1,278 @@
+-- Nullscape Gamma v4
+-- LIGHTING ONLY. Does not touch parts, materials or textures.
+-- GUI is built first, so a lighting error can never stop the slider from showing.
+
+local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local function safe(f, ...)
+	local ok, err = pcall(f, ...)
+	if not ok then warn("[NullGamma] " .. tostring(err)) end
+	return ok
+end
+
+------------------------------------------------------------
+-- TUNING (edit these if the look is off)
+------------------------------------------------------------
+local AMBIENT        = Color3.fromRGB(0, 0, 130)     -- shaded areas  (blue)
+local OUTDOOR        = Color3.fromRGB(30, 0, 170)    -- outdoor shade (blue-violet)
+local SHIFT_TOP      = Color3.fromRGB(255, 0, 170)   -- lit areas     (magenta)
+local SHIFT_BOTTOM   = Color3.fromRGB(0, 0, 120)
+local BRIGHTNESS     = 2.5                           -- sun strength at 100%
+local TINT           = Color3.fromRGB(255, 70, 255)  -- screen tint (removes green)
+local CONTRAST_1     = 0.7                           -- two stacked contrast passes =
+local CONTRAST_2     = 0.6                           -- hard, posterized banding
+local SATURATION     = 0.9
+local SHADOW_SOFT    = 0.5                           -- Future shadow softness (noisy edges)
+
+local alpha, enabled = 0.85, true
+local function eff() return enabled and alpha or 0 end
+
+------------------------------------------------------------
+-- GUI PARENT
+------------------------------------------------------------
+local guiParent
+do
+	local ok, res = pcall(function() return gethui and gethui() end)
+	if ok and res then
+		guiParent = res
+	else
+		local ok2, cg = pcall(function() return game:GetService("CoreGui") end)
+		guiParent = (ok2 and cg) or Players.LocalPlayer:WaitForChild("PlayerGui")
+	end
+end
+for _, n in ipairs({"NullGamma", "NullGammaOverlay"}) do
+	safe(function() local o = guiParent:FindFirstChild(n); if o then o:Destroy() end end)
+end
+for _, v in ipairs(Lighting:GetChildren()) do
+	if string.sub(v.Name, 1, 9) == "NullGamma" then v:Destroy() end
+end
+
+local lightingStep, lightingRestore = function() end, function() end
+local overlayGui, overlay, overlayOK, noiseOn = nil, nil, false, false
+
+------------------------------------------------------------
+-- GUI (built first)
+------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "NullGamma"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999; gui.Parent = guiParent
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(240, 120)
+frame.Position = UDim2.new(0.5, -120, 0.3, 0)
+frame.BackgroundColor3 = Color3.fromRGB(20, 8, 40)
+frame.BorderSizePixel = 0; frame.Active = true; frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+local stroke = Instance.new("UIStroke", frame)
+stroke.Color = Color3.fromRGB(255, 0, 170); stroke.Thickness = 1.5
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -110, 0, 28); title.Position = UDim2.fromOffset(10, 4)
+title.BackgroundTransparency = 1; title.Text = "Gamma"; title.Font = Enum.Font.Fondamento
+title.TextSize = 20; title.TextColor3 = Color3.new(1, 1, 1)
+title.TextXAlignment = Enum.TextXAlignment.Left; title.Active = true; title.Parent = frame
+
+local valueLbl = Instance.new("TextLabel")
+valueLbl.Size = UDim2.fromOffset(50, 28); valueLbl.Position = UDim2.new(1, -92, 0, 4)
+valueLbl.BackgroundTransparency = 1; valueLbl.Font = Enum.Font.GothamBold; valueLbl.TextSize = 14
+valueLbl.TextColor3 = Color3.fromRGB(255, 160, 240); valueLbl.Parent = frame
+
+local toggle = Instance.new("TextButton")
+toggle.Size = UDim2.fromOffset(32, 22); toggle.Position = UDim2.new(1, -38, 0, 7)
+toggle.BackgroundColor3 = Color3.fromRGB(90, 20, 140); toggle.Text = "ON"
+toggle.Font = Enum.Font.GothamBold; toggle.TextSize = 11; toggle.TextColor3 = Color3.new(1, 1, 1)
+toggle.Parent = frame
+Instance.new("UICorner", toggle).CornerRadius = UDim.new(0, 6)
+
+local track = Instance.new("Frame")
+track.Size = UDim2.new(1, -30, 0, 8); track.Position = UDim2.fromOffset(15, 56)
+track.BackgroundColor3 = Color3.fromRGB(60, 20, 100); track.BorderSizePixel = 0; track.Parent = frame
+Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+local fill = Instance.new("Frame")
+fill.BackgroundColor3 = Color3.fromRGB(255, 0, 170); fill.BorderSizePixel = 0; fill.Parent = track
+Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+local knob = Instance.new("Frame")
+knob.Size = UDim2.fromOffset(22, 22); knob.AnchorPoint = Vector2.new(0.5, 0.5)
+knob.BackgroundColor3 = Color3.new(1, 1, 1); knob.BorderSizePixel = 0; knob.Parent = track
+Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+local noiseBtn = Instance.new("TextButton")
+noiseBtn.Size = UDim2.new(1, -30, 0, 24); noiseBtn.Position = UDim2.fromOffset(15, 84)
+noiseBtn.BackgroundColor3 = Color3.fromRGB(45, 20, 80); noiseBtn.Text = "Noise overlay: OFF"
+noiseBtn.Font = Enum.Font.GothamBold; noiseBtn.TextSize = 12; noiseBtn.TextColor3 = Color3.new(1, 1, 1)
+noiseBtn.Parent = frame
+Instance.new("UICorner", noiseBtn).CornerRadius = UDim.new(0, 6)
+
+local function setAlpha(a)
+	alpha = math.clamp(a, 0, 1)
+	fill.Size = UDim2.fromScale(alpha, 1)
+	knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+	valueLbl.Text = math.floor(alpha * 100 + 0.5) .. "%"
+end
+setAlpha(alpha)
+
+local sliding, dragging, dragStart, startPos = false, false, nil, nil
+local function isPress(i) return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch end
+local function isMove(i) return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch end
+local function fromInput(i) setAlpha((i.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X) end
+
+local function startSlide(i) if isPress(i) then sliding = true; fromInput(i) end end
+track.InputBegan:Connect(startSlide); knob.InputBegan:Connect(startSlide)
+title.InputBegan:Connect(function(i)
+	if isPress(i) then dragging = true; dragStart = i.Position; startPos = frame.Position end
+end)
+UIS.InputChanged:Connect(function(i)
+	if not isMove(i) then return end
+	if sliding then fromInput(i)
+	elseif dragging then
+		local d = i.Position - dragStart
+		frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end)
+UIS.InputEnded:Connect(function(i)
+	if isPress(i) then sliding = false; dragging = false end
+end)
+
+toggle.MouseButton1Click:Connect(function()
+	enabled = not enabled
+	toggle.Text = enabled and "ON" or "OFF"
+	toggle.BackgroundColor3 = enabled and Color3.fromRGB(90, 20, 140) or Color3.fromRGB(60, 60, 60)
+end)
+
+noiseBtn.MouseButton1Click:Connect(function()
+	if not overlayOK then noiseBtn.Text = "Noise overlay: N/A"; return end
+	noiseOn = not noiseOn
+	overlay.Visible = noiseOn
+	noiseBtn.Text = "Noise overlay: " .. (noiseOn and "ON" or "OFF")
+end)
+
+------------------------------------------------------------
+-- LIGHTING (only Lighting + post effects, nothing in the map is edited)
+------------------------------------------------------------
+safe(function()
+	local orig = {}
+	for _, p in ipairs({"Ambient","OutdoorAmbient","ColorShift_Top","ColorShift_Bottom","Brightness",
+		"ExposureCompensation","EnvironmentDiffuseScale","EnvironmentSpecularScale","GlobalShadows","ShadowSoftness"}) do
+		pcall(function() orig[p] = Lighting[p] end)
+	end
+
+	local origTech
+	pcall(function() origTech = gethiddenproperty(Lighting, "Technology") end)
+	pcall(function() sethiddenproperty(Lighting, "Technology", Enum.Technology.Future) end)
+
+	local savedEffects = {}
+	for _, e in ipairs(Lighting:GetChildren()) do
+		if e:IsA("PostEffect") then savedEffects[e] = e.Enabled; e.Enabled = false end
+	end
+
+	local atmo = Lighting:FindFirstChildOfClass("Atmosphere")
+	local atmoOrig
+	if atmo then atmoOrig = {Color = atmo.Color, Decay = atmo.Decay, Haze = atmo.Haze, Glare = atmo.Glare} end
+
+	local cc1 = Instance.new("ColorCorrectionEffect"); cc1.Name = "NullGammaCC1"; cc1.Parent = Lighting
+	local cc2 = Instance.new("ColorCorrectionEffect"); cc2.Name = "NullGammaCC2"; cc2.Parent = Lighting
+
+	lightingStep = function()
+		local a = eff()
+		local function mix(k, to)
+			if orig[k] ~= nil then pcall(function() Lighting[k] = orig[k]:Lerp(to, a) end) end
+		end
+		mix("Ambient", AMBIENT)
+		mix("OutdoorAmbient", OUTDOOR)
+		mix("ColorShift_Top", SHIFT_TOP)
+		mix("ColorShift_Bottom", SHIFT_BOTTOM)
+		pcall(function()
+			Lighting.GlobalShadows = true
+			Lighting.Brightness = orig.Brightness + (BRIGHTNESS - orig.Brightness) * a
+			Lighting.EnvironmentDiffuseScale = orig.EnvironmentDiffuseScale * (1 - a)
+			Lighting.EnvironmentSpecularScale = orig.EnvironmentSpecularScale * (1 - a)
+			Lighting.ShadowSoftness = orig.ShadowSoftness + (SHADOW_SOFT - orig.ShadowSoftness) * a
+		end)
+
+		-- stacked passes: tint + heavy contrast/saturation snap colors to black / blue / magenta
+		cc1.TintColor = Color3.new(1, 1, 1):Lerp(TINT, a)
+		cc1.Contrast = CONTRAST_1 * a
+		cc1.Saturation = SATURATION * a
+		cc1.Brightness = -0.05 * a
+		cc2.Contrast = CONTRAST_2 * a
+		cc2.Saturation = 0.4 * a
+
+		if atmo then
+			atmo.Color = atmoOrig.Color:Lerp(Color3.fromRGB(30, 0, 140), a)
+			atmo.Decay = atmoOrig.Decay:Lerp(Color3.fromRGB(10, 0, 90), a)
+			atmo.Haze = atmoOrig.Haze * (1 - a)
+			atmo.Glare = atmoOrig.Glare * (1 - a)
+		end
+	end
+
+	lightingRestore = function()
+		for k, v in pairs(orig) do pcall(function() Lighting[k] = v end) end
+		for e, was in pairs(savedEffects) do pcall(function() e.Enabled = was end) end
+		if origTech then pcall(function() sethiddenproperty(Lighting, "Technology", origTech) end) end
+		if atmo then
+			atmo.Color, atmo.Decay, atmo.Haze, atmo.Glare = atmoOrig.Color, atmoOrig.Decay, atmoOrig.Haze, atmoOrig.Glare
+		end
+		cc1:Destroy(); cc2:Destroy()
+	end
+end)
+
+------------------------------------------------------------
+-- OPTIONAL NOISE OVERLAY (screen speckle, needs EditableImage support)
+------------------------------------------------------------
+safe(function()
+	overlayGui = Instance.new("ScreenGui")
+	overlayGui.Name = "NullGammaOverlay"; overlayGui.IgnoreGuiInset = true
+	overlayGui.ResetOnSpawn = false; overlayGui.DisplayOrder = -5; overlayGui.Parent = guiParent
+
+	overlay = Instance.new("ImageLabel")
+	overlay.Size = UDim2.new(1.02, 0, 1.02, 0); overlay.Position = UDim2.fromScale(-0.01, -0.01)
+	overlay.BackgroundTransparency = 1; overlay.Active = false; overlay.Visible = false
+	overlay.ImageTransparency = 0.55
+	overlay.Parent = overlayGui
+	pcall(function() overlay.ResamplingMode = Enum.ResamplingMode.Pixelated end)
+
+	local W, H = 160, 90
+	local img = Instance.new("EditableImage")
+	img.Size = Vector2.new(W, H)
+	local px = table.create(W * H * 4, 0)
+	local i = 1
+	for _ = 1, W * H do
+		local r = math.random()
+		local R, G, B, A = 0, 0, 0, 0
+		if r < 0.04 then R, G, B, A = 1, 0.05, 0.6, 0.9
+		elseif r < 0.12 then R, G, B, A = 0.05, 0, 0.6, 0.9
+		elseif r < 0.20 then R, G, B, A = 0, 0, 0.04, 0.95
+		end
+		px[i], px[i+1], px[i+2], px[i+3] = R, G, B, A
+		i += 4
+	end
+	img:WritePixels(Vector2.zero, Vector2.new(W, H), px)
+	local ok = pcall(function() overlay.ImageContent = Content.fromObject(img) end)
+	if not ok then img.Parent = overlay end
+	overlayOK = true
+end)
+
+local jt = 0
+local conn = RunService.RenderStepped:Connect(function(dt)
+	pcall(lightingStep)
+	if overlayOK and noiseOn then
+		jt += dt
+		if jt > 0.12 then
+			jt = 0
+			overlay.Position = UDim2.new(-0.01 + math.random() * 0.01, 0, -0.01 + math.random() * 0.01, 0)
+		end
+	end
+end)
+
+-- Destroying the "NullGamma" GUI restores everything
+gui.Destroying:Connect(function()
+	conn:Disconnect()
+	enabled = false
+	pcall(lightingRestore)
+	if overlayGui then pcall(function() overlayGui:Destroy() end) end
+end)
