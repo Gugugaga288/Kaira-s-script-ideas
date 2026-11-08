@@ -1,6 +1,7 @@
 -- DELTA / EXECUTOR VERSION: paste this whole file into Delta and Execute it while you are in a game (it is client-side only).
 -- It waits for the game to load, works with the character you already have, and refuses to start twice (re-execute after rejoining).
 -- Mobile: tap the on-screen buttons; the chat ritual and the secret phrase are typed into the normal Roblox chat.
+-- Tip: turn on SILENT CHANT (left side of the screen) and the ritual lines you type are never sent, so nobody else sees them.
 -- (Studio users: it still works as a LocalScript in StarterPlayer > StarterPlayerScripts.)
 -- DemonSummon: souls, Blessings/Curses (stackable), demon ritual + summon, ghost souls, the Necrobloxicon, improved drone. (Part 1 of 4 of the maze update)
 -- RITUAL: type these three lines in chat yourself, in order (letters only, case ignored). The Necrobloxicon book shows them:
@@ -77,8 +78,9 @@ K.MIN_SPEED, K.MIN_JUMP = 6, 20               -- curses never push you below the
 -- Coin cheat: letters and spaces only. Chat is public, so it ONLY works for the accounts in OWNER_USER_IDS
 -- (Roblox user IDs). Works for anyone in Studio test mode.
 K.COIN_PHRASE, K.COIN_AMOUNT = "quorble zanthic velvet mumbo plunk", 50
-K.OWNER_USER_IDS = {5312058798, 10459535763, 6145072861}
--- ----------------------------------------------------------0
+K.OWNER_USER_IDS = {5312058798, 10459535763}
+-- ------------------------------------------------------------------------
+K.STEP = 1 / 60
 K.TIERS = {"ESP", "ESP + Names", "ESP + Chams", "ESP + Arrows"}
 
 -- state
@@ -284,7 +286,7 @@ K.CURSES = {
 	{id = "heavy",    family = "heavy",    name = "Heavy Steps",         greater = false, weight = 100, reward = 5,  desc = "your speed keeps changing at random"},
 	{id = "heavyG",   family = "heavy",    name = "Greater Heavy Steps", greater = true,  weight = 14,  reward = 12, desc = "wilder speed swings: frozen to The Flash"},
 	{id = "blind",    family = "blind",    name = "Blind Spot",          greater = false, weight = 100, reward = 5,  desc = "screen edges go dark"},
-	{id = "blindG",   family = "blind",    name = "Total Blindness",      greater = true,  weight = 14,  reward = 12, desc = "the world goes almost black and NOTHING glows (souls keep their normal body, curse orbs turn grey). Lasts 5 minutes"},
+	{id = "blindG",   family = "blind",    name = "Total Blindness",      greater = true,  weight = 14,  reward = 12, desc = "the world goes almost black and NOTHING glows (souls keep their normal body, curse orbs turn grey; the maze guide is the only light). Lasts 5 minutes"},
 	{id = "unsteady", family = "unsteady", name = "Unsteady",            greater = false, weight = 100, reward = 5,  desc = "your jump keeps changing at random"},
 	{id = "unsteadyG",family = "unsteady", name = "Greater Unsteady",    greater = true,  weight = 14,  reward = 12, desc = "wilder jump swings, from none to enormous"},
 	{id = "trip",     family = "trip",     name = "Trip",                greater = false, weight = 100, reward = 6,  desc = "you stumble now and then while running"},
@@ -672,8 +674,8 @@ end
 local function applyBuffs()
 	local hum = V.lp.Character and V.lp.Character:FindFirstChildOfClass("Humanoid")
 	if not hum then return end
-	local speed = (V.on.speed and not V.inMaze) and (K.BASE_SPEED + speedBonus) or K.BASE_SPEED -- no blessings inside the maze
-	local jump = (V.on.jump and not V.inMaze) and (K.BASE_JUMP + jumpBonus) or K.BASE_JUMP
+	local speed = (V.on.speed and not (V.inMaze or V.inTrial)) and (K.BASE_SPEED + speedBonus) or K.BASE_SPEED -- no blessings inside the maze
+	local jump = (V.on.jump and not (V.inMaze or V.inTrial)) and (K.BASE_JUMP + jumpBonus) or K.BASE_JUMP
 	if not V.punishing then
 		local h, u = curseOn("heavy"), curseOn("unsteady")
 		if h then speed = speed * V.chaos.speedMul end -- can be 0 (frozen) up to The Flash
@@ -759,7 +761,7 @@ sync = function()
 	hasDouble, hasTriple = V.lv.mjump >= 1, V.lv.mjump >= 2
 	hasGlide, hasMulti, hasMagnet = V.lv.glide > 0, V.lv.multi > 0, V.lv.magnet > 0
 	hasDrone, hasDronePark, hasDroneMount = V.lv.drone > 0, V.lv.dronepark > 0, V.lv.dronemount > 0
-	if V.inMaze then -- blessings are switched off inside the maze (nothing is lost, they return when you leave)
+	if V.inMaze or V.inTrial then -- blessings are switched off inside the maze and the trials (nothing is lost, they return when you leave)
 		hasMissile, hasPhase, hasDouble, hasTriple, hasGlide, hasMulti, hasMagnet, hasDrone, hasDronePark, hasDroneMount = false, false, false, false, false, false, false, false, false, false
 	end
 	if hasDrone and ensureDrone then ensureDrone() end -- the idle-hover loop then parents/positions it automatically
@@ -965,7 +967,7 @@ task.spawn(function()
 	while true do
 		task.wait(.5)
 		local root = V.lp.Character and V.lp.Character:FindFirstChild("HumanoidRootPart")
-		if root and not V.inMaze then
+		if root and not (V.inMaze or V.inTrial) then
 			for i = #natural, 1, -1 do
 				local s = natural[i]
 				if (s.base - root.Position).Magnitude > K.SOUL_RADIUS * 1.6 then -- out of range: relocate near you right away
@@ -1197,6 +1199,11 @@ if V.isOwner then
 	end)
 
 	wideButton("Send me to the maze (test)", function() if V.Maze and V.Maze.enter then V.Maze.enter() end end)
+	header("Trials (testing)")
+	for n = 1, 3 do
+		wideButton("Enter Trial " .. n .. " (ignores lock)", function() if V.Trials and V.Trials.enter then task.spawn(V.Trials.enter, n, true) end end)
+	end
+	wideButton("Reset trial progress", function() if V.Trials then V.Trials.done = {false, false, false} end end)
 
 	header("Curses (tap to add a stack to yourself)")
 	for _, def in ipairs(K.CURSES) do
@@ -1358,12 +1365,38 @@ V.Env.black = false
 K.BLACK_LIGHT = {Ambient = Color3.new(0, 0, 0), OutdoorAmbient = Color3.new(0, 0, 0), Brightness = 0, ExposureCompensation = -1,
 	FogColor = Color3.new(0, 0, 0), FogStart = 0, FogEnd = 1500, ColorShift_Top = Color3.new(0, 0, 0), ColorShift_Bottom = Color3.new(0, 0, 0),
 	EnvironmentDiffuseScale = 0, EnvironmentSpecularScale = 0, ClockTime = 0}
+-- the maze is always lit so you can see where you walk (walls, floor, lava, exit). The orbs are NOT part of this light: they keep their own look.
+K.MAZE_LIGHT = {Ambient = Color3.fromRGB(150, 110, 110), OutdoorAmbient = Color3.fromRGB(150, 110, 110), Brightness = 1.6, ExposureCompensation = .35,
+	FogColor = Color3.fromRGB(30, 8, 8), FogStart = 80, FogEnd = 600, ColorShift_Top = Color3.new(0, 0, 0), ColorShift_Bottom = Color3.new(0, 0, 0),
+	EnvironmentDiffuseScale = 0, EnvironmentSpecularScale = 0, ClockTime = 0}
+function V.Env.maze(t)
+	V.Env.darken(t) -- (saves the real lighting once, hides the sky)
+	pcall(function() envTween(Lighting, t, K.MAZE_LIGHT) end)
+	if envSaved then for atm in pairs(envSaved.atmos) do if atm.Parent then envTween(atm, t, {Density = .08, Haze = 0}) end end end
+	if envTemp[1] then envTween(envTemp[1], t, {Density = .05, Haze = 0}) end
+	if envTemp[2] then envTween(envTemp[2], t, {Saturation = 0, Contrast = 0, Brightness = 0}) end
+end
+-- the trials take place in a hellish red hall
+K.HELL_LIGHT = {Ambient = Color3.fromRGB(150, 72, 52), OutdoorAmbient = Color3.fromRGB(150, 72, 52), Brightness = 1.3, ExposureCompensation = .3,
+	FogColor = Color3.fromRGB(70, 15, 5), FogStart = 70, FogEnd = 480, ColorShift_Top = Color3.fromRGB(60, 10, 0), ColorShift_Bottom = Color3.new(0, 0, 0),
+	EnvironmentDiffuseScale = 0, EnvironmentSpecularScale = 0, ClockTime = 0}
+function V.Env.hell(t)
+	V.Env.darken(t)
+	pcall(function() envTween(Lighting, t, K.HELL_LIGHT) end)
+	if envSaved then for atm in pairs(envSaved.atmos) do if atm.Parent then envTween(atm, t, {Density = .12, Haze = 0}) end end end
+	if envTemp[1] then envTween(envTemp[1], t, {Density = .08, Haze = 0}) end
+	if envTemp[2] then envTween(envTemp[2], t, {Saturation = 0, Contrast = 0, Brightness = 0}) end
+end
 function V.Env.reapply() -- instantly back to black (used after a summon's lighting is restored)
+	if V.inTrial and not V.inMaze then pcall(function() for p, v in pairs(K.HELL_LIGHT) do Lighting[p] = v end end) return end
+	if V.inMaze then pcall(function() for p, v in pairs(K.MAZE_LIGHT) do Lighting[p] = v end end) return end -- the maze stays lit
 	pcall(function() for p, v in pairs(K.BLACK_LIGHT) do Lighting[p] = v end end)
 	if envSaved then for sky in pairs(envSaved.skies) do if sky.Parent then sky.CelestialBodiesShown = false end end end
 end
 function V.Env.blackout(t) -- Total Blindness: the original lighting is saved once, then everything fades to (almost) black
 	V.Env.black = true
+	if V.inTrial and not V.inMaze then V.Env.hell(t) return end
+	if V.inMaze then V.Env.maze(t) return end -- ...except inside the maze: that stays lit so you can find your way
 	V.Env.darken(t)
 	pcall(function() envTween(Lighting, t, K.BLACK_LIGHT) end)
 	if envTemp[1] then envTween(envTemp[1], t, {Color = Color3.new(0, 0, 0), Decay = Color3.new(0, 0, 0), Density = .6}) end
@@ -2104,6 +2137,7 @@ local function onChat(text)
 		refresh()
 		return
 	end
+	if V.Shrine and V.Shrine.onLine and V.Shrine.onLine(s) then return end -- a trial line said at the shrine
 	local idx = table.find(K.RITUAL_LINES, s)
 	if not idx or V.ritual.locked or idx ~= V.ritual.stage + 1 then return end -- lines must come in order (this also ignores duplicate chat events)
 	local char = V.lp.Character
@@ -2136,6 +2170,1267 @@ pcall(function()
 	end)
 end)
 
+---------------------------------------------------------------- Silent chanting (option for everyone, NOT in the admin panel)
+-- When it is ON, the three ritual lines (and the owner phrase, for owners) are caught on their way out of your chat box:
+-- they are never sent, so other players never see them. You still see the line in your own chat (marked "only you"),
+-- and the ritual counts it exactly as if you had said it out loud. Needs an executor that supports hookmetamethod (Delta does).
+V.silentChant = false
+V.silentHooked = false
+do
+	local SG = game:GetService("StarterGui")
+	local function isSilentLine(text)
+		local n = normalize(text)
+		return table.find(K.RITUAL_LINES, n) ~= nil or (n == K.COIN_PHRASE and V.isOwner == true) or (V.Shrine and V.Shrine.isLine(n) ~= nil)
+	end
+	local function echo(text) -- shows the line in YOUR chat only
+		local safe = text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+		local shown = pcall(function()
+			local channels = TCS:FindFirstChild("TextChannels")
+			local ch = channels and (channels:FindFirstChild("RBXGeneral") or channels:FindFirstChildOfClass("TextChannel"))
+			assert(ch)
+			ch:DisplaySystemMessage("<font color='#9a9a9a'>[only you] </font>" .. V.lp.DisplayName .. ": " .. safe)
+		end)
+		if not shown then
+			pcall(function() SG:SetCore("ChatMakeSystemMessage", {Text = "[only you] " .. V.lp.DisplayName .. ": " .. text, Color = Color3.fromRGB(154, 154, 154)}) end)
+		end
+	end
+	local hmm, ncc, gnm, chk = hookmetamethod, newcclosure, getnamecallmethod, checkcaller
+	if hmm and gnm then
+		V.silentHooked = pcall(function()
+			local old
+			local function hook(self, ...)
+				local method = gnm() -- (must be read first)
+				if V.silentChant and (method == "SendAsync" or method == "FireServer") and not (chk and chk()) then
+					local text = ...
+					if type(text) == "string" and typeof(self) == "Instance" then
+						local ok = (method == "SendAsync" and self.ClassName == "TextChannel")
+							or (method == "FireServer" and self.Name == "SayMessageRequest")
+						if ok and isSilentLine(text) then
+							task.defer(function() echo(text) onChat(text) end)
+							return -- swallowed: nobody else ever receives it
+						end
+					end
+				end
+				return old(self, ...)
+			end
+			old = hmm(game, "__namecall", ncc and ncc(hook) or hook)
+		end)
+	end
+
+	-- METHOD 2 (the reliable one): watch the chat box itself. The moment what you typed is exactly a ritual line, it is
+	-- cleared out of the box and handled here, so it can never be sent (no need to press enter, nothing to hook).
+	local watched = {}
+	local function watchBox(tb)
+		if watched[tb] then return end
+		watched[tb] = true
+		tb:GetPropertyChangedSignal("Text"):Connect(function()
+			if not V.silentChant then return end
+			local text = tb.Text
+			if text == "" or #text > 90 then return end
+			if isSilentLine(text) then
+				tb.Text = ""
+				task.defer(function() echo(text) onChat(text) end)
+			end
+		end)
+	end
+	local function watchRoot(root)
+		if not root or watched[root] then return end
+		watched[root] = true
+		for _, d in ipairs(root:GetDescendants()) do if d:IsA("TextBox") then watchBox(d) end end
+		root.DescendantAdded:Connect(function(d) if d:IsA("TextBox") then watchBox(d) end end)
+	end
+	task.spawn(function() -- the chat can load late or be rebuilt, so keep looking for it
+		while true do
+			pcall(function() watchRoot(game:GetService("CoreGui"):FindFirstChild("ExperienceChat")) end) -- new Roblox chat
+			pcall(function() watchRoot(V.lp:FindFirstChild("PlayerGui") and V.lp.PlayerGui:FindFirstChild("Chat")) end) -- classic chat
+			task.wait(2)
+		end
+	end)
+
+	-- the option itself: a small button on the left of the screen
+	local btn = new("TextButton", {
+		AnchorPoint = Vector2.new(0, .5), Position = UDim2.new(0, 10, .5, 0), Size = UDim2.fromOffset(150, 32),
+		BackgroundColor3 = Color3.fromRGB(25, 25, 25), BackgroundTransparency = .25, TextColor3 = Color3.fromRGB(170, 170, 170),
+		Font = Enum.Font.GothamBold, TextSize = 12, Text = "SILENT CHANT: OFF",
+	}, V.gui)
+	corner(btn, 8)
+	btn.MouseButton1Click:Connect(function()
+		V.silentChant = not V.silentChant
+		btn.Text = V.silentChant and "SILENT CHANT: ON" or "SILENT CHANT: OFF"
+		btn.TextColor3 = V.silentChant and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(170, 170, 170)
+		toast(V.silentChant and "Silent chant ON: the ritual lines you type stay on your screen only." or "Silent chant OFF: your lines go out in normal chat.", 3)
+	end)
+end
+
+---------------------------------------------------------------- Demon Shrine + Three Trials
+-- ===== HANDOFF NOTES (keep this block up to date) =====
+-- PLAN: Part 1 shrine + trial framework (DONE) | Part 2 Trial 1 obby | Part 3 Trial 1 arena + giant curse orb + reward menu |
+--       Part 4 Trial 2 | Part 5 Trial 3 obby + boss phases 1-2 | Part 6 boss phase 3 + Angel Orb ending.
+-- CONTRACT for later parts:
+--   K.TRIALS[n] = {name, line}        the three unique ritual lines (said in chat while standing in the shrine centre)
+--   V.Trials.done[n]                   progress (in-session only); V.Trials.active = ctx while inside a trial
+--   V.Trials.builders[n] = function(ctx) -> spawnCFrame      REPLACE the placeholder for a trial by assigning its builder.
+--       ctx = {n, T, origin (Vector3, high in the sky), model (parent your parts here, it is destroyed on leave),
+--              frameFns (append fn(dt, root): runs every frame), cleanups (append fn()), respawnCF, killY (fall below = back to respawnCF),
+--              complete() = trial finished, leave() = abort}
+--   V.Trials.arenas[n] = function(ctx)  optional: the arena an obby hands off to (ctx.toArena()); Part 3 uses it for Trial I
+--   Trial I ARENA (Part 3): V.Trials.startFight(ctx, K.TRIAL_ARENAS[n]) is generic: 3 waves of curse orbs (sword = a client Tool "Demon Blade"),
+--     then the giant curse orb: throw rocks (walk over a rock, F or the THROW button) -> stunned -> sword it -> 3 cycles. HP is custom
+--     (hp/maxHP, 100) and losing it restarts the current stage. Reward menu: V.Trials.openReward(pool, title, done); pool for Trial I
+--     in K.TRIAL_REWARD_POOL[1]. For Trial II (Part 4) copy K.TRIAL_ARENAS[1] into [2], make it harder, set boss.bar = true (code exists).
+--   Trial I (Part 2, REMADE): a hellish enclosed hall (lava floor, walls, roof), 3 lanes + 2 wraparound half-spirals, big platforms, nothing skippable.
+--     Trials II and III are still placeholders. Trial lighting: V.Env.hell(t) (red fog and ambient), restored on leave.
+--   The shrine model was remade (4 terraces, 8 pillars, 6 fire bowls, 8 skulls, demon gate with eye, bigger stone angel, spinning rune rings).
+--   The finale beam is a 96-stud golden column that covers the whole shrine while it crumbles.
+--   BOSS INSPIRATION: the Trial III final boss (Part 5) is heavily inspired by the Eternal Bob boss fight in Slap Battles.
+--   V.Trials.rewards[n] = function(done)   optional: show the buff menu, then call done() to return the player to the shrine
+--   V.Trials.enter(n, force) / V.Trials.leave(survived) / V.Trials.complete(n)
+--   STONE ANGEL ORB (shrine back): wings light after Trial I, halo after II, orb + golden beam (shrine collapses) after III. DONE.
+--     (Update: the angel breaks too in the finale, so nothing of the shrine is left after Trial III.)
+--     NOT STARTED (user asked to hold): the angel following you, clicking it to ask a question, a timed car ride, and the
+--     "become the orb" transformation idea. Those go in a later part.
+--   V.inTrial = n while inside (blessings are off, souls do not spawn, like the maze). `busy` is true while inside.
+K.SHRINE_MIN, K.SHRINE_MAX, K.SHRINE_RADIUS = 70, 120, 5.5 -- how far from you the shrine rises, and how close to its centre you must stand
+K.TRIAL_BASE_Y, K.TRIAL_STEP_Y = 6000, 400                  -- trial n is built at height BASE + (n-1)*STEP (the maze is at 4200)
+K.TRIALS = {
+	{name = "Trial of Stone", line = "stone of the first gate awake and rise"},
+	{name = "Trial of Bone",  line = "bone of the second gate break and bleed"},
+	{name = "Trial of Flame", line = "flame of the last gate burn the skies"},
+}
+V.Trials = {done = {false, false, false}, builders = {}, rewards = {}, arenas = {}, active = nil, entering = false}
+V.Shrine = {built = false, inCenter = false}
+V.inTrial = nil
+do
+	local sCF -- the shrine's centre frame (nil until it has risen)
+	local ROMAN = {"I", "II", "III"}
+	local RUNE = Color3.fromRGB(255, 70, 30)
+	local GOLD = Color3.fromRGB(255, 215, 110)
+	local ANGEL = Color3.fromRGB(150, 146, 140)
+	local angel, angelSet = {wings = {}, halo = {}}, {}   -- the stone angel orb's parts (lit up by trial progress)
+	local shrineGone = false
+	local SHRINE_TOP = 4.7 -- height of the centre plate above the ground
+
+	function V.Shrine.isLine(n)
+		for i, T in ipairs(K.TRIALS) do if T.line == n then return i end end
+		return nil
+	end
+	function V.Shrine.onLine(n) -- called by onChat with the normalised text; returns true when the line was one of the trial lines
+		local idx = V.Shrine.isLine(n)
+		if not idx then return false end
+		if V.Shrine.gone then toast("The shrine has already been broken.", 2.5) return true end
+		if not V.Shrine.built then toast("The shrine has not risen yet.", 2.5) return true end
+		if not V.Shrine.inCenter then toast("Stand in the center of the shrine, then say it.", 3) return true end
+		task.spawn(V.Trials.enter, idx)
+		return true
+	end
+
+	-- ===== trials =====
+	local function flashTo(a, t) TS:Create(V.flashFrame, TweenInfo.new(t), {BackgroundTransparency = a}):Play() end
+
+	function V.Trials.leave(survived)
+		local ctx = V.Trials.active
+		if not ctx then return end
+		V.Trials.active = nil
+		if ctx.conn then ctx.conn:Disconnect() end
+		for _, f in ipairs(ctx.cleanups) do pcall(f) end
+		if ctx.model then ctx.model:Destroy() end
+		V.inTrial, busy = nil, false
+		sync()
+		if V.Env.black then V.Env.blackout(1) else V.Env.restore(1) end -- back to the normal (or Total Blindness) lighting
+		local char = V.lp.Character
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if survived and root and sCF then -- back on the shrine (if you died, the game respawns you as usual)
+			root.CFrame = CFrame.new(sCF.Position + Vector3.new(0, SHRINE_TOP + 4, 0))
+			root.AssemblyLinearVelocity = Vector3.zero
+		end
+		applyBuffs()
+		flashTo(1, .6)
+	end
+
+	function V.Trials.complete(n)
+		local ctx = V.Trials.active
+		if not ctx or ctx.n ~= n or ctx.finished then return end
+		ctx.finished = true
+		V.Trials.done[n] = true
+		toast(K.TRIALS[n].name .. " complete!", 4)
+		local reward = V.Trials.rewards[n]
+		if reward then
+			local ok = pcall(reward, function() V.Trials.leave(true) end) -- the reward menu calls this when the player has chosen
+			if not ok then V.Trials.leave(true) end
+		else
+			V.Trials.leave(true)
+		end
+	end
+
+	-- ===== TRIAL I: the stone obby (remade) =====
+-- A hellish hall: a sea of lava far below, scorched basalt walls and a roof. The course is three long lanes joined by two wraparound
+-- half-spirals. Platforms are big, and every lane sits 60+ studs sideways and 30+ studs up from the one below it, so nothing can be skipped.
+V.Trials.builders[1] = function(ctx)
+	local model, frameFns, base = ctx.model, ctx.frameFns, ctx.origin
+	local STONE, ROCK, EMBER, GOLD = Color3.fromRGB(100, 86, 80), Color3.fromRGB(40, 30, 28), Color3.fromRGB(255, 90, 30), Color3.fromRGB(255, 200, 80)
+	local cursor, dirDeg, lastW = base + Vector3.new(-115, 0, -100), 0, 18
+	local checkpoints = {}
+	local minX, maxX, minZ, maxZ, maxY = math.huge, -math.huge, math.huge, -math.huge, -math.huge
+
+	local function dirVec()
+		local d = math.rad(dirDeg)
+		return Vector3.new(math.cos(d), 0, math.sin(d))
+	end
+	local function place(top, w, opts) -- one platform whose top surface is at top.Y
+		opts = opts or {}
+		minX, maxX = math.min(minX, top.X - w / 2), math.max(maxX, top.X + w / 2)
+		minZ, maxZ = math.min(minZ, top.Z - w / 2), math.max(maxZ, top.Z + w / 2)
+		maxY = math.max(maxY, top.Y)
+		if opts.checkpoint then
+			opts.stripe = GOLD
+			local up = top + Vector3.new(0, 3, 0)
+			table.insert(checkpoints, {top = top, w = w, cf = CFrame.lookAt(up, up + dirVec()), hit = false})
+		end
+		new("Part", {Size = Vector3.new(w, 2, w), CFrame = CFrame.new(top - Vector3.new(0, 1, 0)), Color = STONE, Material = Enum.Material.Slate,
+			Anchored = true, CanCollide = true, CanTouch = false}, model)
+		local h = 8 + w * .5 -- the rock this island hangs from
+		new("Part", {Size = Vector3.new(w * .55, h, w * .55), CFrame = CFrame.new(top - Vector3.new(0, 2 + h / 2, 0)), Color = ROCK, Material = Enum.Material.Basalt,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false}, model)
+		if opts.stripe then
+			new("Part", {Size = Vector3.new(w * .9, .2, w * .9), CFrame = CFrame.new(top + Vector3.new(0, .1, 0)), Color = opts.stripe,
+				Material = Enum.Material.Neon, Anchored = true, CanCollide = false, CanTouch = false}, model)
+		end
+		cursor, lastW = top, w
+	end
+	local function step(gap, dy, w, turn, opts) -- walk on from the last platform: gap = empty space between the two edges
+		dirDeg = (dirDeg + (turn or 0)) % 360
+		place(cursor + dirVec() * (gap + lastW / 2 + w / 2) + Vector3.new(0, dy, 0), w, opts)
+	end
+	local function halfLoop(R, n, rise, w, cpw, sg) -- wraparound: n platforms climb half a circle, you come out heading back the other way
+		local d = dirVec()
+		local side = Vector3.new(-d.Z, 0, d.X) * sg
+		local C = cursor + side * R
+		for k = 1, n do
+			local th = k * math.pi / n
+			local top = C + (-side * math.cos(th) + d * math.sin(th)) * R + Vector3.new(0, rise * k, 0) -- (C is at the height of the platform you started from)
+			place(top, k == n and cpw or w, {checkpoint = k == n})
+		end
+		dirDeg = (dirDeg + 180) % 360
+	end
+
+	-- LANE 1 (heading +X): start pad, zigzag, stepping stones, a long jump
+	place(cursor, 18, {checkpoint = true})
+	step(6, 0, 13, 20); step(6, 0, 12, -40); step(6, 1, 12, 40); step(6, 0, 12, -40); step(6, 1, 12, 20)
+	step(7, 0, 10, 0); step(7, 1, 9, 0); step(7, 0, 10, 0); step(7, 1, 9, 0)
+	step(6, 0, 16, 0, {checkpoint = true})
+	step(8, 0, 12, 0)
+	step(6, 0, 14, 0, {checkpoint = true})
+	halfLoop(34, 6, 5, 11, 14, 1)
+	-- LANE 2 (heading -X): a climbing zigzag tower, narrow ledges, a long jump
+	step(6, 3, 10, 30); step(6, 3, 10, -60); step(6, 3, 10, 60); step(6, 3, 10, -30)
+	step(7, 0, 8, 0); step(7, 1, 8, 0); step(7, 1, 8, 0)
+	step(6, 0, 16, 0, {checkpoint = true})
+	step(8, 0, 11, 0); step(8, 1, 11, 0)
+	step(6, 0, 14, 0, {checkpoint = true})
+	halfLoop(34, 6, 5, 11, 14, -1)
+	-- LANE 3 (heading +X): the hardest one, then the ember platform that opens the arena
+	step(7, 2, 10, 35); step(7, 2, 10, -70); step(7, 2, 9, 70); step(7, 2, 9, -70); step(7, 2, 10, 35)
+	step(7, 2, 8, 0); step(7, 2, 8, 0); step(8, 0, 9, 0)
+	step(6, 0, 16, 0, {checkpoint = true})
+	step(8, 3, 32, 0, {stripe = EMBER})
+	local fin = cursor
+
+	-- the hall around it: lava floor, four basalt walls, a roof
+	local M = 60
+	local x0, x1, z0, z1 = minX - M, maxX + M, minZ - M, maxZ + M
+	local cx, cz, sx, sz = (x0 + x1) / 2, (z0 + z1) / 2, x1 - x0, z1 - z0
+	local LAVA_Y, ROOF_Y = base.Y - 50, maxY + 75
+	local WALL_B = LAVA_Y - 10
+	ctx.killY = LAVA_Y + 3
+	local function solid(size, center, color, mat, collide)
+		return new("Part", {Size = size, CFrame = CFrame.new(center), Color = color, Material = mat or Enum.Material.Basalt, Anchored = true,
+			CanCollide = collide ~= false, CanTouch = false, CanQuery = collide ~= false}, model)
+	end
+	local lava = solid(Vector3.new(sx, 1, sz), Vector3.new(cx, LAVA_Y - .5, cz), Color3.fromRGB(255, 80, 20), Enum.Material.Neon, false)
+	new("ParticleEmitter", {Rate = 40, Lifetime = NumberRange.new(2, 5), Speed = NumberRange.new(3, 10), SpreadAngle = Vector2.new(25, 25),
+		EmissionDirection = Enum.NormalId.Top, Size = NumberSequence.new(.8), LightEmission = 1, Color = ColorSequence.new(Color3.fromRGB(255, 170, 60))}, lava)
+	local WH = ROOF_Y - WALL_B
+	local WALL_COL = Color3.fromRGB(34, 26, 25)
+	solid(Vector3.new(6, WH, sz + 12), Vector3.new(x1 + 3, WALL_B + WH / 2, cz), WALL_COL)
+	solid(Vector3.new(6, WH, sz + 12), Vector3.new(x0 - 3, WALL_B + WH / 2, cz), WALL_COL)
+	solid(Vector3.new(sx + 12, WH, 6), Vector3.new(cx, WALL_B + WH / 2, z1 + 3), WALL_COL)
+	solid(Vector3.new(sx + 12, WH, 6), Vector3.new(cx, WALL_B + WH / 2, z0 - 3), WALL_COL)
+	solid(Vector3.new(sx + 12, 6, sz + 12), Vector3.new(cx, ROOF_Y + 3, cz), WALL_COL) -- the roof
+	-- glowing ember bands where the walls meet the lava and the roof
+	for _, y in ipairs({LAVA_Y + 1, ROOF_Y - .6}) do
+		solid(Vector3.new(.6, 1.2, sz), Vector3.new(x1 - .3, y, cz), EMBER, Enum.Material.Neon, false)
+		solid(Vector3.new(.6, 1.2, sz), Vector3.new(x0 + .3, y, cz), EMBER, Enum.Material.Neon, false)
+		solid(Vector3.new(sx, 1.2, .6), Vector3.new(cx, y, z1 - .3), EMBER, Enum.Material.Neon, false)
+		solid(Vector3.new(sx, 1.2, .6), Vector3.new(cx, y, z0 + .3), EMBER, Enum.Material.Neon, false)
+	end
+	for _ = 1, 26 do -- cracks of fire in the roof
+		local len = math.random(14, 46)
+		solid(math.random() < .5 and Vector3.new(len, .3, 2) or Vector3.new(2, .3, len),
+			Vector3.new(x0 + math.random() * sx, ROOF_Y - .2, z0 + math.random() * sz), EMBER, Enum.Material.Neon, false)
+	end
+	for _ = 1, 60 do -- stalactites hanging from the roof
+		local w, h = math.random(3, 8), math.random(10, 34)
+		solid(Vector3.new(w, h, w), Vector3.new(x0 + math.random() * sx, ROOF_Y - h / 2, z0 + math.random() * sz), ROCK, Enum.Material.Basalt, false)
+	end
+	for _ = 1, 24 do -- rock spires standing in the lava
+		local w, top = math.random(8, 20), LAVA_Y + math.random(2, 12)
+		solid(Vector3.new(w, top - (LAVA_Y - 20), w), Vector3.new(x0 + math.random() * sx, (top + LAVA_Y - 20) / 2, z0 + math.random() * sz), ROCK, Enum.Material.Basalt, false)
+	end
+
+	table.insert(frameFns, function(dt, root)
+		lava.Color = Color3.fromRGB(255, 70 + 40 * (.5 + .5 * math.sin(os.clock() * 1.3)), 20) -- the lava breathes
+		local p = root.Position
+		if p.Y < ctx.respawnCF.Position.Y - 70 then -- fell a long way: back to the last checkpoint at once
+			root.CFrame = ctx.respawnCF
+			root.AssemblyLinearVelocity = Vector3.zero
+		end
+		for _, cp in ipairs(checkpoints) do
+			if not cp.hit and math.abs(p.Y - (cp.top.Y + 3)) < 4 and Vector3.new(p.X - cp.top.X, 0, p.Z - cp.top.Z).Magnitude < cp.w / 2 + .5 then
+				cp.hit = true
+				ctx.respawnCF = cp.cf
+				toast("Checkpoint", 1.5)
+			end
+		end
+	end)
+	local fired = false
+	table.insert(frameFns, function(dt, root) -- reaching the ember platform opens the arena
+		if fired then return end
+		local p = root.Position
+		if math.abs(p.Y - (fin.Y + 3)) < 5 and Vector3.new(p.X - fin.X, 0, p.Z - fin.Z).Magnitude < 15 then
+			fired = true
+			toast("The stone gate opens...", 2.5)
+			ctx.toArena()
+		end
+	end)
+	local start = base + Vector3.new(-115, 3, -100)
+	ctx.respawnCF = CFrame.lookAt(start, start + Vector3.new(1, 0, 0))
+	return ctx.respawnCF
+end
+
+-- ===== TRIAL ARENAS (Part 3) =====
+-- One generic arena fight, configured per trial. Trial I uses K.TRIAL_ARENAS[1]; Trial II (Part 4) only needs a harder config + boss bar.
+K.TRIAL_ARENAS = {
+	[1] = {
+		maxHP = 100, healBetweenWaves = 40,
+		waves = {4, 6, 8},                                  -- curse orbs per wave
+		orbSpeed = 11, orbDmg = 8, orbHP = 1,
+		boss = {name = "THE GIANT CURSE ORB", speed = 8, rocks = 3, window = 14, hitsPerSection = 4, sections = 3,
+			spawnEvery = 5, maxMinions = 5, bar = false},    -- rocks = rock hits to stun it, window = seconds it stays stunned
+	},
+}
+-- which blessings Trial I may give (no drone, no missile, nothing too strong). nil = anything that is still available.
+K.TRIAL_REWARD_POOL = {[1] = {"speed", "jump", "magnet", "fortune", "mercy", "djump", "glide"}}
+
+-- the buff-selection menu: pick ONE blessing for free, then done() is called
+function V.Trials.openReward(poolIds, title, done)
+	local defs = {}
+	for _, d in ipairs(K.BLESSINGS) do
+		local inPool = true
+		if poolIds then inPool = table.find(poolIds, d.id) ~= nil end
+		if inPool and blessingAvailable(d) and (V.lv[d.key] == nil or V.lv[d.key] < (K.CAP[d.key] or 99)) then table.insert(defs, d) end
+	end
+	if #defs == 0 then toast("Nothing is left to choose from.", 3) done() return end
+	local overlay = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = .35, ZIndex = 50, Active = true}, V.gui)
+	new("TextLabel", {AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 70), Size = UDim2.fromOffset(340, 56), BackgroundTransparency = 1,
+		TextColor3 = Color3.fromRGB(255, 200, 120), Font = Enum.Font.GothamBold, TextSize = 22, TextWrapped = true, ZIndex = 51,
+		Text = title .. "\nChoose your reward"}, overlay)
+	local list = new("ScrollingFrame", {AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 140), Size = UDim2.new(0, 330, 1, -170),
+		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.new(0, 0, 0, #defs * 68), ZIndex = 51}, overlay)
+	local chosen = false
+	for i, d in ipairs(defs) do
+		local card = new("TextButton", {Position = UDim2.fromOffset(0, (i - 1) * 68), Size = UDim2.new(1, -8, 0, 60), BackgroundColor3 = Color3.fromRGB(40, 24, 24),
+			TextColor3 = Color3.fromRGB(255, 235, 220), Font = Enum.Font.GothamBold, TextSize = 15, TextWrapped = true, ZIndex = 52,
+			Text = d.name .. "\n" .. d.desc}, list)
+		corner(card, 10)
+		new("UIStroke", {Color = Color3.fromRGB(200, 70, 40), Thickness = 1.5}, card)
+		card.MouseButton1Click:Connect(function()
+			if chosen then return end
+			chosen = true
+			grant(d.key, d.greater)
+			if d.key == "glide" then V.glideEnergy = V.glideMax end
+			refresh()
+			sync()
+			overlay:Destroy()
+			toast("You received: " .. d.name, 4)
+			done()
+		end)
+	end
+end
+V.Trials.rewards[1] = function(done) V.Trials.openReward(K.TRIAL_REWARD_POOL[1], "TRIAL OF STONE CONQUERED", done) end
+
+function V.Trials.startFight(ctx, cfg)
+	local model = ctx.model
+	local lp = V.lp
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) then return end
+	local A = ctx.origin + Vector3.new(0, 0, 520) -- arena centre (the floor's top surface is at A.Y)
+	local FLOOR_R, WALL_R, WALL_H = 80, 86, 70
+	local EMBER, PURPLE, ROCKC = Color3.fromRGB(255, 90, 30), Color3.fromRGB(170, 60, 255), Color3.fromRGB(46, 36, 34)
+	local bc = cfg.boss
+
+	-- ---------- the arena ----------
+	local function solid(size, cf, color, mat, collide, shape)
+		return new("Part", {Size = size, CFrame = cf, Color = color, Material = mat or Enum.Material.Basalt, Anchored = true,
+			CanCollide = collide ~= false, CanTouch = false, Shape = shape or Enum.PartType.Block}, model)
+	end
+	local function cylY(diam, h, pos, color, mat, collide)
+		return solid(Vector3.new(h, diam, diam), CFrame.new(pos) * CFrame.Angles(0, 0, math.rad(90)), color, mat, collide, Enum.PartType.Cylinder)
+	end
+	cylY(FLOOR_R * 2 + 2, 3.6, A - Vector3.new(0, 2.2, 0), EMBER, Enum.Material.Neon)                 -- glowing rim
+	cylY(FLOOR_R * 2, 4, A - Vector3.new(0, 2, 0), Color3.fromRGB(58, 48, 46), Enum.Material.Slate)     -- the floor
+	cylY(44, .1, A + Vector3.new(0, .06, 0), EMBER, Enum.Material.Neon, false)                          -- ritual circle in the middle
+	cylY(41, .12, A + Vector3.new(0, .1, 0), Color3.fromRGB(40, 32, 30), Enum.Material.Slate, false)
+	for k = 0, 11 do
+		local a = k / 12 * math.pi * 2
+		solid(Vector3.new(.6, .1, 16), CFrame.new(A + Vector3.new(math.cos(a) * 14, .14, math.sin(a) * 14)) * CFrame.Angles(0, -a, 0), EMBER, Enum.Material.Neon, false)
+	end
+	for i = 0, 27 do -- the wall: 28 slabs facing the middle
+		local a = i / 28 * math.pi * 2
+		local pos = A + Vector3.new(math.cos(a) * WALL_R, WALL_H / 2 - 2, math.sin(a) * WALL_R)
+		solid(Vector3.new(2 * math.pi * WALL_R / 28 + 1.2, WALL_H, 6), CFrame.lookAt(pos, Vector3.new(A.X, pos.Y, A.Z)), Color3.fromRGB(34, 26, 25))
+		local band = A + Vector3.new(math.cos(a) * (WALL_R - 3.2), .6, math.sin(a) * (WALL_R - 3.2))
+		solid(Vector3.new(2 * math.pi * WALL_R / 28, 1.2, .5), CFrame.lookAt(band, Vector3.new(A.X, band.Y, A.Z)), EMBER, Enum.Material.Neon, false)
+	end
+	cylY(WALL_R * 2 + 16, 6, A + Vector3.new(0, WALL_H + 1, 0), Color3.fromRGB(34, 26, 25))              -- the roof
+	for _ = 1, 30 do
+		local w, h = math.random(3, 8), math.random(8, 28)
+		local a, r = math.random() * math.pi * 2, math.random() * (WALL_R - 8)
+		solid(Vector3.new(w, h, w), CFrame.new(A + Vector3.new(math.cos(a) * r, WALL_H - 2 - h / 2, math.sin(a) * r)), ROCKC, Enum.Material.Basalt, false)
+	end
+	for k = 0, 7 do -- fire bowls on stone stands around the arena
+		local a = k / 8 * math.pi * 2 + math.pi / 8
+		local pos = A + Vector3.new(math.cos(a) * 66, 0, math.sin(a) * 66)
+		solid(Vector3.new(5, 8, 5), CFrame.new(pos + Vector3.new(0, 4, 0)), Color3.fromRGB(70, 62, 58), Enum.Material.Slate)
+		local bowl = solid(Vector3.new(2, 7, 7), CFrame.new(pos + Vector3.new(0, 9, 0)) * CFrame.Angles(0, 0, math.rad(90)), Color3.fromRGB(50, 44, 42), Enum.Material.Slate, false, Enum.PartType.Cylinder)
+		new("Fire", {Size = 9, Heat = 10, Color = Color3.fromRGB(255, 70, 0), SecondaryColor = Color3.fromRGB(255, 170, 40)}, bowl)
+		new("PointLight", {Color = Color3.fromRGB(255, 110, 40), Range = 38, Brightness = 1.3, Shadows = false}, bowl)
+	end
+
+	-- ---------- player: health, sword ----------
+	local maxHP = cfg.maxHP
+	local hp, invuln = maxHP, 0
+	local gui = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 8, Active = false}, V.gui)
+	table.insert(ctx.cleanups, function() gui:Destroy() end)
+	local objective = new("TextLabel", {AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 100), Size = UDim2.fromOffset(380, 30), BackgroundColor3 = Color3.fromRGB(15, 8, 8),
+		BackgroundTransparency = .3, TextColor3 = Color3.fromRGB(255, 220, 190), Font = Enum.Font.GothamBold, TextSize = 14, TextWrapped = true, Text = "", ZIndex = 9}, gui)
+	corner(objective, 8)
+	local hpBack = new("Frame", {AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 136), Size = UDim2.fromOffset(300, 16), BackgroundColor3 = Color3.fromRGB(20, 10, 10), ZIndex = 9}, gui)
+	corner(hpBack, 6)
+	new("UIStroke", {Color = Color3.fromRGB(180, 60, 40), Thickness = 1.5}, hpBack)
+	local hpFill = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(210, 50, 40), ZIndex = 10}, hpBack)
+	corner(hpFill, 6)
+	local hurt = new("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(200, 0, 0), BackgroundTransparency = 1, ZIndex = 7}, gui)
+	local function setObjective(t) objective.Text = t end
+
+	local bossBarFill -- (only Trial II and later show the boss health bar)
+	local barFills = {}
+	if bc.bar then
+		local bar = new("Frame", {AnchorPoint = Vector2.new(.5, 0), Position = UDim2.new(.5, 0, 0, 160), Size = UDim2.fromOffset(420, 20), BackgroundColor3 = Color3.fromRGB(20, 8, 20), ZIndex = 9}, gui)
+		corner(bar, 6)
+		new("UIStroke", {Color = Color3.fromRGB(190, 80, 255), Thickness = 1.5}, bar)
+		for i = 1, bc.sections do
+			local seg = new("Frame", {Position = UDim2.new((i - 1) / bc.sections, 2, 0, 2), Size = UDim2.new(1 / bc.sections, -4, 1, -4), BackgroundColor3 = Color3.fromRGB(35, 14, 40), ZIndex = 10}, bar)
+			barFills[i] = new("Frame", {Size = UDim2.fromScale(0, 1), BackgroundColor3 = Color3.fromRGB(190, 80, 255), ZIndex = 11}, seg)
+		end
+		for i = 1, bc.sections - 1 do -- the lines that divide the bar into its three cycles
+			new("Frame", {Position = UDim2.new(i / bc.sections, -1, 0, 0), Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = Color3.fromRGB(255, 240, 255), ZIndex = 12}, bar)
+		end
+		bossBarFill = bar
+		bar.Visible = false
+	end
+
+	local function updateHP() hpFill.Size = UDim2.fromScale(math.clamp(hp / maxHP, 0, 1), 1) end
+	local function damagePlayer(n)
+		if invuln > 0 or hp <= 0 then return end
+		hp = math.max(0, hp - n)
+		invuln = .9
+		updateHP()
+		hurt.BackgroundTransparency = .55
+		TS:Create(hurt, TweenInfo.new(.5), {BackgroundTransparency = 1}):Play()
+	end
+
+	-- the sword: a real Tool in your backpack, swung by tapping/clicking
+	local tool = Instance.new("Tool")
+	tool.Name, tool.RequiresHandle, tool.CanBeDropped = "Demon Blade", true, false
+	tool.GripForward, tool.GripPos, tool.GripRight, tool.GripUp = Vector3.new(-1, 0, 0), Vector3.new(0, 0, -1.5), Vector3.new(0, 1, 0), Vector3.new(0, 0, 1)
+	local handle = new("Part", {Name = "Handle", Size = Vector3.new(1, .8, 4), Color = Color3.fromRGB(190, 40, 30), Material = Enum.Material.Neon, CanCollide = false, Massless = true}, tool)
+	local guard = new("Part", {Size = Vector3.new(3, .5, .6), Color = Color3.fromRGB(25, 20, 20), Material = Enum.Material.Slate, CanCollide = false, Massless = true}, tool)
+	new("Weld", {Part0 = handle, Part1 = guard, C0 = CFrame.new(0, 0, 1.4)}, guard)
+	table.insert(ctx.cleanups, function() tool:Destroy() end)
+	local backpack = lp:FindFirstChildOfClass("Backpack")
+	if backpack then tool.Parent = backpack end
+	task.delay(.3, function() if tool.Parent and hum.Parent then pcall(function() hum:EquipTool(tool) end) end end)
+
+	-- ---------- enemies, rocks ----------
+	local orbs, rocks, shots = {}, {}, {}
+	local held
+	local boss
+	local state, wave, queue, spawnT = "intro", 0, 0, 0
+	local nextAt, nextFn = os.clock() + 2.5, function() end
+	local resetting = false
+
+	local function burst(pos, color, size)
+		local b = new("Part", {Shape = Enum.PartType.Ball, Size = Vector3.new(size, size, size) * .4, Position = pos, Color = color, Material = Enum.Material.Neon,
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, Transparency = .1}, model)
+		TS:Create(b, TweenInfo.new(.4), {Size = Vector3.new(size, size, size), Transparency = 1}):Play()
+		Debris:AddItem(b, .5)
+	end
+	local function spawnOrb(pos)
+		local part = new("Part", {Shape = Enum.PartType.Ball, Size = Vector3.new(3.4, 3.4, 3.4), Position = pos, Color = Color3.fromRGB(150, 60, 230), Material = Enum.Material.Neon,
+			Anchored = true, CanCollide = false, CanTouch = false}, model)
+		new("PointLight", {Color = Color3.fromRGB(170, 80, 255), Range = 14, Brightness = 1.2, Shadows = false}, part)
+		table.insert(orbs, {part = part, pos = pos, hp = cfg.orbHP, cd = 0, spd = cfg.orbSpeed * (.85 + math.random() * .3), ph = math.random() * 6.28})
+	end
+	local function killOrb(o)
+		burst(o.pos, Color3.fromRGB(190, 110, 255), 9)
+		o.part:Destroy()
+		local i = table.find(orbs, o)
+		if i then table.remove(orbs, i) end
+	end
+	local function clearOrbs() for i = #orbs, 1, -1 do orbs[i].part:Destroy() orbs[i] = nil end end
+
+	local function newRock()
+		local a, r = math.random() * math.pi * 2, 10 + math.random() * 58
+		local sz = 2.4 + math.random()
+		local rk = new("Part", {Size = Vector3.new(sz, sz * .85, sz * 1.1), CFrame = CFrame.new(A + Vector3.new(math.cos(a) * r, sz * .45, math.sin(a) * r))
+			* CFrame.Angles(math.random() * 3, math.random() * 3, math.random() * 3), Color = Color3.fromRGB(96, 88, 84), Material = Enum.Material.Slate,
+			Anchored = true, CanCollide = false, CanTouch = false}, model)
+		table.insert(rocks, rk)
+	end
+	for _ = 1, 12 do newRock() end
+	local rockT = 0
+
+	local throwBtn = new("TextButton", {AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -24, 1, -200), Size = UDim2.fromOffset(92, 92), BackgroundColor3 = Color3.fromRGB(60, 36, 30),
+		TextColor3 = Color3.fromRGB(255, 230, 200), Font = Enum.Font.GothamBold, TextSize = 14, Text = "THROW\nROCK (F)", Visible = false, ZIndex = 20}, gui)
+	corner(throwBtn, 46)
+	new("UIStroke", {Color = Color3.fromRGB(255, 140, 60), Thickness = 2}, throwBtn)
+
+	-- ---------- the giant curse orb ----------
+	local bossCore, bossShell, bossLight, bossTag
+	local function bossLook(stunned)
+		if not boss then return end
+		bossCore.Color = stunned and Color3.fromRGB(50, 28, 70) or PURPLE
+		bossCore.Material = stunned and Enum.Material.SmoothPlastic or Enum.Material.Neon
+		bossShell.Transparency = stunned and 1 or .72
+		bossLight.Enabled = not stunned
+		bossTag.Enabled = stunned
+	end
+	local function updateBossBar()
+		if not bossBarFill then return end
+		for i = 1, bc.sections do
+			local filled = math.clamp(boss.hitsDone - (i - 1) * bc.hitsPerSection, 0, bc.hitsPerSection) / bc.hitsPerSection
+			barFills[i].Size = UDim2.fromScale(filled, 1)
+		end
+	end
+	local function spawnBoss()
+		local pos = A + Vector3.new(0, 45, 0)
+		bossCore = new("Part", {Shape = Enum.PartType.Ball, Size = Vector3.new(14, 14, 14), Position = pos, Color = PURPLE, Material = Enum.Material.Neon,
+			Anchored = true, CanCollide = false, CanTouch = false}, model)
+		bossShell = new("Part", {Shape = Enum.PartType.Ball, Size = Vector3.new(17.5, 17.5, 17.5), Position = pos, Color = Color3.fromRGB(210, 150, 255), Material = Enum.Material.Neon,
+			Transparency = .72, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false}, model)
+		bossLight = new("PointLight", {Color = PURPLE, Range = 55, Brightness = 2.5, Shadows = false}, bossCore)
+		local bb = new("BillboardGui", {Size = UDim2.fromOffset(200, 50), StudsOffset = Vector3.new(0, 11, 0), AlwaysOnTop = true, Enabled = false, Adornee = bossCore}, bossCore)
+		bossTag = bb
+		new("TextLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "STUNNED", TextColor3 = Color3.fromRGB(255, 240, 160), Font = Enum.Font.GothamBold, TextScaled = true}, bb)
+		boss = {pos = pos, vel = Vector3.zero, r = 7, rocksHit = 0, hitsDone = 0, stunned = false, stunT = 0, spawnT = 4, ang = -math.pi / 2, t = 0, arrived = false}
+		if bossBarFill then bossBarFill.Visible = true end
+		updateBossBar()
+	end
+
+	local function stunBoss()
+		boss.stunned, boss.stunT, boss.rocksHit = true, bc.window, 0
+		bossLook(true)
+		burst(boss.pos, Color3.fromRGB(255, 255, 255), 26)
+		setObjective("STUNNED! Strike it with your sword!")
+	end
+	local function recoverBoss()
+		boss.stunned, boss.rocksHit = false, 0
+		bossLook(false)
+		burst(boss.pos, PURPLE, 30)
+		setObjective(bc.name .. " - throw rocks at it (0/" .. bc.rocks .. ")")
+	end
+	local function victory()
+		state = "victory"
+		clearOrbs()
+		burst(boss.pos, Color3.fromRGB(255, 255, 255), 60)
+		burst(boss.pos, PURPLE, 90)
+		bossCore:Destroy() bossShell:Destroy()
+		boss = nil
+		if bossBarFill then bossBarFill.Visible = false end
+		setObjective("The giant curse orb is destroyed.")
+		toast("The giant curse orb shatters!", 4)
+		nextAt, nextFn = os.clock() + 3, function() ctx.complete() end
+	end
+
+	-- ---------- rocks: pick up (walk over), throw (button or F) ----------
+	local function throwRock()
+		if not held or not boss then return end
+		local rp = root.Position + Vector3.new(0, 2, 0)
+		local look = workspace.CurrentCamera.CFrame.LookVector
+		local dir = look
+		if not boss.stunned then
+			local dist = (boss.pos - rp).Magnitude
+			local t = dist / 95
+			local aim = boss.pos + boss.vel * t + Vector3.new(0, 22.5 * t * t, 0) -- lead the target and allow for gravity
+			local to = (aim - rp).Unit
+			if look:Dot(to) > .8 then dir = look:Lerp(to, .8).Unit end -- gentle aim assist when you are roughly facing it
+		end
+		held.CFrame = CFrame.new(rp + look * 3)
+		table.insert(shots, {part = held, vel = dir * 95, life = 0})
+		held = nil
+		throwBtn.Visible = false
+	end
+	throwBtn.MouseButton1Click:Connect(throwRock)
+	local inputConn = UIS.InputBegan:Connect(function(input, gp)
+		if not gp and input.KeyCode == Enum.KeyCode.F then throwRock() end
+	end)
+	table.insert(ctx.cleanups, function() inputConn:Disconnect() end)
+
+	-- ---------- sword swings ----------
+	local lastSwing = 0
+	local function swordHit()
+		local rp = root.Position
+		local look = root.CFrame.LookVector
+		for i = #orbs, 1, -1 do
+			local o = orbs[i]
+			local v = o.pos - rp
+			if v.Magnitude < 10.5 and (v.Magnitude < 4.5 or v.Unit:Dot(look) > .1) then
+				o.hp -= 1
+				if o.hp <= 0 then killOrb(o) else burst(o.pos, Color3.new(1, 1, 1), 6) end
+			end
+		end
+		if boss and boss.stunned and (boss.pos - rp).Magnitude < boss.r + 9 then
+			boss.hitsDone += 1
+			burst(boss.pos + (rp - boss.pos).Unit * boss.r, Color3.fromRGB(255, 240, 160), 10)
+			updateBossBar()
+			if boss.hitsDone % bc.hitsPerSection == 0 then -- one more of its cycles is finished
+				local done = boss.hitsDone // bc.hitsPerSection
+				toast("Cycle " .. done .. "/" .. bc.sections .. " complete", 2.5)
+				if done >= bc.sections then victory() else recoverBoss() end
+			end
+		end
+	end
+	tool.Activated:Connect(function()
+		local now = os.clock()
+		if now - lastSwing < .42 or resetting then return end
+		lastSwing = now
+		task.spawn(function()
+			local g0 = tool.Grip
+			for i = 1, 5 do tool.Grip = g0 * CFrame.Angles(math.rad(-24 * i), 0, 0) task.wait(.02) end
+			local slash = new("Part", {Shape = Enum.PartType.Cylinder, Size = Vector3.new(.2, 8, 8), CFrame = root.CFrame * CFrame.new(0, .5, -5) * CFrame.Angles(0, math.rad(90), 0),
+				Color = Color3.fromRGB(255, 120, 80), Material = Enum.Material.Neon, Transparency = .35, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false}, model)
+			TS:Create(slash, TweenInfo.new(.25), {Size = Vector3.new(.2, 13, 13), Transparency = 1}):Play()
+			Debris:AddItem(slash, .3)
+			swordHit()
+			for i = 5, 0, -1 do tool.Grip = g0 * CFrame.Angles(math.rad(-24 * i), 0, 0) task.wait(.02) end
+			tool.Grip = g0
+		end)
+	end)
+
+	-- ---------- start of a stage ----------
+	local function startWave(n)
+		wave, state = n, "waves"
+		queue, spawnT = cfg.waves[n], 0
+		setObjective("WAVE " .. n .. "/" .. #cfg.waves .. " - slay the curse orbs with your sword")
+	end
+	local function startBoss()
+		state = "bossIntro"
+		spawnBoss()
+		setObjective(bc.name)
+		toast(bc.name .. " awakens!", 3.5)
+	end
+	local function doReset() -- you were overwhelmed: the current stage starts again
+		clearOrbs()
+		held = nil
+		throwBtn.Visible = false
+		hp, invuln = maxHP, 1.5
+		updateHP()
+		root.CFrame = CFrame.lookAt(A + Vector3.new(0, 4, -60), A + Vector3.new(0, 4, 0))
+		root.AssemblyLinearVelocity = Vector3.zero
+		if state == "waves" then startWave(wave)
+		elseif boss then recoverBoss() end
+		resetting = false
+	end
+
+	-- ---------- teleport in, then run ----------
+	root.CFrame = CFrame.lookAt(A + Vector3.new(0, 4, -60), A + Vector3.new(0, 4, 0))
+	root.AssemblyLinearVelocity = Vector3.zero
+	updateHP()
+	setObjective("Arena - prepare yourself")
+	toast("Slay the curse orbs. Walk over a rock to pick it up.", 5)
+
+	table.insert(ctx.frameFns, function(dt, rt)
+		local now = os.clock()
+		if invuln > 0 then invuln -= dt end
+		if hp <= 0 and not resetting then
+			resetting = true
+			toast("Overwhelmed! The stage begins again...", 2.5)
+			task.delay(1.6, function() if V.Trials.active == ctx then doReset() end end)
+		end
+		if resetting then return end
+		local rp = rt.Position
+		if rp.Y < A.Y - 30 then rt.CFrame = CFrame.new(A + Vector3.new(0, 4, -40)) rt.AssemblyLinearVelocity = Vector3.zero end
+
+		if nextFn and now >= nextAt then local f = nextFn nextFn = nil f() end
+
+		-- rocks: pick up, hold, fly
+		if not held and boss then
+			for i = #rocks, 1, -1 do
+				local rk = rocks[i]
+				if (rk.Position - rp).Magnitude < 5.5 then
+					held = rk
+					table.remove(rocks, i)
+					throwBtn.Visible = true
+					break
+				end
+			end
+		end
+		if held then held.CFrame = rt.CFrame * CFrame.new(0, 3.6, -.6) * CFrame.Angles(now * 2, now * 1.3, 0) end
+		rockT += dt
+		if rockT > 3 and #rocks < 10 then rockT = 0 newRock() end
+		for i = #shots, 1, -1 do
+			local sh = shots[i]
+			sh.life += dt
+			sh.vel += Vector3.new(0, -45, 0) * dt
+			sh.part.Position += sh.vel * dt
+			sh.part.CFrame = CFrame.new(sh.part.Position) * (sh.part.CFrame - sh.part.CFrame.Position) * CFrame.Angles(dt * 6, dt * 4, 0)
+			local gone = false
+			if boss and not boss.stunned and (sh.part.Position - boss.pos).Magnitude < boss.r + 1.5 then
+				gone = true
+				boss.rocksHit += 1
+				burst(sh.part.Position, Color3.new(1, 1, 1), 12)
+				if boss.rocksHit >= bc.rocks then stunBoss()
+				else setObjective(bc.name .. " - rock hit " .. boss.rocksHit .. "/" .. bc.rocks) end
+			elseif sh.part.Position.Y < A.Y + .6 or sh.life > 5 then
+				gone = true
+			end
+			if gone then
+				sh.part:Destroy()
+				table.remove(shots, i)
+			end
+		end
+
+		-- the small curse orbs
+		local tt = now
+		for _, o in ipairs(orbs) do
+			local goal = Vector3.new(rp.X, A.Y + 4 + math.sin(tt * 3 + o.ph) * .8, rp.Z)
+			local to = goal - o.pos
+			local flat = Vector3.new(to.X, 0, to.Z)
+			local dirv = flat.Magnitude > .1 and flat.Unit or Vector3.zero
+			local perp = Vector3.new(-dirv.Z, 0, dirv.X)
+			if o.cd > 0 then o.cd -= dt dirv = -dirv end -- after a hit it backs off for a moment
+			local move = (dirv + perp * math.sin(tt * 2 + o.ph) * .6) * o.spd * dt
+			o.pos = Vector3.new(o.pos.X + move.X, o.pos.Y + (goal.Y - o.pos.Y) * math.min(1, dt * 4), o.pos.Z + move.Z)
+			o.part.Position = o.pos
+			if o.cd <= 0 and (o.pos - rp).Magnitude < 4.6 then
+				damagePlayer(cfg.orbDmg)
+				o.cd = 1.2
+			end
+		end
+
+		-- stage logic
+		if state == "intro" and nextFn == nil and wave == 0 then
+			startWave(1)
+		elseif state == "waves" then
+			if queue > 0 then
+				spawnT -= dt
+				if spawnT <= 0 then
+					local a = math.random() * math.pi * 2
+					spawnOrb(A + Vector3.new(math.cos(a) * 70, 4, math.sin(a) * 70))
+					queue -= 1
+					spawnT = .7
+				end
+			elseif #orbs == 0 then
+				hp = math.min(maxHP, hp + cfg.healBetweenWaves)
+				updateHP()
+				if wave < #cfg.waves then
+					toast("Wave " .. wave .. " cleared", 2.5)
+					state = "between"
+					nextAt, nextFn = now + 3, function() startWave(wave + 1) end
+				else
+					state = "between"
+					nextAt, nextFn = now + 3, startBoss
+				end
+			end
+		elseif state == "bossIntro" and boss then
+			local target = A + Vector3.new(0, 15, 30)
+			boss.pos = boss.pos:Lerp(target, math.min(1, dt * 1.6))
+			bossCore.Position, bossShell.Position = boss.pos, boss.pos
+			if (boss.pos - target).Magnitude < 2 then
+				state = "boss"
+				recoverBoss()
+			end
+		elseif state == "boss" and boss then
+			boss.t += dt
+			local last = boss.pos
+			if boss.stunned then
+				local rest = Vector3.new(boss.pos.X, A.Y + boss.r, boss.pos.Z)
+				boss.pos = boss.pos:Lerp(rest, math.min(1, dt * 3)) -- it sinks to the floor
+				boss.stunT -= dt
+				setObjective("STUNNED! Strike it! " .. math.max(0, math.ceil(boss.stunT)) .. "s  (" .. (boss.hitsDone % bc.hitsPerSection) .. "/" .. bc.hitsPerSection .. ")")
+				if boss.stunT <= 0 then
+					toast("It recovers!", 2)
+					recoverBoss()
+				end
+			else
+				boss.ang += (bc.speed / 30) * dt
+				local target = A + Vector3.new(math.cos(boss.ang) * 30, 15 + math.sin(boss.t * 1.3) * 1.5, math.sin(boss.ang) * 30)
+				boss.pos = boss.pos:Lerp(target, math.min(1, dt * 3))
+				boss.spawnT -= dt
+				if boss.spawnT <= 0 and #orbs < bc.maxMinions then
+					spawnOrb(boss.pos - Vector3.new(0, 3, 0))
+					boss.spawnT = bc.spawnEvery
+				end
+			end
+			boss.vel = (boss.pos - last) / math.max(dt, 1e-3)
+			bossCore.Position, bossShell.Position = boss.pos, boss.pos
+		end
+	end)
+end
+
+V.Trials.arenas[1] = function(ctx)
+	table.clear(ctx.frameFns) -- the obby is over: its checkpoint and finish checks stop here
+	ctx.killY = -1e9
+	task.spawn(function()
+		flashTo(0, .3)
+		task.wait(.4)
+		if V.Trials.active ~= ctx then return end
+		V.Trials.startFight(ctx, K.TRIAL_ARENAS[1])
+		flashTo(1, .7)
+	end)
+end
+
+-- the placeholder trial used until a real builder is written for it
+	local function placeholder(ctx)
+		local o = ctx.origin
+		local function blk(size, pos, color, mat, collide)
+			return new("Part", {Size = size, CFrame = CFrame.new(pos), Color = color, Material = mat or Enum.Material.Slate,
+				Anchored = true, CanCollide = collide ~= false, CanTouch = false}, ctx.model)
+		end
+		blk(Vector3.new(70, 2, 40), o + Vector3.new(0, -1, 0), Color3.fromRGB(70, 66, 64))
+		local gold = blk(Vector3.new(7, .4, 7), o + Vector3.new(22, .2, 0), Color3.fromRGB(255, 210, 90), Enum.Material.Neon, false)
+		local red = blk(Vector3.new(7, .4, 7), o + Vector3.new(-22, .2, 0), Color3.fromRGB(220, 50, 40), Enum.Material.Neon, false)
+		local sign = blk(Vector3.new(1, 1, 1), o + Vector3.new(0, 9, 0), Color3.new(1, 1, 1), Enum.Material.SmoothPlastic, false)
+		sign.Transparency = 1
+		local bb = new("BillboardGui", {Size = UDim2.fromOffset(360, 90), AlwaysOnTop = true, Adornee = sign}, sign)
+		new("TextLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(255, 200, 160), Font = Enum.Font.GothamBold,
+			TextSize = 16, TextWrapped = true, Text = ctx.T.name .. "\n(placeholder: this trial is built in a later part)\nGOLD pad = finish it    RED pad = leave"}, bb)
+		table.insert(ctx.frameFns, function(dt, root)
+			local p = root.Position
+			if math.abs(p.Y - o.Y) < 8 then
+				if (Vector2.new(p.X, p.Z) - Vector2.new(gold.Position.X, gold.Position.Z)).Magnitude < 4.5 then ctx.complete() return end
+				if (Vector2.new(p.X, p.Z) - Vector2.new(red.Position.X, red.Position.Z)).Magnitude < 4.5 then ctx.leave() return end
+			end
+		end)
+		local cf = CFrame.lookAt(o + Vector3.new(0, 3, 0), o + Vector3.new(1, 3, 0))
+		ctx.respawnCF = cf
+		return cf
+	end
+
+	function V.Trials.enter(n, force)
+		local T = K.TRIALS[n]
+		if not T or V.Trials.entering then return end
+		if V.Trials.active then toast("You are already inside a trial.", 2.5) return end
+		if not force and n > 1 and not V.Trials.done[n - 1] then
+			toast("The gate is sealed. Finish the " .. K.TRIALS[n - 1].name .. " first.", 3.5)
+			return
+		end
+		local char = V.lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not (hum and root) or hum.Health <= 0 then return end
+		if busy or missileBusy or gliding or pilotingDrone or mountedDrone or V.inMaze or V.punishing or V.ritual.active then
+			toast("Finish what you are doing first.", 2.5)
+			return
+		end
+		V.Trials.entering = true
+		flashTo(0, .4)
+		task.wait(.5)
+		if hum.Health <= 0 then V.Trials.entering = false flashTo(1, .5) return end
+
+		local origin = Vector3.new(0, K.TRIAL_BASE_Y + (n - 1) * K.TRIAL_STEP_Y, 0)
+		local model = Instance.new("Model")
+		model.Name = "DemonTrial" .. n
+		model.Parent = workspace
+		local ctx = {n = n, T = T, origin = origin, model = model, frameFns = {}, cleanups = {}, killY = origin.Y - 120}
+		ctx.complete = function() V.Trials.complete(n) end
+		-- an obby hands off to its arena here. Arenas are optional: V.Trials.arenas[n] = function(ctx) ... end
+		ctx.toArena = function() local a = V.Trials.arenas[n] if a then a(ctx) else V.Trials.complete(n) end end
+		ctx.leave = function() V.Trials.leave(true) end
+		local ok, spawnCF = pcall(V.Trials.builders[n] or placeholder, ctx)
+		if not ok or typeof(spawnCF) ~= "CFrame" then
+			warn("[DemonSummon] trial " .. n .. " failed to build: " .. tostring(spawnCF))
+			for _, f in ipairs(ctx.cleanups) do pcall(f) end
+			model:Destroy()
+			V.Trials.entering = false
+			flashTo(1, .5)
+			toast("The gate would not open.", 3)
+			return
+		end
+		ctx.respawnCF = ctx.respawnCF or spawnCF
+		V.Trials.active, V.Trials.entering = ctx, false
+		V.inTrial, busy = n, true
+		sync()
+		root.CFrame = spawnCF
+		root.AssemblyLinearVelocity = Vector3.zero
+		applyBuffs()
+		V.Env.hell(1)
+		hum.Died:Connect(function() if V.Trials.active == ctx then V.Trials.leave(false) end end)
+		ctx.conn = RS.Heartbeat:Connect(function(dt)
+			if V.Trials.active ~= ctx then return end
+			if hum.Health <= 0 or not root.Parent then V.Trials.leave(false) return end
+			if root.Position.Y < ctx.killY then -- fell off: back to the last respawn point
+				root.CFrame = ctx.respawnCF
+				root.AssemblyLinearVelocity = Vector3.zero
+			end
+			for _, f in ipairs(ctx.frameFns) do
+				f(dt, root)
+				if V.Trials.active ~= ctx then return end
+			end
+		end)
+		flashTo(1, 1)
+		toast(T.name, 3.5)
+	end
+
+	-- ===== the stone shrine =====
+	local function findGround(rootPos)
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = {V.lp.Character, V.coinFolder, V.orbFolder}
+		params.IgnoreWater = true
+		local offs = {Vector3.new(24, 0, 0), Vector3.new(-24, 0, 0), Vector3.new(0, 0, 24), Vector3.new(0, 0, -24)}
+		for _ = 1, 60 do -- looks for a flat spot
+			local a, d = math.random() * math.pi * 2, math.random(K.SHRINE_MIN, K.SHRINE_MAX)
+			local p = rootPos + Vector3.new(math.cos(a) * d, 0, math.sin(a) * d)
+			local hit = workspace:Raycast(p + Vector3.new(0, 120, 0), Vector3.new(0, -400, 0), params)
+			if hit and hit.Normal.Y > .93 then
+				local ok = true
+				for _, o in ipairs(offs) do
+					local h2 = workspace:Raycast(p + o + Vector3.new(0, 120, 0), Vector3.new(0, -400, 0), params)
+					if not h2 or math.abs(h2.Position.Y - hit.Position.Y) > 5 then ok = false break end
+				end
+				if ok then return hit.Position, false end
+			end
+		end
+		return rootPos + Vector3.new(70, -3.2, 0), true -- nothing flat found: it rises on a stone pedestal instead
+	end
+
+	local function buildShrine(groundPos, pedestal)
+		local model = Instance.new("Model")
+		model.Name = "DemonShrine"
+		model.Parent = workspace
+		sCF = CFrame.new(groundPos) * CFrame.Angles(0, math.rad(math.random(0, 359)), 0)
+		local STONE, DARK, BONE = Color3.fromRGB(98, 92, 88), Color3.fromRGB(50, 46, 45), Color3.fromRGB(206, 199, 184)
+		local EMBER = Color3.fromRGB(190, 55, 25)
+		local function put(size, lcf, color, mat, collide, shape)
+			return new("Part", {Size = size, CFrame = sCF * lcf, Color = color, Material = mat or Enum.Material.Slate, Anchored = true,
+				CanCollide = collide ~= false, CanTouch = false, Shape = shape or Enum.PartType.Block}, model)
+		end
+		local function disc(y, h, diam, color, mat, collide)
+			return put(Vector3.new(h, diam, diam), CFrame.new(0, y, 0) * CFrame.Angles(0, 0, math.rad(90)), color, mat, collide, Enum.PartType.Cylinder)
+		end
+		local NEON, BALL = Enum.Material.Neon, Enum.PartType.Ball
+		local TOP = SHRINE_TOP
+		local runes, stars, spin = {}, {}, {}
+		if pedestal then disc(-34, 68, 72, DARK) end
+
+		-- four stone terraces; each one has a glowing ember rim
+		disc(.1, 2.4, 66, DARK)                                  -- top 1.3
+		for _, t in ipairs({{1.9, 1.2, 54}, {3.05, 1.1, 42}, {4.15, 1.1, 30}}) do -- tops 2.5, 3.6, 4.7
+			disc(t[1] - .15, t[2] - .3, t[3], EMBER, NEON)
+			disc(t[1], t[2], t[3] - 1.2, STONE)
+		end
+
+		-- the centre: glowing ring, dark plate and a five-pointed sigil. Stand here.
+		local ring = disc(TOP + .08, .16, 12, RUNE, NEON, false)
+		disc(TOP + .12, .16, 10.4, Color3.fromRGB(38, 32, 32), Enum.Material.Slate, false)
+		new("PointLight", {Color = RUNE, Range = 30, Brightness = 1.2, Shadows = false}, ring)
+		local verts = {}
+		for i = 0, 4 do
+			local a = -math.pi / 2 + i * math.pi * 2 / 5
+			verts[i] = Vector3.new(math.cos(a) * 4.4, 0, math.sin(a) * 4.4)
+		end
+		for i = 0, 4 do
+			local a, b = verts[i], verts[(i + 2) % 5]
+			local d, mid = b - a, (a + b) / 2
+			table.insert(stars, put(Vector3.new(d.Magnitude, .06, .22), CFrame.new(mid.X, TOP + .24, mid.Z) * CFrame.Angles(0, math.atan2(-d.Z, d.X), 0), RUNE, NEON, false))
+		end
+		for k = 0, 23 do -- two circles of carved glyphs around the sigil
+			local a = k / 24 * math.pi * 2
+			table.insert(runes, put(Vector3.new(.45, .06, k % 2 == 0 and 1.3 or .7), CFrame.new(math.cos(a) * 7.4, TOP + .04, math.sin(a) * 7.4) * CFrame.Angles(0, -a, 0), RUNE, NEON, false))
+		end
+		for k = 0, 35 do
+			local a = k / 36 * math.pi * 2
+			table.insert(runes, put(Vector3.new(.4, .06, .6), CFrame.new(math.cos(a) * 13.2, TOP + .04, math.sin(a) * 13.2) * CFrame.Angles(0, -a, 0), RUNE, NEON, false))
+		end
+
+		-- eight tall ancient pillars (two of them broken) with glowing runes, horned caps and flames
+		local PT, tops = 3.6, {}
+		for k = 1, 8 do
+			local a = (k - 1) * math.pi / 4 + math.pi / 8
+			local broken = k == 3 or k == 8
+			local pf = CFrame.new(math.cos(a) * 17.5, 0, math.sin(a) * 17.5) * CFrame.Angles(0, -a, 0)
+			put(Vector3.new(6, 2, 6), pf * CFrame.new(0, PT + 1, 0), DARK)
+			put(Vector3.new(4.4, 9, 4.4), pf * CFrame.new(0, PT + 6.5, 0), STONE)
+			put(Vector3.new(4.9, .9, 4.9), pf * CFrame.new(0, PT + 11.45, 0), DARK)
+			table.insert(runes, put(Vector3.new(.2, 6, .6), pf * CFrame.new(-2.3, PT + 6.5, 0), RUNE, NEON, false))
+			if broken then
+				put(Vector3.new(4.2, 3.4, 4.2), pf * CFrame.new(0, PT + 13.6, 0) * CFrame.Angles(0, .4, .12), STONE) -- jagged stump
+				put(Vector3.new(3.2, 2.2, 5), pf * CFrame.new(3.6, PT + 1.1, 2.2) * CFrame.Angles(.1, .6, .2), STONE) -- fallen pieces
+				put(Vector3.new(2.2, 1.6, 2.2), pf * CFrame.new(5.4, PT + .8, -1.6) * CFrame.Angles(.3, .9, 0), DARK)
+			else
+				put(Vector3.new(3.4, 9, 3.4), pf * CFrame.new(0, PT + 16.4, 0), STONE)
+				table.insert(runes, put(Vector3.new(.2, 6, .5), pf * CFrame.new(-1.8, PT + 16.4, 0), RUNE, NEON, false))
+				put(Vector3.new(5.4, 1.6, 5.4), pf * CFrame.new(0, PT + 21.7, 0), DARK)
+				for _, sx in ipairs({-1, 1}) do
+					put(Vector3.new(.9, 3.8, .9), pf * CFrame.new(0, PT + 24.2, sx * 2.1) * CFrame.Angles(sx * .35, 0, 0), DARK)
+				end
+				local flame = put(Vector3.new(1.8, 1.8, 1.8), pf * CFrame.new(0, PT + 24.2, 0), RUNE, NEON, false, BALL)
+				if k % 2 == 1 then new("PointLight", {Color = RUNE, Range = 20, Brightness = .9, Shadows = false}, flame) end
+				tops[k] = pf.Position + Vector3.new(0, PT + 22.5, 0)
+			end
+		end
+		for _, pr in ipairs({{1, 2}, {4, 5}, {6, 7}}) do -- heavy lintels over the pairs that are still standing
+			local a, b = tops[pr[1]], tops[pr[2]]
+			if a and b then
+				local mid, d = (a + b) / 2 + Vector3.new(0, .8, 0), b - a
+				local dir = Vector3.new(d.X, 0, d.Z)
+				put(Vector3.new(3, 1.6, dir.Magnitude + 2.5), CFrame.lookAt(mid, mid + dir), STONE)
+				table.insert(runes, put(Vector3.new(.3, .15, dir.Magnitude), CFrame.lookAt(mid - Vector3.new(0, .85, 0), mid - Vector3.new(0, .85, 0) + dir), RUNE, NEON, false))
+			end
+		end
+
+		-- six fire bowls
+		for k = 0, 5 do
+			local a = math.rad(30 + k * 60)
+			local x, z = math.cos(a) * 10.2, math.sin(a) * 10.2
+			put(Vector3.new(2.6, 2.6, 2.6), CFrame.new(x, TOP + 1.3, z), DARK)
+			local bowl = put(Vector3.new(1.2, 4.2, 4.2), CFrame.new(x, TOP + 3.2, z) * CFrame.Angles(0, 0, math.rad(90)), STONE, nil, false, Enum.PartType.Cylinder)
+			new("Fire", {Size = 6, Heat = 9, Color = Color3.fromRGB(255, 70, 0), SecondaryColor = Color3.fromRGB(255, 170, 40)}, bowl)
+			new("PointLight", {Color = Color3.fromRGB(255, 110, 40), Range = 18, Brightness = 1, Shadows = false}, bowl)
+		end
+
+		-- eight horned skulls on stakes around the outer terrace, red eyes
+		for k = 0, 7 do
+			local a = k * math.pi / 4
+			local at = Vector3.new(math.cos(a) * 24.5, 0, math.sin(a) * 24.5)
+			local sf = CFrame.lookAt(at, at + Vector3.new(math.cos(a), 0, math.sin(a)))
+			put(Vector3.new(.9, 3.4, .9), sf * CFrame.new(0, 2.5 + 1.7, 0), DARK)
+			put(Vector3.new(2.2, 2.1, 2.3), sf * CFrame.new(0, 2.5 + 4.4, 0), BONE, Enum.Material.Marble, nil, BALL)
+			put(Vector3.new(1.4, .7, 1.5), sf * CFrame.new(0, 2.5 + 3.3, -.5), BONE, Enum.Material.Marble)
+			for _, sx in ipairs({-1, 1}) do
+				put(Vector3.new(.7, .7, .7), sf * CFrame.new(sx * .55, 2.5 + 4.6, -.9), Color3.new(0, 0, 0), Enum.Material.SmoothPlastic, false, BALL)
+				table.insert(runes, put(Vector3.new(.3, .3, .3), sf * CFrame.new(sx * .55, 2.5 + 4.6, -1.05), RUNE, NEON, false, BALL))
+				put(Vector3.new(.5, 2.4, .5), sf * CFrame.new(sx * .95, 2.5 + 5.7, .1) * CFrame.Angles(0, 0, -sx * .45), BONE, Enum.Material.Marble)
+			end
+		end
+
+		-- the great demon gate at the back, with a huge watching eye
+		local GZ, GB = -29, 1.3
+		for _, sx in ipairs({-1, 1}) do
+			put(Vector3.new(8, 2, 8), CFrame.new(sx * 11, GB + 1, GZ), DARK)
+			put(Vector3.new(5, 32, 5), CFrame.new(sx * 11, GB + 18, GZ), STONE)
+			table.insert(runes, put(Vector3.new(.25, 24, .6), CFrame.new(sx * 8.4, GB + 18, GZ + .2), RUNE, NEON, false))
+			put(Vector3.new(1.4, 10, 1.4), CFrame.new(sx * 14.6, GB + 40, GZ) * CFrame.Angles(0, 0, -sx * .5), DARK) -- curved outer horns
+		end
+		put(Vector3.new(31, 5, 7), CFrame.new(0, GB + 36.5, GZ), STONE)
+		for _, x in ipairs({-11, 0, 11}) do put(Vector3.new(2.6, x == 0 and 11 or 8, 2.6), CFrame.new(x, GB + 39 + (x == 0 and 5.5 or 4), GZ), DARK) end
+		put(Vector3.new(16, 32, 2), CFrame.new(0, GB + 18, GZ - 1.6), DARK)
+		local eye = put(Vector3.new(10, 5.4, .9), CFrame.new(0, GB + 22, GZ - .3), RUNE, NEON, false, BALL)
+		put(Vector3.new(1.4, 5, 1), CFrame.new(0, GB + 22, GZ + .2), Color3.new(0, 0, 0), Enum.Material.SmoothPlastic, false)
+		for _, sy in ipairs({-1, 1}) do put(Vector3.new(11.5, 1.2, 1.6), CFrame.new(0, GB + 22 + sy * 3.4, GZ - .2), DARK) end
+		table.insert(runes, eye)
+
+		-- the stone angel orb: just like the guiding orb of the maze (an orb with a halo and wings), carved in stone, floating above a plinth
+		-- in front of the gate. Wings light up after Trial I (and start to flap), the halo after Trial II, the orb after Trial III.
+		local function ap(size, shape)
+			local part = put(size, CFrame.new(), ANGEL, nil, false, shape)
+			angelSet[part] = true
+			return part
+		end
+		put(Vector3.new(8, 1.4, 6), CFrame.new(0, 2.5 + .7, -23), DARK)
+		put(Vector3.new(5.6, 1, 4.2), CFrame.new(0, 2.5 + 1.9, -23), STONE)
+		angel.orb = ap(Vector3.new(4.4, 4.4, 4.4), BALL)
+		angel.orbLight = new("PointLight", {Color = GOLD, Range = 32, Brightness = 2.5, Shadows = false, Enabled = false}, angel.orb)
+		angel.haloSegs = {}
+		for k = 1, 14 do
+			local seg = ap(Vector3.new(1.9, .3, .3))
+			table.insert(angel.halo, seg)
+			angel.haloSegs[k] = seg
+		end
+		local FLEN, FSPREAD = {6.8, 6.2, 5.4, 4.4}, {22, 6, -10, -26}
+		angel.featherData = {}
+		for _, sx in ipairs({-1, 1}) do
+			for i = 1, 4 do
+				local f = ap(Vector3.new(FLEN[i], .4, 1.9))
+				table.insert(angel.wings, f)
+				table.insert(angel.featherData, {part = f, sx = sx, i = i})
+			end
+		end
+		local function animateAngel(t)
+			local base = sCF * CFrame.new(0, 2.5 + 2.4 + 5.2 + math.sin(t * 1.4) * .45, -23)
+			angel.orb.CFrame = base
+			local haloCF = base * CFrame.new(0, 3.6 + math.sin(t * 1.7) * .1, 0) * CFrame.Angles(math.rad(8), 0, 0)
+			for k, seg in ipairs(angel.haloSegs) do
+				local a = (k - 1) / 14 * math.pi * 2
+				seg.CFrame = haloCF * CFrame.new(math.cos(a) * 3.6, 0, math.sin(a) * 3.6) * CFrame.Angles(0, -a - math.pi / 2, 0)
+			end
+			local flap = V.Trials.done[1] and (math.rad(14) + math.sin(t * 3.2) * math.rad(30)) or math.rad(26) -- stone wings only flap once they are lit
+			for _, fd in ipairs(angel.featherData) do
+				local pivot = base * CFrame.new(fd.sx * 2.1, .7, .3) * CFrame.Angles(0, 0, fd.sx * flap)
+				fd.part.CFrame = pivot * CFrame.Angles(0, 0, fd.sx * math.rad(FSPREAD[fd.i])) * CFrame.new(fd.sx * FLEN[fd.i] / 2, 0, -(fd.i - 1) * .18)
+			end
+		end
+
+		-- two rings of runes slowly turning above the sigil
+		for _, cfg in ipairs({{9.5, TOP + 10, 18, .35}, {6.5, TOP + 14, 12, -.5}}) do
+			for k = 0, cfg[3] - 1 do
+				local part = put(Vector3.new(1.6, .35, .35), CFrame.new(0, cfg[2], 0), RUNE, NEON, false)
+				table.insert(spin, {part = part, a = k / cfg[3] * math.pi * 2, R = cfg[1], y = cfg[2], w = cfg[4]})
+			end
+		end
+		local function animate(t)
+			animateAngel(t)
+			for _, sp in ipairs(spin) do
+				local a = sp.a + t * sp.w
+				sp.part.CFrame = sCF * CFrame.new(math.cos(a) * sp.R, sp.y, math.sin(a) * sp.R) * CFrame.Angles(0, -a - math.pi / 2, 0)
+			end
+		end
+
+		-- a faint beam of red light so the shrine can be found from far away
+		local beam = put(Vector3.new(3, 800, 3), CFrame.new(0, TOP + 400, 0), RUNE, NEON, false)
+		beam.Transparency = .8
+
+		V.Shrine.built = true
+		return model, ring, stars, runes, beam, animate
+	end
+
+	-- the little panel shown while you stand in the centre
+	local panel = new("TextLabel", {
+		AnchorPoint = Vector2.new(.5, 1), Position = UDim2.new(.5, 0, 1, -130), Size = UDim2.fromOffset(340, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = Color3.fromRGB(15, 8, 8), BackgroundTransparency = .25, TextColor3 = Color3.fromRGB(235, 220, 210), RichText = true,
+		Font = Enum.Font.GothamMedium, TextSize = 14, TextWrapped = true, Visible = false, ZIndex = 5,
+	}, V.gui)
+	corner(panel, 10)
+	new("UIPadding", {PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)}, panel)
+	new("UIStroke", {Color = Color3.fromRGB(200, 50, 30), Thickness = 1.5}, panel)
+	local function panelText()
+		local out = {'<font color="#ff6a3c"><b>THE SHRINE LISTENS</b></font>', "Say a line out loud (or with Silent Chant) to enter its trial:"}
+		for i, T in ipairs(K.TRIALS) do
+			if V.Trials.done[i] then
+				table.insert(out, string.format('<font color="#7dff8a">%s  %s  (done, can be repeated)</font>\n"%s"', ROMAN[i], T.name, T.line))
+			elseif i == 1 or V.Trials.done[i - 1] then
+				table.insert(out, string.format('<font color="#ffd27a">%s  %s</font>\n"%s"', ROMAN[i], T.name, T.line))
+			else
+				table.insert(out, string.format('<font color="#8a8a8a">%s  ???  (finish the %s first)</font>', ROMAN[i], K.TRIALS[i - 1].name))
+			end
+		end
+		return table.concat(out, "\n")
+	end
+
+	-- the angel's lights follow trial progress (stone while locked, gold when lit)
+	local function paint(p, lit)
+		if not (p and p.Parent) then return end
+		p.Material = lit and Enum.Material.Neon or Enum.Material.Slate
+		p.Color = lit and GOLD or ANGEL
+	end
+	local lastKey = ""
+	local function paintAngel()
+		local d = V.Trials.done
+		local key = (d[1] and "1" or "0") .. (d[2] and "1" or "0") .. (d[3] and "1" or "0")
+		if key == lastKey then return end
+		lastKey = key
+		for _, f in ipairs(angel.wings) do paint(f, d[1]) end
+		for _, h in ipairs(angel.halo) do paint(h, d[2]) end
+		paint(angel.orb, d[3])
+		if angel.orbLight then angel.orbLight.Enabled = d[3] and true or false end
+	end
+
+	-- after Trial III: a huge golden beam of light swallows the WHOLE shrine, the stone crumbles inside it, then the light fades
+	local function finale(model)
+		shrineGone, V.Shrine.gone, V.Shrine.inCenter = true, true, false
+		panel.Visible = false
+		local center = sCF.Position
+		local function cyl(diam, height, y, color, transp)
+			return new("Part", {Shape = Enum.PartType.Cylinder, Size = Vector3.new(height, diam, diam),
+				CFrame = CFrame.new(center + Vector3.new(0, y, 0)) * CFrame.Angles(0, 0, math.rad(90)), Color = color, Material = Enum.Material.Neon,
+				Transparency = transp, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false}, workspace)
+		end
+		local outer = cyl(6, 1000, 450, GOLD, .2)               -- wide golden column (grows to 96 studs: wider than the whole shrine)
+		local core = cyl(3, 1000, 450, Color3.new(1, 1, 1), 0)   -- white-hot core
+		local wave = cyl(10, .5, 1, GOLD, .15)                   -- shockwave along the ground
+		local grow = TweenInfo.new(1.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TS:Create(outer, grow, {Size = Vector3.new(1000, 96, 96)}):Play()
+		TS:Create(core, grow, {Size = Vector3.new(1000, 44, 44)}):Play()
+		TS:Create(wave, TweenInfo.new(2.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = Vector3.new(.5, 190, 190), Transparency = 1}):Play()
+		new("PointLight", {Color = GOLD, Range = 60, Brightness = 6, Shadows = false}, core)
+		new("ParticleEmitter", {Rate = 120, Lifetime = NumberRange.new(2, 4), Speed = NumberRange.new(12, 30), SpreadAngle = Vector2.new(8, 8),
+			EmissionDirection = Enum.NormalId.Top, Size = NumberSequence.new(1.4), LightEmission = 1, Color = ColorSequence.new(GOLD)}, core)
+		toast("A golden light swallows the shrine.", 4)
+		task.delay(1.5, function() -- inside the light, every stone sinks and fades
+			for _, d in ipairs(model:GetChildren()) do
+				if d:IsA("BasePart") then
+					d.CanCollide = false
+					TS:Create(d, TweenInfo.new(2.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In, 0, false, math.random() * 1.4),
+						{Transparency = 1, Position = d.Position - Vector3.new(0, 12, 0)}):Play()
+				end
+			end
+		end)
+		task.delay(5.3, function()
+			model:Destroy()
+			TS:Create(outer, TweenInfo.new(1.6), {Transparency = 1}):Play()
+			TS:Create(core, TweenInfo.new(1.6), {Transparency = 1}):Play()
+			Debris:AddItem(outer, 2)
+			Debris:AddItem(core, 2)
+			Debris:AddItem(wave, 2)
+		end)
+	end
+
+	task.spawn(function()
+		local char = V.lp.Character or V.lp.CharacterAdded:Wait()
+		local root = char:WaitForChild("HumanoidRootPart", 15)
+		if not root then return end
+		task.wait(2) -- let the world load around you
+		local groundPos, pedestal = findGround(root.Position)
+		local model, ring, stars, runes, beam, animate = buildShrine(groundPos, pedestal)
+		toast("A stone shrine has risen somewhere nearby. Find the red light.", 5)
+		local hinted, lastText = false, ""
+		local hb = RS.Heartbeat:Connect(function() if model.Parent and not shrineGone then animate(os.clock()) end end)
+		while model.Parent do
+			task.wait(.1)
+			paintAngel()
+			if V.Trials.done[3] and not shrineGone then finale(model) end
+			if not shrineGone then
+			local c = V.lp.Character
+			local r = c and c:FindFirstChild("HumanoidRootPart")
+			local inC = false
+			if r and not (V.inMaze or V.inTrial) then
+				local rel = sCF:PointToObjectSpace(r.Position)
+				inC = math.sqrt(rel.X * rel.X + rel.Z * rel.Z) < K.SHRINE_RADIUS and rel.Y > SHRINE_TOP - 1 and rel.Y < SHRINE_TOP + 10
+				if not hinted and (r.Position - sCF.Position).Magnitude < 45 then
+					hinted = true
+					toast("An ancient shrine. Step into the center of its sigil to listen.", 4.5)
+				end
+			end
+			V.Shrine.inCenter = inC
+			local t = os.clock()
+			for i, rn in ipairs(runes) do rn.Transparency = .1 + .3 * (.5 + .5 * math.sin(t * 2 + i)) end
+			ring.Color = inC and Color3.fromRGB(255, 150, 80) or RUNE
+			beam.Transparency = V.Trials.active and 1 or .8
+			for _, st in ipairs(stars) do st.Transparency = inC and 0 or .35 end
+			panel.Visible = inC
+			if inC then
+				local txt = panelText()
+				if txt ~= lastText then panel.Text, lastText = txt, txt end
+			end
+			end
+		end
+		hb:Disconnect()
+	end)
+end
+
 ---------------------------------------------------------------- The Necrobloxicon
 -- ===== TWEAKS =====
 K.BOOK_SPAWN_MIN, K.BOOK_SPAWN_MAX = 150, 260  -- how far from you the book appears (it only spawns while you don't own it)
@@ -2159,7 +3454,10 @@ local function initTotalBlind()
 -- all of them glowing so you can see them light up. There is an opening on your LEFT (the arena's east wall) that leads into the real maze.
 -- After 10 seconds the demon wakes (fire, "WHO DARE AWAKEN ME") and chases you; the orbs follow you and curse you when they get close.
 -- Reach the red exit at the far end of the maze to escape. Lava strips on the way must be jumped. Blessings are off.
-K.MAZE_N, K.MAZE_CELL, K.MAZE_WALL_H, K.MAZE_Y = 13, 14, 18, 4200
+K.MAZE_N, K.MAZE_CELL, K.MAZE_WALL_H, K.MAZE_Y = 9, 14, 18, 4200 -- (was 13 x 13: now 9 x 9, a much shorter way out)
+K.MAZE_LOOPS = .22  -- chance that each inner wall is knocked down: fewer dead ends, several ways to the exit
+K.MAZE_LAVA = 3     -- lava strips you have to jump (was 6)
+K.GUIDE_SPEED = 24  -- how fast the guiding orb flies (it always waits one cell ahead of you, on the way to the exit)
 K.ARENA_W, K.ARENA_D, K.ARENA_H = 126, 126, 44  -- the free space you fall into (width, depth, height in studs)
 K.DEMON_SPEED, K.ORB_SPEED, K.AWAKEN_TIME = 15, 12, 10  -- faster demon orb and curse orbs (was 10 and 7)
 -- each curse orb has its OWN orbit around you, its own speed, its own weaving flight (they fly, they do not share one path)
@@ -2197,6 +3495,12 @@ local function initMaze()
 				open[cx][cy][o[1][1]], open[o[2]][o[3]][o[1][4]] = true, true
 				seen[o[2]][o[3]] = true
 				table.insert(stack, {o[2], o[3]})
+			end
+		end
+		for x = 0, N - 1 do -- knock down some walls: dead ends turn into loops, so it is much harder to get truly lost
+			for y = 0, N - 1 do
+				if x < N - 1 and not open[x][y].e and math.random() < K.MAZE_LOOPS then open[x][y].e, open[x + 1][y].w = true, true end
+				if y < N - 1 and not open[x][y].s and math.random() < K.MAZE_LOOPS then open[x][y].s, open[x][y + 1].n = true, true end
 			end
 		end
 		return open, math.floor(N / 2) -- (the second value is the row where the arena door is)
@@ -2254,7 +3558,7 @@ local function initMaze()
 			return math.clamp(math.floor((p.X - origin.X) / C), 0, N - 1), math.clamp(math.floor((p.Z - origin.Z) / C), 0, N - 1)
 		end
 
-		local DARK = Color3.fromRGB(26, 8, 8)
+		local DARK = Color3.fromRGB(100, 62, 62) -- stone colour of the walls, floor and ceiling (light enough to see now that the maze is lit)
 		local DR = m                                   -- the maze row whose west wall is open: the door out of the arena
 		local AW, AD, AH = K.ARENA_W, K.ARENA_D, K.ARENA_H
 		local midZ = origin.Z + (DR + .5) * C          -- the arena is centred on the door's line
@@ -2294,13 +3598,13 @@ local function initMaze()
 		-- lava strips on straight corridor cells of the solution: you have to jump them
 		local path = bfs(open, 0, DR, N - 1, N - 1)
 		local lavas, idx = {}, 5
-		while idx < #path - 3 and #lavas < 6 do
+		while idx < #path - 3 and #lavas < K.MAZE_LAVA do
 			local c, p, nx = path[idx], path[idx - 1], path[idx + 1]
 			if (p[1] == c[1] and nx[1] == c[1]) or (p[2] == c[2] and nx[2] == c[2]) then
 				local along = p[1] == c[1] and "z" or "x"
 				local ctr = cellCenter(c[1], c[2])
 				local sz = along == "z" and Vector3.new(C - T - .4, .4, 6) or Vector3.new(6, .4, C - T - .4)
-				local part = block(sz, CFrame.new(ctr.X, origin.Y + .2, ctr.Z), Color3.fromRGB(40, 10, 0), Enum.Material.SmoothPlastic, false)
+				local part = block(sz, CFrame.new(ctr.X, origin.Y + .2, ctr.Z), Color3.fromRGB(150, 50, 10), Enum.Material.SmoothPlastic, false)
 				table.insert(lavas, {part = part, x = ctr.X, z = ctr.Z, hx = sz.X / 2, hz = sz.Z / 2})
 				idx += 7
 			else
@@ -2331,6 +3635,79 @@ local function initMaze()
 			orbs[i] = {part = core, fire = fire, light = light, def = curseDef(id), pos = demon.pos, cd = 0,
 				radius = K.ORB_RADII[i], speedMul = K.ORB_SPEED_MULS[i], spin = K.ORB_SPINS[i], height = K.ORB_HEIGHTS[i],
 				phase = (i - 1) * math.pi / 2 + math.random() * .5, weaveRate = .8 + i * .25}
+		end
+
+		-- the guiding orb: a white orb with a halo and flapping wings. It waits in the doorway while you are in the arena, then floats one cell
+		-- ahead of you along the shortest way to the exit (it is recalculated every time you change cell, so wrong turns are fine).
+		local gm = Instance.new("Model")
+		gm.Name = "MazeGuide"
+		gm.Parent = model
+		local function gpart(size, shape, transp)
+			return new("Part", {Size = size, Shape = shape or Enum.PartType.Block, Color = Color3.new(1, 1, 1), Material = Enum.Material.Neon, Transparency = transp or 0,
+				Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false}, gm)
+		end
+		local gcore = gpart(Vector3.new(1.8, 1.8, 1.8), Enum.PartType.Ball)
+		new("PointLight", {Color = Color3.new(1, 1, 1), Range = 22, Brightness = 1.4}, gcore)
+		local HALO_N, HALO_R = 14, 1.25
+		local halo = {}
+		for k = 1, HALO_N do
+			local seg = gpart(Vector3.new(2 * math.pi * HALO_R / HALO_N * 1.1, .14, .14))
+			seg.Color = Color3.fromRGB(255, 232, 150)
+			halo[k] = seg
+		end
+		local FEATHER_SPREAD = {22, 6, -10, -26} -- each feather fans out a little lower than the one before
+		local FEATHER_LEN = {2.4, 2.3, 2.0, 1.6}
+		local wings = {{sx = 1, feathers = {}}, {sx = -1, feathers = {}}}
+		for _, w in ipairs(wings) do
+			for i = 1, #FEATHER_LEN do
+				local f = gpart(Vector3.new(FEATHER_LEN[i], .16, .85), nil, .12)
+				new("SpecialMesh", {MeshType = Enum.MeshType.Sphere}, f) -- soft, rounded feathers
+				w.feathers[i] = f
+			end
+		end
+		local guide = {pos = Vector3.new(origin.X - 2, origin.Y + 5, midZ), face = Vector3.new(1, 0, 0), key = nil, path = nil}
+		local function updateGuide(now, dt, rp)
+			local tgt
+			if rp.X < origin.X then -- you are still in the arena: it waits in the doorway
+				tgt = Vector3.new(origin.X - 2, origin.Y + 5, midZ)
+			else
+				local cx, cy = cellOf(rp)
+				local key = cx * 100 + cy
+				if guide.key ~= key then guide.key, guide.path = key, bfs(open, cx, cy, N - 1, N - 1) end
+				local pth = guide.path
+				if #pth <= 2 then
+					tgt = Vector3.new(exitPos.X, origin.Y + 5, exitPos.Z) -- last cell: lead you out through the gap
+				else
+					local c = pth[2]
+					tgt = cellCenter(c[1], c[2]) + Vector3.new(0, 5, 0)
+				end
+			end
+			tgt += Vector3.new(0, math.sin(now * 2.2) * .6, 0)
+			local to = tgt - guide.pos
+			local d = to.Magnitude
+			local moving = d > 1
+			if d > .05 then
+				local flat = Vector3.new(to.X, 0, to.Z)
+				if flat.Magnitude > .5 then guide.face = guide.face:Lerp(flat.Unit, math.min(1, dt * 6)) end
+				guide.pos += to.Unit * math.min(d, K.GUIDE_SPEED * dt * (d > 30 and 2 or 1))
+			end
+			local fl = guide.face.Magnitude > .01 and guide.face.Unit or Vector3.new(1, 0, 0)
+			local base = CFrame.lookAt(guide.pos, guide.pos + fl)
+			gcore.CFrame = base
+			-- halo floats above the orb
+			local haloCF = base * CFrame.new(0, 1.7 + math.sin(now * 3) * .08, 0) * CFrame.Angles(math.rad(8), 0, 0)
+			for k, seg in ipairs(halo) do
+				local a = (k - 1) / HALO_N * math.pi * 2
+				seg.CFrame = haloCF * CFrame.new(math.cos(a) * HALO_R, 0, math.sin(a) * HALO_R) * CFrame.Angles(0, -a - math.pi / 2, 0)
+			end
+			-- wings flap (faster while it is flying)
+			local flap = math.rad(12) + math.sin(now * (moving and 11 or 6)) * math.rad(38)
+			for _, w in ipairs(wings) do
+				local pivot = base * CFrame.new(w.sx * .75, .25, .15) * CFrame.Angles(0, 0, w.sx * flap)
+				for i, f in ipairs(w.feathers) do
+					f.CFrame = pivot * CFrame.Angles(0, 0, w.sx * math.rad(FEATHER_SPREAD[i])) * CFrame.new(w.sx * FEATHER_LEN[i] / 2, 0, -(i - 1) * .12)
+				end
+			end
 		end
 
 		-- messages
@@ -2367,12 +3744,13 @@ local function initMaze()
 		TS:Create(V.flashFrame, TweenInfo.new(.4), {BackgroundTransparency = 0}):Play()
 		task.wait(.5)
 		if hum.Health <= 0 then finish(false) return end
-		V.Env.blackout(.5)
+		V.Env.maze(.5) -- the maze is lit (everything but the orbs), even before the demon wakes and even with Total Blindness
 		-- you FALL in: dropped from near the arena ceiling, facing the orb. The door to the maze is on your left.
 		local spawn = Vector3.new(origin.X - AW / 2, origin.Y + AH - 6, aZ0 + 14)
 		root.CFrame = CFrame.lookAt(spawn, spawn + Vector3.new(0, 0, 1))
 		root.AssemblyLinearVelocity = Vector3.zero
 		applyBuffs()
+		toast("Follow the white orb with the halo: it shows you the way out.", 5)
 		TS:Create(V.flashFrame, TweenInfo.new(1), {BackgroundTransparency = 1}):Play()
 		hum.Died:Connect(function() finish(false) end)
 
@@ -2414,7 +3792,7 @@ local function initMaze()
 			for _, l in ipairs(lavas) do l.part.Material, l.part.Color = Enum.Material.Neon, Color3.fromRGB(255, 100, 0) end
 			dFire.Enabled, dLight.Range, dLight.Brightness = true, 60, 4
 			for _, o in ipairs(orbs) do o.fire.Enabled, o.light.Range, o.light.Brightness = true, 14, 2 end
-			if not (V.TotalBlindOn and V.TotalBlindOn()) then V.Env.fire(2) end
+			if not (V.TotalBlindOn and V.TotalBlindOn()) then V.Env.maze(2) end -- (still lit; the walls and lava turn red on their own)
 			if V.TotalBlindDim then V.TotalBlindDim() end -- Total Blindness: nothing is allowed to glow, not even an awake maze
 			bigText("WHO DARE AWAKEN ME")
 		end
@@ -2432,6 +3810,7 @@ local function initMaze()
 				dLight.Brightness = 2.6 + math.sin(now * 3) * .9 -- breathing glow while it sleeps
 			end
 			dCore.Position = demon.pos
+			updateGuide(now, dt, rp)
 			for i, o in ipairs(orbs) do
 				if awake then
 					-- the orb flies to its own spot on its own circle around you, weaving from side to side on the way
@@ -2642,13 +4021,17 @@ initMaze()
 		local isPart = d:IsA("BasePart") and d.Material == Enum.Material.Neon
 		local isFx = not isPart and (d:IsA("Light") or d:IsA("Fire") or d:IsA("ParticleEmitter") or d:IsA("Sparkles") or d:IsA("Beam") or d:IsA("Trail")) and d.Enabled
 		if not (isPart or isFx) then return end
+		if d:FindFirstAncestor("MazeGuide") then return end -- the guiding orb is the one thing allowed to shine
 		if folder and d:IsDescendantOf(folder) then return end -- (only the blindness effects themselves are allowed to glow)
 		if isPart and d:IsDescendantOf(V.coinFolder) then return end -- souls keep their normal body; only their light is switched off (below)
 		if isPart then
 			dimmed[d] = {mat = d.Material, color = d.Color}
 			d.Material = Enum.Material.SmoothPlastic
+			local mz = workspace:FindFirstChild("DemonMaze")
 			if d.Name == "MazeCurseOrb" or d:IsDescendantOf(V.orbFolder) then
 				d.Color = Color3.fromRGB(150, 150, 150) -- curse orbs turn plain grey
+			elseif mz and d.Name ~= "MazeDemon" and d:IsDescendantOf(mz) then
+				-- the maze itself keeps its colour (it is lit, so you can see it); it just does not glow
 			else
 				d.Color = d.Color:Lerp(Color3.new(0, 0, 0), .85)
 			end
@@ -2835,7 +4218,7 @@ initMaze()
 		dots, dotIdx = {}, 0
 		boxes, humList, soundList, humRec, lastSound = {}, {}, {}, {}, {}
 		V.Env.black = false
-		if V.inMaze then V.Env.fire(1.5) -- inside the maze the lighting goes back to the maze's own
+		if V.inMaze then V.Env.maze(1.5) -- inside the maze the lighting goes back to the maze's own
 		elseif not V.ritual.active then V.Env.restore(1.5) end -- (a running summon restores the sky itself when it ends)
 	end
 	V.TotalBlind = function(flag) if flag then start() else stop() end end
