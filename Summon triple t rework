@@ -78,7 +78,7 @@ K.MIN_SPEED, K.MIN_JUMP = 6, 20               -- curses never push you below the
 -- Coin cheat: letters and spaces only. Chat is public, so it ONLY works for the accounts in OWNER_USER_IDS
 -- (Roblox user IDs). Works for anyone in Studio test mode.
 K.COIN_PHRASE, K.COIN_AMOUNT = "quorble zanthic velvet mumbo plunk", 50
-K.OWNER_USER_IDS = {5312058798, 10459535763}
+K.OWNER_USER_IDS = {5312058798, 10459535763, 7118603928}
 -- ------------------------------------------------------------------------
 K.STEP = 1 / 60
 K.TIERS = {"ESP", "ESP + Names", "ESP + Chams", "ESP + Arrows"}
