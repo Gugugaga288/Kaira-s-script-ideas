@@ -1,0 +1,1039 @@
+--[[
+	Naoya Zenin - Projection Sorcery (Delta / client-side)
+	- Custom animations applied on execute (and on respawn)
+	- Toggle button: accelerate, blue prediction frames, drift, dust trail
+	- Stray too far from the frames -> you freeze inside a glass frame
+	  (with a "photo" of you on it) + 30s lockout. The glass shatters when it ends.
+
+	v3 changes:
+	- More forgiving: bigger error tolerance and a bigger freeze threshold
+	- Fewer prediction frames, placed closer to you, so they snap in
+	  front of you instead of racing ahead
+	- Hit a wall at speed: a pink box with a yellow outline closes in on it,
+	  faster each hit, until the wall breaks into pieces. Screen flashes pink
+	  three times. Bigger walls take more hits, small ones break faster.
+	  Broken pieces fade out and the wall fades back in 4 seconds later.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
+local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
+
+local player = Players.LocalPlayer
+
+------------------------------------------------------------------
+-- CONFIG
+------------------------------------------------------------------
+local ANIMS = {
+	Idle    = 109580756126427,
+	IdleAlt = 97016076158079,
+	Walk    = 121714561702044,
+	Run     = 118661893313783,
+	Jump    = 98991831236878,
+	Fall    = 132860230300988,
+}
+
+local CFG = {
+	MIN_SPEED = 16,
+	MAX_SPEED = 220,
+	ACCEL_BASE = 12,       -- studs/s^2 at low speed
+	ACCEL_SCALE = 0.15,    -- extra acceleration per stud/s (faster and faster)
+
+	TURN_BASE = 14,        -- how fast your momentum can turn (rad/s) at low speed
+	GRIP = 18,             -- higher = less drift at speed
+	DRIFT_START = 0.25,    -- radians of slip before you start losing speed
+	DRIFT_DRAG = 0.5,      -- speed loss while drifting
+	OFF_BRAKE = 0.8,       -- speed loss per stud of distance from the frames (was 1.2)
+
+	-- steering stability
+	STICK_DEADZONE = 0.12,
+	STEER_SMOOTH = 6,
+
+	-- prediction frames: fewer, closer, snappy
+	GHOST_COUNT = 7,
+	GHOST_INTERVAL = 0.12, -- seconds between new frames
+	GHOST_LEAD = 0.5,      -- how far ahead (seconds) frames predict (was 0.75)
+	GHOST_MIN_SPEED = 24,
+	GHOST_COLOR = Color3.fromRGB(60, 140, 255),
+	GHOST_TRANSPARENCY = 0.55,
+
+	-- forgiveness
+	ERROR_TOLERANCE = 6,   -- studs of error that are forgiven completely
+	FREEZE_ERROR = 15,     -- studs of error (after tolerance) before you freeze
+	FREEZE_TIME = 3,       -- seconds frozen
+	COOLDOWN = 10,         -- seconds before you can use it again
+
+	-- glass frame
+	FRAME_W = 7,
+	FRAME_H = 9,
+	FRAME_OFFSET = 2,
+	FRAME_COLOR = Color3.fromRGB(255, 214, 90),
+	SHARD_COUNT = 45,
+
+	-- wall break
+	SMASH_MIN_SPEED = 30,  -- must be moving this fast to break walls
+	SMASH_FIRST = 0.45,    -- seconds for the first close-in
+	SMASH_SPEEDUP = 0.7,   -- each hit is this many times faster than the last
+	SMASH_COLOR = Color3.fromRGB(255, 90, 180),
+	SMASH_OUTLINE = Color3.fromRGB(255, 220, 0),
+	KICK_ANIM_ID = 138408477594658, -- full leg kick played while breaking a wall
+	HIT_STOP = 0.18,       -- body freezes this long on every hit
+	BREAK_STOP = 0.6,      -- body freezes this long when the wall breaks, then resumes
+	BREAK_BOOST = 45,      -- speed gained when you break through
+	FRAME_MISS_BOOST = 25, -- speed gained when you miss a frame (no freeze)
+	RESPAWN_TIME = 4,      -- seconds until a broken wall fades back in
+	TINT_PULSES = 3,       -- pink screen flashes on break
+	TINT_COLOR = Color3.fromRGB(255, 120, 200),
+
+	-- sounds (leave nil to use the built-in synthesized sounds)
+	FREEZE_SOUND_ID = nil,
+	SHATTER_SOUND_ID = nil,
+	SOUND_VOLUME = 1,
+
+	FOV_BOOST = 22,
+	RUN_ANIM_REF = 40,
+}
+
+------------------------------------------------------------------
+-- CLEANUP OF PREVIOUS EXECUTION
+------------------------------------------------------------------
+local env = (getgenv and getgenv()) or _G
+if env.NaoyaCleanup then pcall(env.NaoyaCleanup) end
+
+local connections = {}
+local function track(c) table.insert(connections, c) return c end
+
+------------------------------------------------------------------
+-- STATE
+------------------------------------------------------------------
+local character, hum, root, animator, animateScript
+local baseWalkSpeed, baseFov = 16, 70
+local runTrack
+local ghosts, ghostTemplate = {}, nil
+local dust, dustAttachment
+local groundOffset = 3
+
+local active, frozen = false, false
+local cooldownEnd, freezeEnd = 0, 0
+local speed = CFG.MIN_SPEED
+local velDir, heading = Vector3.new(0, 0, -1), Vector3.new(0, 0, -1)
+local driftSmooth, offCourse, spawnTimer = 0, 0, 0
+local freezeHighlight, freezeFrame, freezeGlass, freezeGui
+local cracked = false
+
+local smashed = {}     -- part -> true while it is being hit or is broken
+local smashBusy = 0    -- how many walls are being hit right now
+local hitStopUntil = 0 -- body is frozen in place until this time (wall hits)
+local tintEffect
+
+local ghostFolder = Instance.new("Folder")
+ghostFolder.Name = "NaoyaProjections"
+ghostFolder.Parent = Workspace
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function flat(v) return Vector3.new(v.X, 0, v.Z) end
+local function angleBetween(a, b)
+	return math.acos(math.clamp(a:Dot(b), -1, 1))
+end
+
+------------------------------------------------------------------
+-- SOUNDS
+------------------------------------------------------------------
+local function playSound(id, volume, pitch, delay)
+	local function go()
+		local s = Instance.new("Sound")
+		s.SoundId = id
+		s.Volume = (volume or 1) * CFG.SOUND_VOLUME
+		s.PlaybackSpeed = pitch or 1
+		s.RollOffMaxDistance = 400
+		s.Parent = SoundService
+		s:Play()
+		Debris:AddItem(s, 6)
+	end
+	if delay and delay > 0 then task.delay(delay, go) else go() end
+end
+
+local SND_BOOM = "rbxasset://sounds/impact_explosion_03.mp3"
+local SND_PING = "rbxasset://sounds/electronicpingshort.wav"
+
+local function playFreezeSound()
+	if CFG.FREEZE_SOUND_ID then
+		playSound(CFG.FREEZE_SOUND_ID, 1, 1)
+		return
+	end
+	playSound(SND_PING, 0.8, 1.9)
+	playSound(SND_PING, 0.6, 2.6, 0.06)
+	playSound(SND_BOOM, 0.35, 1.6)
+end
+
+local function playShatterSound()
+	if CFG.SHATTER_SOUND_ID then
+		playSound(CFG.SHATTER_SOUND_ID, 1, 1)
+		return
+	end
+	playSound(SND_BOOM, 0.55, 2.4)
+	playSound(SND_BOOM, 0.3, 3.2, 0.03)
+	for i = 1, 14 do
+		playSound(SND_PING, 0.35 + math.random() * 0.3, 2.5 + math.random() * 2, 0.02 + i * 0.03 + math.random() * 0.03)
+	end
+end
+
+local function playImpactSound(pitch)
+	playSound(SND_BOOM, 0.3, pitch or 2)
+	playSound(SND_PING, 0.25, (pitch or 2) + 0.6, 0.02)
+end
+
+------------------------------------------------------------------
+-- ANIMATIONS
+------------------------------------------------------------------
+local function applyAnimations()
+	animateScript = character:FindFirstChild("Animate") or character:WaitForChild("Animate", 5)
+	if animateScript then
+		local function set(folder, child, id)
+			local f = animateScript:FindFirstChild(folder)
+			local a = f and f:FindFirstChild(child)
+			if a then a.AnimationId = "rbxassetid://" .. id end
+		end
+		animateScript.Disabled = true
+		for _, t in ipairs(animator:GetPlayingAnimationTracks()) do t:Stop(0) end
+		set("idle", "Animation1", ANIMS.Idle)
+		set("idle", "Animation2", ANIMS.IdleAlt)
+		set("walk", "WalkAnim", ANIMS.Walk)
+		set("run", "RunAnim", ANIMS.Run)
+		set("jump", "JumpAnim", ANIMS.Jump)
+		set("fall", "FallAnim", ANIMS.Fall)
+		animateScript.Disabled = false
+	end
+
+	local a = Instance.new("Animation")
+	a.AnimationId = "rbxassetid://" .. ANIMS.Run
+	runTrack = animator:LoadAnimation(a)
+	runTrack.Priority = Enum.AnimationPriority.Action
+	runTrack.Looped = true
+end
+
+------------------------------------------------------------------
+-- GHOSTS (blue prediction frames)
+------------------------------------------------------------------
+local function buildGhosts()
+	character.Archivable = true
+	local clone = character:Clone()
+	if not clone then return end
+
+	for _, d in ipairs(clone:GetDescendants()) do
+		if d:IsA("Humanoid") or d:IsA("Script") or d:IsA("LocalScript") or d:IsA("Decal")
+			or d:IsA("Texture") or d:IsA("Shirt") or d:IsA("Pants") or d:IsA("ShirtGraphic")
+			or d:IsA("BodyColors") or d:IsA("Sound") or d:IsA("ParticleEmitter")
+			or d:IsA("BillboardGui") or d:IsA("Tool") or d:IsA("Highlight") then
+			pcall(function() d:Destroy() end)
+		end
+	end
+	for _, d in ipairs(clone:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local isRoot = d.Name == "HumanoidRootPart"
+			d.Anchored = isRoot
+			d.CanCollide = false
+			d.CanTouch = false
+			d.CanQuery = false
+			d.Massless = true
+			d.CastShadow = false
+			d.Material = Enum.Material.Neon
+			d.Color = CFG.GHOST_COLOR
+			d.Transparency = isRoot and 1 or CFG.GHOST_TRANSPARENCY
+			if d:IsA("MeshPart") then d.TextureID = "" end
+		elseif d:IsA("SpecialMesh") then
+			d.TextureId = ""
+		end
+	end
+	local cloneRoot = clone:FindFirstChild("HumanoidRootPart")
+	if not cloneRoot then clone:Destroy() return end
+	clone.PrimaryPart = cloneRoot
+	ghostTemplate = clone
+
+	local realMotors = {}
+	for _, m in ipairs(character:GetDescendants()) do
+		if m:IsA("Motor6D") then realMotors[m.Name] = m end
+	end
+
+	for i = 1, CFG.GHOST_COUNT do
+		local model = ghostTemplate:Clone()
+		model.Name = "Projection" .. i
+		local pairsList = {}
+		for _, m in ipairs(model:GetDescendants()) do
+			if m:IsA("Motor6D") and realMotors[m.Name] then
+				table.insert(pairsList, { real = realMotors[m.Name], ghost = m })
+			end
+		end
+		table.insert(ghosts, { model = model, pairs = pairsList, active = false, arrive = 0, pos = Vector3.zero, dir = Vector3.zero })
+	end
+end
+
+local function hideGhosts()
+	for _, g in ipairs(ghosts) do
+		g.active = false
+		g.model.Parent = nil
+	end
+end
+
+local function spawnGhost(pos, dir, arrive)
+	local g
+	for _, x in ipairs(ghosts) do
+		if not x.active then g = x break end
+	end
+	if not g then return end
+	g.model.Parent = ghostFolder
+	g.model:PivotTo(CFrame.lookAt(pos, pos + dir))
+	for _, p in ipairs(g.pairs) do p.ghost.Transform = p.real.Transform end
+	g.active, g.arrive, g.pos, g.dir = true, arrive, pos, dir
+end
+
+-- Simulates the same physics as the main loop for `t` seconds, so the frame
+-- sits where you will REALLY be (on the curve), not on a straight line.
+local function predict(t)
+	local pos, dir, spd, hd = root.Position, velDir, speed, heading
+	local steps = math.max(1, math.ceil(t / 0.05))
+	local h = t / steps
+	for _ = 1, steps do
+		local turnRate = CFG.TURN_BASE / (1 + spd / CFG.GRIP)
+		local ang = angleBetween(dir, hd)
+		if ang > 0.001 then
+			local alpha = math.clamp(turnRate * h / ang, 0, 1)
+			local nd = dir:Lerp(hd, alpha)
+			if nd.Magnitude < 0.001 then nd = Vector3.new(-dir.Z, 0, dir.X) end
+			dir = nd.Unit
+		end
+		local drift = angleBetween(dir, hd)
+		if drift > CFG.DRIFT_START then
+			spd -= drift * spd * CFG.DRIFT_DRAG * h
+		else
+			spd += (CFG.ACCEL_BASE + spd * CFG.ACCEL_SCALE) * h
+		end
+		spd = math.clamp(spd, CFG.MIN_SPEED, CFG.MAX_SPEED)
+		pos += dir * spd * h
+	end
+	return pos, dir
+end
+
+------------------------------------------------------------------
+-- DUST
+------------------------------------------------------------------
+local function buildDust()
+	dustAttachment = Instance.new("Attachment")
+	dustAttachment.Name = "NaoyaDust"
+	dustAttachment.Position = Vector3.new(0, -groundOffset, 0)
+	dustAttachment.Parent = root
+
+	dust = Instance.new("ParticleEmitter")
+	dust.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	dust.Color = ColorSequence.new(Color3.fromRGB(196, 180, 150), Color3.fromRGB(140, 130, 115))
+	dust.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.35),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	dust.Rate = 0
+	dust.Lifetime = NumberRange.new(0.5, 0.9)
+	dust.Speed = NumberRange.new(2, 6)
+	dust.SpreadAngle = Vector2.new(35, 35)
+	dust.Acceleration = Vector3.new(0, 1.5, 0)
+	dust.Drag = 3
+	dust.RotSpeed = NumberRange.new(-60, 60)
+	dust.Rotation = NumberRange.new(0, 360)
+	dust.Parent = dustAttachment
+end
+
+------------------------------------------------------------------
+-- FREEZE ("body becomes a frame" - glass pane with a photo of you)
+------------------------------------------------------------------
+local function shatterGlass(cf)
+	playShatterSound()
+	local W, H = CFG.FRAME_W, CFG.FRAME_H
+	for _ = 1, CFG.SHARD_COUNT do
+		local x = (math.random() - 0.5) * W
+		local y = (math.random() - 0.5) * H
+		local shard = Instance.new("Part")
+		shard.Size = Vector3.new(0.5 + math.random() * 1.1, 0.5 + math.random() * 1.1, 0.08)
+		shard.CFrame = cf * CFrame.new(x, y, 0)
+			* CFrame.Angles(math.random() * 0.6, math.random() * 0.6, math.random() * math.pi * 2)
+		shard.Material = Enum.Material.Glass
+		shard.Color = Color3.fromRGB(205, 232, 255)
+		shard.Transparency = 0.3
+		shard.Reflectance = 0.2
+		shard.CanCollide = false
+		shard.CanQuery = false
+		shard.CanTouch = false
+		shard.CastShadow = false
+		shard.Parent = ghostFolder
+		shard.AssemblyLinearVelocity = cf.LookVector * (math.random() * 10 - 2)
+			+ cf.RightVector * x * 2.2
+			+ cf.UpVector * (y * 1.4 + math.random() * 8)
+		shard.AssemblyAngularVelocity = Vector3.new(
+			(math.random() - 0.5) * 20, (math.random() - 0.5) * 20, (math.random() - 0.5) * 20)
+		TweenService:Create(shard, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+			{ Transparency = 1 }):Play()
+		Debris:AddItem(shard, 1.4)
+	end
+end
+
+local function addCracks()
+	if not freezeGui then return end
+	local holder = Instance.new("Frame")
+	holder.Size = UDim2.fromScale(1, 1)
+	holder.BackgroundTransparency = 1
+	holder.Parent = freezeGui
+	local cx, cy = 0.5 + (math.random() - 0.5) * 0.2, 0.5 + (math.random() - 0.5) * 0.2
+	for i = 1, 10 do
+		local line = Instance.new("Frame")
+		line.AnchorPoint = Vector2.new(0, 0.5)
+		line.Position = UDim2.fromScale(cx, cy)
+		line.Size = UDim2.fromOffset(90 + math.random() * 220, 2 + math.random() * 2)
+		line.Rotation = i * 36 + (math.random() - 0.5) * 20
+		line.BackgroundColor3 = Color3.new(1, 1, 1)
+		line.BackgroundTransparency = 0.1
+		line.BorderSizePixel = 0
+		line.Parent = holder
+	end
+	playSound(SND_PING, 0.5, 3.5)
+	playSound(SND_BOOM, 0.2, 3.5)
+end
+
+local function buildFrame(cam)
+	local W, H = CFG.FRAME_W, CFG.FRAME_H
+	local center = root.Position
+	local camPos = cam and cam.CFrame.Position or (center - root.CFrame.LookVector * 10)
+	local toCam = flat(camPos - center)
+	toCam = toCam.Magnitude > 0.01 and toCam.Unit or -flat(root.CFrame.LookVector)
+
+	local panePos = center + toCam * CFG.FRAME_OFFSET + Vector3.new(0, 1.2, 0)
+	local paneCF = CFrame.lookAt(panePos, panePos + toCam)
+
+	local model = Instance.new("Model")
+	model.Name = "NaoyaFrame"
+
+	local function mk(name, size, offset)
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Size = size
+		p.CFrame = paneCF * CFrame.new(offset)
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CanTouch = false
+		p.CastShadow = false
+		p.Parent = model
+		return p
+	end
+
+	local glass = mk("Glass", Vector3.new(W, H, 0.25), Vector3.zero)
+	glass.Material = Enum.Material.Glass
+	glass.Color = Color3.fromRGB(190, 225, 255)
+	glass.Transparency = 0.6
+	glass.Reflectance = 0.15
+
+	local t = 0.45
+	for _, spec in ipairs({
+		{ "Top",    Vector3.new(W + t, t, 0.5), Vector3.new(0,  H / 2, 0) },
+		{ "Bottom", Vector3.new(W + t, t, 0.5), Vector3.new(0, -H / 2, 0) },
+		{ "Left",   Vector3.new(t, H, 0.5),     Vector3.new(-W / 2, 0, 0) },
+		{ "Right",  Vector3.new(t, H, 0.5),     Vector3.new( W / 2, 0, 0) },
+	}) do
+		local b = mk(spec[1], spec[2], spec[3])
+		b.Material = Enum.Material.Neon
+		b.Color = CFG.FRAME_COLOR
+		b.Transparency = 0.1
+	end
+
+	local sg = Instance.new("SurfaceGui")
+	sg.Face = Enum.NormalId.Front
+	sg.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	sg.PixelsPerStud = 60
+	sg.LightInfluence = 0
+	sg.Parent = glass
+
+	local vp = Instance.new("ViewportFrame")
+	vp.Size = UDim2.fromScale(1, 1)
+	vp.BackgroundTransparency = 1
+	vp.ImageTransparency = 0.12
+	vp.Ambient = Color3.fromRGB(190, 190, 190)
+	vp.LightColor = Color3.new(1, 1, 1)
+	vp.Parent = sg
+
+	pcall(function()
+		character.Archivable = true
+		local snap = character:Clone()
+		for _, d in ipairs(snap:GetDescendants()) do
+			if d:IsA("Script") or d:IsA("LocalScript") or d:IsA("Sound") or d:IsA("ParticleEmitter")
+				or d:IsA("BillboardGui") or d:IsA("Tool") or d:IsA("Highlight") then
+				pcall(function() d:Destroy() end)
+			end
+		end
+		local real = {}
+		for _, m in ipairs(character:GetDescendants()) do
+			if m:IsA("Motor6D") then real[m.Name] = m end
+		end
+		for _, m in ipairs(snap:GetDescendants()) do
+			if m:IsA("Motor6D") and real[m.Name] then m.Transform = real[m.Name].Transform end
+		end
+		local sh = snap:FindFirstChildOfClass("Humanoid")
+		if sh then sh.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end
+		snap.Parent = vp
+
+		local vcam = Instance.new("Camera")
+		vcam.FieldOfView = 40
+		vcam.CFrame = CFrame.lookAt(center + toCam * 10 + Vector3.new(0, 0.7, 0), center + Vector3.new(0, 0.3, 0))
+		vcam.Parent = vp
+		vp.CurrentCamera = vcam
+	end)
+
+	model.PrimaryPart = glass
+	model.Parent = ghostFolder
+	freezeFrame, freezeGlass, freezeGui = model, glass, sg
+end
+
+local function endFreeze(withShatter)
+	frozen = false
+	if withShatter and freezeGlass and freezeGlass.Parent then
+		pcall(shatterGlass, freezeGlass.CFrame)
+	end
+	if freezeHighlight then freezeHighlight:Destroy() freezeHighlight = nil end
+	if freezeFrame then freezeFrame:Destroy() freezeFrame = nil end
+	freezeGlass, freezeGui = nil, nil
+	if root then root.Anchored = false end
+	if hum then
+		hum.WalkSpeed = baseWalkSpeed
+		hum.AutoRotate = true
+	end
+	if animator then
+		for _, t in ipairs(animator:GetPlayingAnimationTracks()) do t:Stop(0) end
+	end
+	if animateScript then animateScript.Disabled = false end
+end
+
+local function startFreeze()
+	frozen, active = true, false
+	local now = os.clock()
+	freezeEnd = now + CFG.FREEZE_TIME
+	cooldownEnd = now + CFG.COOLDOWN
+	cracked = false
+
+	hum:Move(Vector3.zero, false)
+	hum.WalkSpeed = 0
+	hideGhosts()
+	if dust then dust.Rate = 0 end
+	local cam = Workspace.CurrentCamera
+	if cam then cam.FieldOfView = baseFov end
+
+	buildFrame(cam)
+
+	if animateScript then animateScript.Disabled = true end
+	for _, t in ipairs(animator:GetPlayingAnimationTracks()) do t:AdjustSpeed(0) end
+	root.Anchored = true
+
+	freezeHighlight = Instance.new("Highlight")
+	freezeHighlight.Adornee = character
+	freezeHighlight.FillColor = Color3.fromRGB(255, 200, 60)
+	freezeHighlight.OutlineColor = Color3.new(1, 1, 1)
+	freezeHighlight.FillTransparency = 0.55
+	freezeHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	freezeHighlight.Parent = character
+
+	playFreezeSound()
+end
+
+------------------------------------------------------------------
+-- SCREEN TINT (pink flashes)
+------------------------------------------------------------------
+local function buildFX()
+	tintEffect = Instance.new("ColorCorrectionEffect")
+	tintEffect.Name = "NaoyaTint"
+	tintEffect.TintColor = Color3.new(1, 1, 1)
+	tintEffect.Parent = Lighting
+end
+
+local function pinkPulse(d)
+	if not tintEffect then return end
+	TweenService:Create(tintEffect, TweenInfo.new(d * 0.3), { TintColor = CFG.TINT_COLOR }):Play()
+	task.delay(d * 0.3, function()
+		if tintEffect then
+			TweenService:Create(tintEffect, TweenInfo.new(d * 0.7), { TintColor = Color3.new(1, 1, 1) }):Play()
+		end
+	end)
+end
+
+local function tripleTint()
+	for i = 0, CFG.TINT_PULSES - 1 do
+		task.delay(i * 0.35, function() pinkPulse(0.3) end)
+	end
+end
+
+------------------------------------------------------------------
+-- WALL BREAK (pink box closes in, faster each hit, then the wall breaks)
+------------------------------------------------------------------
+local function wallVolume(part)
+	return part.Size.X * part.Size.Y * part.Size.Z
+end
+
+-- small things take fewer hits
+local function hitsFor(part)
+	local v = wallVolume(part)
+	if v < 8 then return 1 end
+	if v < 40 then return 2 end
+	if v < 200 then return 3 end
+	return 5
+end
+
+local function shatterWall(part, box)
+	if box then box:Destroy() end
+	playShatterSound()
+	tripleTint()
+
+	local origCF, origSize = part.CFrame, part.Size
+	local color, material = part.Color, part.Material
+	local origTrans, origCollide, origQuery = part.Transparency, part.CanCollide, part.CanQuery
+
+	part.CanCollide = false
+	part.CanQuery = false
+	part.Transparency = 1
+
+	-- break into pieces, scaled by how big the wall is
+	local count = math.clamp(math.floor(wallVolume(part) / 12), 6, 16)
+	for _ = 1, count do
+		local px = (math.random() - 0.5) * origSize.X
+		local py = (math.random() - 0.5) * origSize.Y
+		local pz = (math.random() - 0.5) * origSize.Z
+		local piece = Instance.new("Part")
+		piece.Size = Vector3.new(
+			math.max(0.4, origSize.X * (0.15 + math.random() * 0.25)),
+			math.max(0.4, origSize.Y * (0.15 + math.random() * 0.25)),
+			math.max(0.4, origSize.Z * (0.15 + math.random() * 0.25)))
+		piece.CFrame = origCF * CFrame.new(px, py, pz)
+			* CFrame.Angles(math.random() * 2, math.random() * 2, math.random() * 2)
+		piece.Color = color
+		piece.Material = material
+		piece.CanCollide = false
+		piece.CanQuery = false
+		piece.CanTouch = false
+		piece.CastShadow = false
+		piece.Anchored = false
+		piece.Parent = ghostFolder
+		local outward = (piece.Position - origCF.Position)
+		piece.AssemblyLinearVelocity = outward.Unit * (10 + math.random() * 12) + Vector3.new(0, 8 + math.random() * 8, 0)
+		piece.AssemblyAngularVelocity = Vector3.new(
+			(math.random() - 0.5) * 16, (math.random() - 0.5) * 16, (math.random() - 0.5) * 16)
+		TweenService:Create(piece, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+			{ Transparency = 1 }):Play()
+		Debris:AddItem(piece, 1.5)
+	end
+
+	-- fade back in after RESPAWN_TIME seconds
+	task.delay(CFG.RESPAWN_TIME, function()
+		if part.Parent then
+			TweenService:Create(part, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+				{ Transparency = origTrans }):Play()
+		end
+		task.delay(0.8, function()
+			if part.Parent then
+				part.CanCollide = origCollide
+				part.CanQuery = origQuery
+			end
+			smashed[part] = nil
+		end)
+	end)
+end
+
+local function smashWall(part)
+	if smashed[part] then return end
+	smashed[part] = true
+	smashBusy += 1
+
+	task.spawn(function()
+		local hits = hitsFor(part)
+		local box = Instance.new("Part")
+		box.Name = "NaoyaBreakBox"
+		box.Anchored = false
+		box.Massless = true
+		box.CanCollide = false
+		box.CanQuery = false
+		box.CanTouch = false
+		box.CastShadow = false
+		box.Material = Enum.Material.Neon
+		box.Color = CFG.SMASH_COLOR
+		box.Transparency = 0.25
+		local sel = Instance.new("SelectionBox")
+		sel.Color3 = CFG.SMASH_OUTLINE
+		sel.LineThickness = 0.08
+		sel.SurfaceTransparency = 1
+		sel.Adornee = box
+		sel.Parent = box
+		box.Parent = ghostFolder
+
+		-- the box sits on the object being broken
+		box.CFrame = part.CFrame
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = part
+		weld.Part1 = box
+		weld.Parent = box
+
+		-- full leg kick animation while the wall is being broken
+		local kickTrack
+		pcall(function()
+			local a = Instance.new("Animation")
+			a.AnimationId = "rbxassetid://" .. CFG.KICK_ANIM_ID
+			kickTrack = animator:LoadAnimation(a)
+			kickTrack.Priority = Enum.AnimationPriority.Action4
+			kickTrack.Looped = false
+			kickTrack:Play(0.05)
+		end)
+
+		local dur = CFG.SMASH_FIRST
+		for _ = 1, hits do
+			if not part.Parent then break end
+			-- box starts big and closes in onto the wall
+			box.Size = part.Size * 1.6
+			local tw = TweenService:Create(box,
+				TweenInfo.new(dur, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+				{ Size = part.Size * 1.02 })
+			tw:Play()
+			tw.Completed:Wait()
+			playImpactSound(2 + math.random())
+			hitStopUntil = os.clock() + CFG.HIT_STOP
+			pinkPulse(0.15)
+			dur *= CFG.SMASH_SPEEDUP
+		end
+
+		if kickTrack then kickTrack:Stop(0.1) end
+		if part.Parent then
+			shatterWall(part, box)
+		else
+			box:Destroy()
+		end
+		smashBusy = math.max(0, smashBusy - 1)
+		if active then
+			speed = math.min(CFG.MAX_SPEED, speed + CFG.BREAK_BOOST)
+		end
+	end)
+end
+
+------------------------------------------------------------------
+-- ACTIVATE / DEACTIVATE
+------------------------------------------------------------------
+local function deactivate()
+	active = false
+	if hum and hum.Parent then
+		hum.WalkSpeed = baseWalkSpeed
+		hum.AutoRotate = true
+		hum:Move(Vector3.zero, false)
+	end
+	if runTrack and runTrack.IsPlaying then runTrack:Stop(0.2) end
+	hideGhosts()
+	if dust then dust.Rate = 0 end
+	local cam = Workspace.CurrentCamera
+	if cam then cam.FieldOfView = baseFov end
+end
+
+local function activate()
+	local cam = Workspace.CurrentCamera
+	active = true
+	speed = CFG.MIN_SPEED
+	baseWalkSpeed = hum.WalkSpeed
+	baseFov = cam and cam.FieldOfView or 70
+	local look = flat(root.CFrame.LookVector)
+	velDir = look.Magnitude > 0.01 and look.Unit or Vector3.new(0, 0, -1)
+	heading = velDir
+	driftSmooth, offCourse, spawnTimer = 0, 0, 0
+	hum.AutoRotate = false
+end
+
+local function toggle()
+	if frozen or not hum or hum.Health <= 0 then return end
+	if os.clock() < cooldownEnd then return end
+	if active then deactivate() else activate() end
+end
+
+------------------------------------------------------------------
+-- GUI
+------------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "NaoyaProjectionGui"
+gui.ResetOnSpawn = false
+local okParent = pcall(function() gui.Parent = (gethui and gethui()) or CoreGui end)
+if not okParent or not gui.Parent then gui.Parent = player:WaitForChild("PlayerGui") end
+
+local button = Instance.new("TextButton")
+button.Size = UDim2.fromOffset(180, 58)
+button.Position = UDim2.new(1, -210, 0.5, -29)
+button.BackgroundColor3 = Color3.fromRGB(15, 25, 50)
+button.TextColor3 = Color3.new(1, 1, 1)
+button.Font = Enum.Font.GothamBold
+button.TextSize = 15
+button.Text = "Projection Sorcery\nOFF"
+button.AutoButtonColor = true
+button.Parent = gui
+Instance.new("UICorner", button).CornerRadius = UDim.new(0, 10)
+local stroke = Instance.new("UIStroke", button)
+stroke.Color = CFG.GHOST_COLOR
+stroke.Thickness = 2
+
+local dragging, dragStart, startPos, moved = false, nil, nil, false
+
+track(button.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging, moved = true, false
+		dragStart, startPos = i.Position, button.Position
+		local c; c = i.Changed:Connect(function()
+			if i.UserInputState == Enum.UserInputState.End then dragging = false c:Disconnect() end
+		end)
+	end
+end))
+track(UserInputService.InputChanged:Connect(function(i)
+	if dragging and (i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseMovement) then
+		local d = i.Position - dragStart
+		if d.Magnitude > 8 then moved = true end
+		if moved then
+			button.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end
+end))
+track(button.Activated:Connect(function()
+	if not moved then toggle() end
+end))
+
+local function updateGui(now)
+	if frozen then
+		button.Text = "FRAME\nFROZEN"
+		stroke.Color = Color3.fromRGB(255, 200, 60)
+	elseif now < cooldownEnd then
+		button.Text = "Projection Sorcery\nCOOLDOWN " .. math.ceil(cooldownEnd - now) .. "s"
+		stroke.Color = Color3.fromRGB(120, 120, 120)
+	elseif active then
+		button.Text = "Projection Sorcery\nON  (" .. math.floor(speed) .. ")"
+		stroke.Color = CFG.GHOST_COLOR
+	else
+		button.Text = "Projection Sorcery\nOFF"
+		stroke.Color = CFG.GHOST_COLOR
+	end
+end
+
+------------------------------------------------------------------
+-- MAIN LOOP
+------------------------------------------------------------------
+local function isPlayerPart(inst)
+	local m = inst:FindFirstAncestorOfClass("Model")
+	while m do
+		if m:FindFirstChildOfClass("Humanoid") then return true end
+		m = m.Parent and m.Parent:FindFirstAncestorOfClass("Model")
+	end
+	return false
+end
+
+local function step(dt)
+	local now = os.clock()
+	updateGui(now)
+	if not (hum and hum.Parent and root and root.Parent) or hum.Health <= 0 then return end
+
+	if frozen then
+		if freezeHighlight then
+			local on = math.floor(now * 24) % 2 == 0
+			freezeHighlight.FillColor = on and Color3.fromRGB(255, 200, 60) or Color3.new(0, 0, 0)
+		end
+		if not cracked and freezeEnd - now < 0.7 then
+			cracked = true
+			addCracks()
+		end
+		if now >= freezeEnd then endFreeze(true) end
+		return
+	end
+	if not active then return end
+
+	-- hit-stop: body stops dead on a wall hit, then resumes
+	if now < hitStopUntil or smashBusy > 0 then
+		hum:Move(Vector3.zero, false)
+		hum.WalkSpeed = 0
+		return
+	end
+
+	local cam = Workspace.CurrentCamera
+	local grounded = hum.FloorMaterial ~= Enum.Material.Air
+	if grounded then groundOffset = math.max(1, hum.HipHeight + root.Size.Y / 2) end
+
+	-- steering input (camera relative), smoothed + deadzone
+	local input = flat(hum.MoveDirection)
+	if input.Magnitude > 0.1 then
+		local target = input.Unit
+		if angleBetween(heading, target) > CFG.STICK_DEADZONE then
+			local nh = heading:Lerp(target, math.min(1, dt * CFG.STEER_SMOOTH))
+			if nh.Magnitude < 0.001 then nh = Vector3.new(-heading.Z, 0, heading.X) end
+			heading = nh.Unit
+		end
+	end
+
+	-- momentum turns slowly at high speed = drift
+	local turnRate = CFG.TURN_BASE / (1 + speed / CFG.GRIP)
+	local ang = angleBetween(velDir, heading)
+	if ang > 0.001 then
+		local alpha = math.clamp(turnRate * dt / ang, 0, 1)
+		local nd = velDir:Lerp(heading, alpha)
+		if nd.Magnitude < 0.001 then nd = Vector3.new(-velDir.Z, 0, velDir.X) end
+		velDir = nd.Unit
+	end
+	local drift = angleBetween(velDir, heading)
+	driftSmooth += (drift - driftSmooth) * math.min(1, dt * 8)
+
+	-- speed
+	local accel = CFG.ACCEL_BASE + speed * CFG.ACCEL_SCALE
+	if drift > CFG.DRIFT_START then
+		speed -= drift * speed * CFG.DRIFT_DRAG * dt
+		accel = 0
+	else
+		speed += accel * dt
+	end
+	speed -= offCourse * CFG.OFF_BRAKE * dt
+	offCourse *= (1 - math.min(1, dt * 1.5))
+	speed = math.clamp(speed, CFG.MIN_SPEED, CFG.MAX_SPEED)
+
+	-- apply movement
+	hum.WalkSpeed = speed
+	hum:Move(velDir, false)
+	local look = flat(root.CFrame.LookVector)
+	local newLook = look:Lerp(heading, math.min(1, dt * 12))
+	if newLook.Magnitude > 0.01 then
+		root.CFrame = CFrame.lookAt(root.Position, root.Position + newLook.Unit)
+	end
+
+	-- run animation
+	if runTrack then
+		if grounded and speed > 20 then
+			if not runTrack.IsPlaying then runTrack:Play(0.15) end
+			runTrack:AdjustSpeed(math.clamp(speed / CFG.RUN_ANIM_REF, 0.8, 2.2))
+		elseif runTrack.IsPlaying then
+			runTrack:Stop(0.15)
+		end
+	end
+
+	-- wall check: something solid right in front of you at speed -> smash it
+	if speed > CFG.SMASH_MIN_SPEED then
+		local reach = speed * dt + 2.5
+		local hit = Workspace:Raycast(root.Position, velDir * reach, rayParams)
+		if hit and hit.Instance:IsA("BasePart") and not hit.Instance:IsA("Terrain")
+			and hit.Instance.CanCollide and not smashed[hit.Instance] and not isPlayerPart(hit.Instance) then
+			smashWall(hit.Instance)
+		end
+	end
+
+	-- prediction frames (closer, fewer, snap in front of you)
+	spawnTimer += dt
+	if speed >= CFG.GHOST_MIN_SPEED and spawnTimer >= CFG.GHOST_INTERVAL then
+		spawnTimer = 0
+		local t = CFG.GHOST_LEAD
+		local p, d = predict(t)
+		local hitDown = Workspace:Raycast(p + Vector3.new(0, 30, 0), Vector3.new(0, -80, 0), rayParams)
+		local y = hitDown and (hitDown.Position.Y + groundOffset) or root.Position.Y
+		spawnGhost(Vector3.new(p.X, y, p.Z), d, now + t)
+	end
+
+	for _, g in ipairs(ghosts) do
+		if g.active and now >= g.arrive then
+			g.active = false
+			g.model.Parent = nil
+			-- while you are busy breaking a wall you are stuck, so don't punish that
+			if smashBusy == 0 then
+				local d = flat(root.Position - g.pos)
+				local lon = d:Dot(g.dir)
+				local lat = (d - g.dir * lon).Magnitude
+				local err = math.sqrt(lat * lat + (lon * 0.5) ^ 2)
+				err = math.max(0, err - CFG.ERROR_TOLERANCE)
+				offCourse = math.max(offCourse, err)
+				-- missing a frame now gives you a speed boost instead of freezing you
+				if err > CFG.FREEZE_ERROR then
+					speed = math.min(CFG.MAX_SPEED, speed + CFG.FRAME_MISS_BOOST)
+					offCourse = 0
+				end
+			end
+		end
+	end
+
+	-- dust trail
+	local s = math.clamp(speed / CFG.MAX_SPEED, 0, 1)
+	local turn = math.clamp(driftSmooth / 1.2, 0, 1)
+	if dust and grounded and speed > 25 then
+		local size = (1.2 + 3.5 * s) * (1 + turn * 1.2)
+		dust.Rate = 20 + 140 * s * (1 + turn * 1.5)
+		dust.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, size * 0.5),
+			NumberSequenceKeypoint.new(1, size * 2),
+		})
+		dust.Lifetime = NumberRange.new(0.5 + 0.5 * s, 0.9 + 0.9 * s)
+		dust.Speed = NumberRange.new(2 + 4 * turn, 6 + 10 * turn)
+		if turn > 0.4 then dust:Emit(math.floor(3 + 8 * s * turn)) end
+	elseif dust then
+		dust.Rate = 0
+	end
+
+	-- speed FOV
+	if cam then
+		local target = baseFov + CFG.FOV_BOOST * ((speed - CFG.MIN_SPEED) / (CFG.MAX_SPEED - CFG.MIN_SPEED))
+		cam.FieldOfView += (target - cam.FieldOfView) * math.min(1, dt * 4)
+	end
+end
+
+RunService:BindToRenderStep("NaoyaProjection", Enum.RenderPriority.Character.Value + 1, step)
+
+------------------------------------------------------------------
+-- CHARACTER SETUP / RESPAWN
+------------------------------------------------------------------
+local charConn
+
+local function resetCharacterState()
+	if active then deactivate() end
+	if frozen then endFreeze(false) end
+	for _, g in ipairs(ghosts) do g.model:Destroy() end
+	ghosts = {}
+	if ghostTemplate then ghostTemplate:Destroy() ghostTemplate = nil end
+	if dust then dust:Destroy() dust = nil end
+	if dustAttachment then dustAttachment:Destroy() dustAttachment = nil end
+	if runTrack then runTrack:Stop(0) runTrack = nil end
+	if charConn then charConn:Disconnect() charConn = nil end
+	smashBusy = 0
+end
+
+local function setupCharacter(char)
+	resetCharacterState()
+	character = char
+	hum = char:WaitForChild("Humanoid")
+	root = char:WaitForChild("HumanoidRootPart")
+	animator = hum:FindFirstChildOfClass("Animator") or hum:WaitForChild("Animator", 3)
+	if not animator then animator = Instance.new("Animator") animator.Parent = hum end
+	baseWalkSpeed = hum.WalkSpeed
+	rayParams.FilterDescendantsInstances = { char, ghostFolder }
+	applyAnimations()
+	buildGhosts()
+	buildDust()
+	charConn = hum.Died:Connect(function()
+		if active then deactivate() end
+		if frozen then endFreeze(false) end
+	end)
+end
+
+buildFX()
+
+track(player.CharacterAdded:Connect(function(c) task.spawn(setupCharacter, c) end))
+if player.Character then task.spawn(setupCharacter, player.Character) end
+
+------------------------------------------------------------------
+-- CLEANUP HOOK
+------------------------------------------------------------------
+env.NaoyaCleanup = function()
+	pcall(function() RunService:UnbindFromRenderStep("NaoyaProjection") end)
+	pcall(resetCharacterState)
+	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+	pcall(function() gui:Destroy() end)
+	pcall(function() ghostFolder:Destroy() end)
+	pcall(function() if tintEffect then tintEffect:Destroy() end end)
+end
