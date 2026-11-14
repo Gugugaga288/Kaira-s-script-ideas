@@ -1,0 +1,1670 @@
+--[[
+	Dimension Workbench (Rick & Morty style) - client-side, made for Delta  (v3)
+
+	- Side panel (right edge): pick a dimension. Each one has its own look and
+	  floating materials. Walk into a material to collect it. They respawn.
+	- "Bag" button shows what you have collected.
+	- Equip the "Workbench" tool: a bench appears in front of you. Pick an item
+	  from the menu (it costs materials), then drag the glowing parts onto the blue outlines.
+	- Finished items are added to your backpack.
+	- Portal Gun: tap/click to shoot portal 1, then portal 2. Portals can even link
+	  two different dimensions together.
+
+	Re-executing the script cleans up the old run first.
+
+	HOW TO ADD MORE
+	  * New item:      add a parts list (like GUN / LANTERN), then add an entry to RECIPES.
+	  * New material:  add to MATERIALS + MAT_ORDER + NODE_SHAPES, then use it in a dimension's nodes list.
+	  * New dimension: copy one entry in DIMENSIONS (give it a new id, seed and look).
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+local env = (getgenv and getgenv()) or _G
+
+if env.__PortalGunCleanup then
+	pcall(env.__PortalGunCleanup)
+end
+
+------------------------------------------------------------------
+-- SETTINGS
+------------------------------------------------------------------
+local SNAP_DIST = 1.5        -- how close a part must be to snap (studs)
+local TOUCH_LIFT = 70        -- on touch, the part floats this many pixels above your finger
+local BENCH_DISTANCE = 14    -- how far in front of you the workbench appears
+local COLLECT_RADIUS = 6     -- how close you must be to pick up a material
+local RESPAWN_TIME = 25      -- seconds until a collected material comes back
+local PORTAL_W, PORTAL_H = 5, 7.5
+
+local GREEN = Color3.fromRGB(110, 255, 80)
+local BLUE = Color3.fromRGB(0, 170, 255)
+
+------------------------------------------------------------------
+-- SHARED CONSTANTS
+------------------------------------------------------------------
+local WHITE = Color3.fromRGB(236, 238, 240)
+local GREY = Color3.fromRGB(150, 155, 160)
+local SILVER = Color3.fromRGB(205, 208, 212)
+local DARK = Color3.fromRGB(35, 35, 40)
+local CYAN = Color3.fromRGB(80, 220, 255)
+local PALE_GREEN = Color3.fromRGB(200, 255, 190)
+
+local ROT = CFrame.Angles(0, math.pi / 2, 0)      -- lays a cylinder along Z
+local UPRIGHT = CFrame.Angles(0, 0, math.pi / 2)  -- stands a cylinder up (along Y)
+
+local Block, Cyl, Ball = Enum.PartType.Block, Enum.PartType.Cylinder, Enum.PartType.Ball
+local Plastic, Metal, Neon, Glass = Enum.Material.SmoothPlastic, Enum.Material.Metal, Enum.Material.Neon, Enum.Material.Glass
+
+local function V(x, y, z) return Vector3.new(x, y, z) end
+
+------------------------------------------------------------------
+-- MATERIALS (what you collect)
+------------------------------------------------------------------
+local MATERIALS = {
+	scrap   = { name = "Scrap Metal",   color = Color3.fromRGB(170, 175, 185) },
+	circuit = { name = "Circuit Board", color = Color3.fromRGB(70, 210, 120) },
+	fluid   = { name = "Portal Fluid",  color = Color3.fromRGB(110, 255, 80) },
+	goo     = { name = "Mutant Goo",    color = Color3.fromRGB(215, 255, 60) },
+	crystal = { name = "Void Crystal",  color = Color3.fromRGB(175, 115, 255) },
+	plasma  = { name = "Plasma Core",   color = Color3.fromRGB(255, 140, 40) },
+}
+local MAT_ORDER = { "scrap", "circuit", "fluid", "goo", "crystal", "plasma" }
+
+local inv = {}
+for _, id in ipairs(MAT_ORDER) do inv[id] = 0 end
+
+-- how each material looks floating in a dimension (parts are relative to the middle)
+local NODE_SHAPES = {
+	scrap = function(add)
+		add(Cyl, V(0.35, 1.5, 1.5), CFrame.new(), Color3.fromRGB(165, 170, 180), Metal)
+		add(Cyl, V(0.5, 0.6, 0.6), CFrame.new(), DARK, Metal)
+		for _, o in ipairs({ V(0, 0.85, 0), V(0, -0.85, 0), V(0, 0, 0.85), V(0, 0, -0.85) }) do
+			add(Block, V(0.35, 0.35, 0.35), CFrame.new(o), Color3.fromRGB(165, 170, 180), Metal)
+		end
+	end,
+	circuit = function(add)
+		add(Block, V(1.5, 0.14, 1.1), CFrame.new(), Color3.fromRGB(30, 140, 70), Plastic)
+		add(Block, V(0.5, 0.12, 0.5), CFrame.new(0, 0.12, 0), DARK, Plastic)
+		add(Block, V(0.12, 0.1, 0.12), CFrame.new(0.5, 0.1, 0.3), Color3.fromRGB(255, 210, 60), Neon)
+		add(Block, V(0.12, 0.1, 0.12), CFrame.new(-0.5, 0.1, -0.3), Color3.fromRGB(255, 210, 60), Neon)
+	end,
+	fluid = function(add)
+		add(Cyl, V(1.3, 0.6, 0.6), UPRIGHT, Color3.fromRGB(210, 255, 220), Glass, 0.45)
+		add(Cyl, V(0.9, 0.42, 0.42), CFrame.new(0, -0.15, 0) * UPRIGHT, GREEN, Neon)
+		add(Cyl, V(0.2, 0.5, 0.5), CFrame.new(0, 0.72, 0) * UPRIGHT, DARK, Plastic)
+	end,
+	goo = function(add)
+		add(Ball, V(0.95, 0.95, 0.95), CFrame.new(), Color3.fromRGB(215, 255, 60), Neon)
+		add(Ball, V(0.5, 0.5, 0.5), CFrame.new(0.5, -0.25, 0.1), Color3.fromRGB(190, 240, 40), Neon)
+		add(Ball, V(0.3, 0.3, 0.3), CFrame.new(-0.4, 0.3, 0.3), Color3.fromRGB(235, 255, 110), Neon)
+	end,
+	crystal = function(add)
+		local c = Color3.fromRGB(175, 115, 255)
+		add(Block, V(0.55, 1.7, 0.55), CFrame.Angles(0, math.rad(45), 0), c, Neon)
+		add(Block, V(0.35, 1.0, 0.35), CFrame.new(0.45, -0.3, 0) * CFrame.Angles(0, 0, 0.5), Color3.fromRGB(140, 90, 230), Neon)
+		add(Block, V(0.3, 0.9, 0.3), CFrame.new(-0.4, -0.35, 0.1) * CFrame.Angles(0, 0, -0.4), Color3.fromRGB(205, 160, 255), Neon)
+	end,
+	plasma = function(add)
+		add(Ball, V(1.2, 1.2, 1.2), CFrame.new(), Color3.fromRGB(255, 200, 150), Glass, 0.5)
+		add(Ball, V(0.7, 0.7, 0.7), CFrame.new(), Color3.fromRGB(255, 130, 30), Neon)
+	end,
+}
+
+------------------------------------------------------------------
+-- ITEM PART LISTS (item frame: grip at origin, front is -Z, up is +Y)
+------------------------------------------------------------------
+local GUN = {
+	{ name = "Grip",        label = "grip",           shape = Cyl,   size = V(1.3, 0.5, 0.5),    offset = CFrame.new(0, 0, 0) * UPRIGHT,       color = DARK,       material = Plastic },
+	{ name = "Pommel",      label = "round pommel",   shape = Ball,  size = V(0.6, 0.6, 0.6),    offset = CFrame.new(0, -0.68, 0),             color = Color3.fromRGB(70, 72, 80), material = Metal },
+	{ name = "Body",        label = "white body",     shape = Block, size = V(0.7, 0.7, 1.8),    offset = CFrame.new(0, 1.0, -0.35),           color = WHITE,      material = Plastic },
+	{ name = "RearHousing", label = "rear housing",   shape = Block, size = V(0.8, 0.5, 0.45),   offset = CFrame.new(0, 1.0, 0.775),           color = GREY,       material = Metal },
+	{ name = "BackCap",     label = "back cap",       shape = Cyl,   size = V(0.2, 0.42, 0.42),  offset = CFrame.new(0, 1.0, 1.1) * ROT,        color = DARK,       material = Plastic },
+	{ name = "Display",     label = "display screen", shape = Block, size = V(0.4, 0.05, 0.3),   offset = CFrame.new(0, 1.275, 0.78),          color = CYAN,       material = Neon },
+	{ name = "Barrel",      label = "barrel",         shape = Cyl,   size = V(1.3, 0.36, 0.36),  offset = CFrame.new(0, 1.0, -1.9) * ROT,      color = SILVER,     material = Metal },
+	{ name = "RingA",       label = "first ring",     shape = Cyl,   size = V(0.12, 0.5, 0.5),   offset = CFrame.new(0, 1.0, -1.45) * ROT,     color = DARK,       material = Plastic },
+	{ name = "RingB",       label = "second ring",    shape = Cyl,   size = V(0.12, 0.5, 0.5),   offset = CFrame.new(0, 1.0, -2.3) * ROT,      color = DARK,       material = Plastic },
+	{ name = "EmitterTip",  label = "emitter tip",    shape = Cyl,   size = V(0.3, 0.62, 0.62),  offset = CFrame.new(0, 1.0, -2.7) * ROT,      color = DARK,       material = Plastic },
+	{ name = "EmitterLens", label = "green lens",     shape = Cyl,   size = V(0.06, 0.44, 0.44), offset = CFrame.new(0, 1.0, -2.88) * ROT,     color = GREEN,      material = Neon },
+	{ name = "DomeBase",    label = "dome base",      shape = Cyl,   size = V(0.14, 0.7, 0.7),   offset = CFrame.new(0, 1.42, -0.8) * UPRIGHT, color = GREY,       material = Metal },
+	{ name = "Dome",        label = "glass dome",     shape = Ball,  size = V(0.8, 0.8, 0.8),    offset = CFrame.new(0, 1.8, -0.8),            color = GREEN,      material = Glass, transparency = 0.35 },
+	{ name = "DomeCore",    label = "glowing core",   shape = Ball,  size = V(0.38, 0.38, 0.38), offset = CFrame.new(0, 1.8, -0.8),            color = PALE_GREEN, material = Neon },
+	{ name = "SideButton",  label = "side button",    shape = Cyl,   size = V(0.1, 0.2, 0.2),    offset = CFrame.new(0.4, 1.0, 0.1),           color = GREEN,      material = Neon },
+}
+
+local LANTERN = {
+	{ name = "Grip",  label = "grip",         shape = Cyl,  size = V(0.9, 0.3, 0.3),   offset = CFrame.new(0, 0, 0) * UPRIGHT,    color = DARK, material = Plastic },
+	{ name = "Base",  label = "metal base",   shape = Cyl,  size = V(0.15, 1.0, 1.0),  offset = CFrame.new(0, 0.52, 0) * UPRIGHT, color = GREY, material = Metal },
+	{ name = "Core",  label = "plasma core",  shape = Ball, size = V(0.6, 0.6, 0.6),   offset = CFrame.new(0, 1.15, 0),           color = Color3.fromRGB(255, 150, 50), material = Neon },
+	{ name = "Shell", label = "glass shell",  shape = Ball, size = V(1.1, 1.1, 1.1),   offset = CFrame.new(0, 1.15, 0),           color = Color3.fromRGB(190, 230, 255), material = Glass, transparency = 0.55 },
+	{ name = "Cap",   label = "top cap",      shape = Cyl,  size = V(0.15, 0.8, 0.8),  offset = CFrame.new(0, 1.78, 0) * UPRIGHT, color = GREY, material = Metal },
+	{ name = "Loop",  label = "hanging loop", shape = Cyl,  size = V(0.08, 0.5, 0.5),  offset = CFrame.new(0, 2.0, 0),            color = DARK, material = Plastic },
+}
+
+-- spots on the table where loose parts start (x, z on the table top)
+local SLOTS = {
+	{ -8.8, 3.2 }, { -6.4, 3.4 }, { -3.6, 3.2 }, { -0.2, 3.3 }, { 2.0, 3.5 },
+	{ 3.8, 3.0 }, { 6.6, 3.2 }, { 8.9, 3.4 }, { 8.8, 1.2 }, { -8.8, 1.2 },
+	{ -6.6, 1.0 }, { 6.4, 1.1 }, { 8.8, -1.4 }, { -8.8, -1.4 }, { -6.6, -1.6 },
+	{ -4.5, -2.8 }, { -1.5, -3.0 }, { 1.5, -3.0 }, { 4.5, -2.8 },
+}
+
+------------------------------------------------------------------
+-- GENERIC HELPERS
+------------------------------------------------------------------
+local function scaleCF(cf, s)
+	return CFrame.new(cf.Position * s) * (cf - cf.Position)
+end
+
+local function halfHeight(cf, size)
+	return 0.5 * (math.abs(cf.RightVector.Y) * size.X + math.abs(cf.UpVector.Y) * size.Y + math.abs(cf.LookVector.Y) * size.Z)
+end
+
+local function hex(c)
+	return ("#%02X%02X%02X"):format(math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+end
+
+-- generic anchored part. collide/query default to false
+local function newPart(parent, shape, size, cf, color, material, transparency, collide, query)
+	local p = Instance.new("Part")
+	p.Shape = shape
+	p.Size = size
+	p.CFrame = cf
+	p.Color = color
+	p.Material = material
+	p.Transparency = transparency or 0
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Anchored = true
+	p.CanCollide = collide or false
+	p.CanQuery = query or false
+	p.CanTouch = false
+	p.Parent = parent
+	return p
+end
+
+local function makePart(def, scale)
+	local p = Instance.new("Part")
+	p.Name = def.name
+	p.Shape = def.shape
+	p.Size = def.size * scale
+	p.Color = def.color
+	p.Material = def.material
+	p.Transparency = def.transparency or 0
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	return p
+end
+
+local connections, objects = {}, {}
+local function track(c) table.insert(connections, c) return c end
+local function trackObj(o) table.insert(objects, o) return o end
+
+------------------------------------------------------------------
+-- STATE
+------------------------------------------------------------------
+local inBench, ready, dragging, dragIsTouch, traveling = false, false, false, false, false
+local step = 1
+local active = nil                       -- { recipe = ... } while building an item
+local owned = {}                         -- crafted items: owned[recipeId] = true
+local benchBuilt = false
+local benchModel, benchPivotLocal, buildFolder
+local B = CFrame.new()                   -- workbench frame (origin = middle of table top, +Z faces you)
+local camLocal = CFrame.new()
+local targetsLocal, restYs, looseParts, ghosts = {}, {}, {}, {}
+local highlight, renderConn, camTween
+local pointerPos = Vector2.zero
+local saved = {}
+local portals = {}
+local currentDim, homeCF = nil, nil      -- nil currentDim = your normal world
+local giveTools, exitBench, refreshBag, refreshRecipeMenu, updateSideButtons
+
+local portalFolder = trackObj(Instance.new("Folder"))
+portalFolder.Name = "PortalGunPortals"
+portalFolder.Parent = Workspace
+
+local dimFolder = trackObj(Instance.new("Folder"))
+dimFolder.Name = "PortalGunDimensions"
+dimFolder.Parent = Workspace
+
+------------------------------------------------------------------
+-- UI
+------------------------------------------------------------------
+local gui = trackObj(Instance.new("ScreenGui"))
+gui.Name = "PortalGunUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 20
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local function round(inst, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 10)
+	c.Parent = inst
+end
+
+local function pad(inst, n)
+	local p = Instance.new("UIPadding")
+	p.PaddingTop, p.PaddingBottom, p.PaddingLeft, p.PaddingRight = UDim.new(0, n), UDim.new(0, n), UDim.new(0, n), UDim.new(0, n)
+	p.Parent = inst
+end
+
+local function list(inst, gap, align)
+	local l = Instance.new("UIListLayout")
+	l.Padding = UDim.new(0, gap)
+	l.SortOrder = Enum.SortOrder.LayoutOrder
+	if align then l.HorizontalAlignment = align end
+	l.Parent = inst
+	return l
+end
+
+-- invisible full-screen catcher: receives every touch/click while building
+local catcher = Instance.new("Frame")
+catcher.Name = "InputCatcher"
+catcher.Size = UDim2.new(1, 0, 1, 0)
+catcher.BackgroundTransparency = 1
+catcher.BorderSizePixel = 0
+catcher.Active = true
+catcher.Visible = false
+catcher.ZIndex = 1
+catcher.Parent = gui
+
+local function makeLabel(className)
+	local l = Instance.new(className)
+	l.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+	l.BackgroundTransparency = 0.2
+	l.TextColor3 = Color3.new(1, 1, 1)
+	l.Font = Enum.Font.GothamMedium
+	l.TextSize = 16
+	l.TextWrapped = true
+	l.Visible = false
+	l.BorderSizePixel = 0
+	l.ZIndex = 5
+	l.Parent = gui
+	round(l)
+	return l
+end
+
+local panel = makeLabel("TextLabel")
+panel.AnchorPoint = Vector2.new(0.5, 0)
+panel.Position = UDim2.new(0.5, 0, 0, 10)
+panel.Size = UDim2.new(0.5, 0, 0, 44)
+
+local exitBtn = makeLabel("TextButton")
+exitBtn.AnchorPoint = Vector2.new(1, 1)
+exitBtn.Position = UDim2.new(1, -16, 1, -16)
+exitBtn.Size = UDim2.new(0, 90, 0, 40)
+exitBtn.Text = "Exit"
+exitBtn.BackgroundColor3 = Color3.fromRGB(170, 40, 40)
+
+local cancelBtn = makeLabel("TextButton")
+cancelBtn.AnchorPoint = Vector2.new(0, 1)
+cancelBtn.Position = UDim2.new(0, 16, 1, -16)
+cancelBtn.Size = UDim2.new(0, 130, 0, 40)
+cancelBtn.Text = "Cancel build"
+cancelBtn.TextSize = 14
+cancelBtn.BackgroundColor3 = Color3.fromRGB(90, 60, 30)
+
+local toastLabel = makeLabel("TextLabel")
+toastLabel.AnchorPoint = Vector2.new(0.5, 1)
+toastLabel.Position = UDim2.new(0.5, 0, 1, -90)
+toastLabel.Size = UDim2.new(0.5, 0, 0, 38)
+toastLabel.ZIndex = 8
+
+local toastId = 0
+local function toast(text)
+	toastId += 1
+	local id = toastId
+	toastLabel.Text = text
+	toastLabel.Visible = true
+	task.delay(2.2, function()
+		if toastId == id then toastLabel.Visible = false end
+	end)
+end
+
+-- fade overlay for dimension travel (does not block input)
+local fade = Instance.new("Frame")
+fade.Size = UDim2.new(1, 0, 1, 0)
+fade.BackgroundColor3 = Color3.new(0, 0, 0)
+fade.BackgroundTransparency = 1
+fade.BorderSizePixel = 0
+fade.Active = false
+fade.ZIndex = 100
+fade.Parent = gui
+
+local function fadeTo(t, dur)
+	local tw = TweenService:Create(fade, TweenInfo.new(dur), { BackgroundTransparency = t })
+	tw:Play()
+	tw.Completed:Wait()
+end
+
+-- ===== side panel: dimensions + bag =====
+local side = Instance.new("Frame")
+side.Name = "DimensionPanel"
+side.AnchorPoint = Vector2.new(1, 0.5)
+side.Position = UDim2.new(1, -8, 0.5, 0)
+side.Size = UDim2.new(0, 128, 0, 0)
+side.AutomaticSize = Enum.AutomaticSize.Y
+side.BackgroundTransparency = 1
+side.ZIndex = 6
+side.Parent = gui
+list(side, 6, Enum.HorizontalAlignment.Right)
+
+local sideTitle = Instance.new("TextLabel")
+sideTitle.Size = UDim2.new(1, 0, 0, 18)
+sideTitle.BackgroundTransparency = 1
+sideTitle.Text = "DIMENSIONS"
+sideTitle.TextColor3 = Color3.fromRGB(230, 230, 240)
+sideTitle.Font = Enum.Font.GothamBold
+sideTitle.TextSize = 12
+sideTitle.LayoutOrder = 0
+sideTitle.ZIndex = 6
+sideTitle.Parent = side
+
+local sideButtons = {}
+local function makeSideButton(text, color, order)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 38)
+	b.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
+	b.BackgroundTransparency = 0.1
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 13
+	b.Text = text
+	b.LayoutOrder = order
+	b.ZIndex = 6
+	b.BorderSizePixel = 0
+	b.Parent = side
+	round(b, 8)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Thickness = 1.5
+	s.Parent = b
+	return b, s
+end
+
+-- bag panel (left of the side panel)
+local bagPanel = Instance.new("Frame")
+bagPanel.AnchorPoint = Vector2.new(1, 0.5)
+bagPanel.Position = UDim2.new(1, -144, 0.5, 0)
+bagPanel.Size = UDim2.new(0, 190, 0, 0)
+bagPanel.AutomaticSize = Enum.AutomaticSize.Y
+bagPanel.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+bagPanel.BackgroundTransparency = 0.15
+bagPanel.BorderSizePixel = 0
+bagPanel.Visible = false
+bagPanel.ZIndex = 6
+bagPanel.Parent = gui
+round(bagPanel)
+pad(bagPanel, 8)
+list(bagPanel, 4)
+
+local bagTitle = Instance.new("TextLabel")
+bagTitle.Size = UDim2.new(1, 0, 0, 20)
+bagTitle.BackgroundTransparency = 1
+bagTitle.Text = "Materials"
+bagTitle.TextColor3 = Color3.new(1, 1, 1)
+bagTitle.Font = Enum.Font.GothamBold
+bagTitle.TextSize = 15
+bagTitle.LayoutOrder = 0
+bagTitle.ZIndex = 6
+bagTitle.Parent = bagPanel
+
+local bagRows = {}
+for i, id in ipairs(MAT_ORDER) do
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 22)
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = i
+	row.ZIndex = 6
+	row.Parent = bagPanel
+
+	local swatch = Instance.new("Frame")
+	swatch.Size = UDim2.new(0, 8, 0, 18)
+	swatch.Position = UDim2.new(0, 0, 0, 2)
+	swatch.BackgroundColor3 = MATERIALS[id].color
+	swatch.BorderSizePixel = 0
+	swatch.ZIndex = 6
+	swatch.Parent = row
+	round(swatch, 3)
+
+	local nameLbl = Instance.new("TextLabel")
+	nameLbl.Size = UDim2.new(1, -60, 1, 0)
+	nameLbl.Position = UDim2.new(0, 14, 0, 0)
+	nameLbl.BackgroundTransparency = 1
+	nameLbl.Text = MATERIALS[id].name
+	nameLbl.TextColor3 = Color3.new(1, 1, 1)
+	nameLbl.Font = Enum.Font.GothamMedium
+	nameLbl.TextSize = 13
+	nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+	nameLbl.ZIndex = 6
+	nameLbl.Parent = row
+
+	local countLbl = Instance.new("TextLabel")
+	countLbl.Size = UDim2.new(0, 44, 1, 0)
+	countLbl.Position = UDim2.new(1, -44, 0, 0)
+	countLbl.BackgroundTransparency = 1
+	countLbl.Text = "0"
+	countLbl.TextColor3 = Color3.fromRGB(255, 230, 120)
+	countLbl.Font = Enum.Font.GothamBold
+	countLbl.TextSize = 14
+	countLbl.TextXAlignment = Enum.TextXAlignment.Right
+	countLbl.ZIndex = 6
+	countLbl.Parent = row
+
+	bagRows[id] = countLbl
+end
+
+function refreshBag()
+	for id, lbl in pairs(bagRows) do
+		lbl.Text = tostring(inv[id])
+	end
+	if refreshRecipeMenu then refreshRecipeMenu() end
+end
+
+-- ===== workbench recipe menu (left side, only while at the bench) =====
+local menu = Instance.new("Frame")
+menu.AnchorPoint = Vector2.new(0, 0.5)
+menu.Position = UDim2.new(0, 10, 0.5, 0)
+menu.Size = UDim2.new(0, 240, 0, 0)
+menu.AutomaticSize = Enum.AutomaticSize.Y
+menu.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+menu.BackgroundTransparency = 0.15
+menu.BorderSizePixel = 0
+menu.Visible = false
+menu.ZIndex = 6
+menu.Parent = gui
+round(menu)
+pad(menu, 8)
+list(menu, 6)
+
+local menuTitle = Instance.new("TextLabel")
+menuTitle.Size = UDim2.new(1, 0, 0, 22)
+menuTitle.BackgroundTransparency = 1
+menuTitle.Text = "Workbench - pick an item"
+menuTitle.TextColor3 = Color3.new(1, 1, 1)
+menuTitle.Font = Enum.Font.GothamBold
+menuTitle.TextSize = 15
+menuTitle.LayoutOrder = 0
+menuTitle.ZIndex = 6
+menuTitle.Parent = menu
+
+------------------------------------------------------------------
+-- HELPERS
+------------------------------------------------------------------
+local function getHumanoid()
+	local ch = player.Character
+	return ch and ch:FindFirstChildOfClass("Humanoid"), ch and ch:FindFirstChild("HumanoidRootPart")
+end
+
+local controls
+local function setControls(enabled)
+	if not controls then
+		pcall(function()
+			controls = require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 3)):GetControls()
+		end)
+	end
+	if controls then
+		pcall(function()
+			if enabled then controls:Enable() else controls:Disable() end
+		end)
+	end
+end
+
+local function canAfford(cost)
+	for id, need in pairs(cost) do
+		if (inv[id] or 0) < need then return false end
+	end
+	return true
+end
+
+local function pay(cost)
+	for id, need in pairs(cost) do inv[id] -= need end
+	refreshBag()
+end
+
+local function refund(cost)
+	for id, need in pairs(cost) do inv[id] += need end
+	refreshBag()
+end
+
+------------------------------------------------------------------
+-- PORTALS
+------------------------------------------------------------------
+local function setCurrentDim(d)
+	if currentDim == d then return end
+	currentDim = d
+	if env.__PortalGunApplyLook then env.__PortalGunApplyLook(d) end
+	updateSideButtons()
+end
+
+local function openPortal(idx, pos, normal)
+	local _, root = getHumanoid()
+	local n = normal
+	local center
+	if math.abs(normal.Y) > 0.85 then
+		-- floor / ceiling: stand the portal upright facing the player
+		local flat = root and Vector3.new(root.Position.X - pos.X, 0, root.Position.Z - pos.Z) or Vector3.zero
+		n = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+		local lift = normal.Y > 0 and PORTAL_H / 2 or -PORTAL_H / 2
+		center = pos + Vector3.new(0, lift, 0) + n * 0.3
+	else
+		center = pos + normal * 0.2
+	end
+	local cf = CFrame.lookAt(center, center + n) * CFrame.Angles(0, math.pi / 2, 0) -- cylinder axis (X) = normal
+
+	if portals[idx] then
+		portals[idx].model:Destroy()
+		portals[idx] = nil
+	end
+
+	local model = Instance.new("Model")
+	model.Name = "Portal" .. idx
+	model.Parent = portalFolder
+
+	local function disc(size, color, transparency)
+		local d = newPart(model, Cyl, Vector3.new(size.X, 0.2, 0.2), cf, color, Neon, transparency, false, false)
+		d.CastShadow = false
+		TweenService:Create(d, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = size }):Play()
+		return d
+	end
+
+	local outer = disc(V(0.3, PORTAL_H, PORTAL_W), GREEN, 0)
+	disc(V(0.45, PORTAL_H * 0.82, PORTAL_W * 0.8), Color3.fromRGB(30, 170, 50), 0.1)
+	local swirl = disc(V(0.6, PORTAL_H * 0.55, PORTAL_W * 0.5), Color3.fromRGB(190, 255, 150), 0.35)
+
+	local pe = Instance.new("ParticleEmitter")
+	pe.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+	pe.Color = ColorSequence.new(GREEN)
+	pe.LightEmission = 1
+	pe.Rate = 50
+	pe.Lifetime = NumberRange.new(0.5, 1)
+	pe.Speed = NumberRange.new(2, 5)
+	pe.SpreadAngle = Vector2.new(180, 180)
+	pe.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 0) })
+	pe.Parent = outer
+
+	local light = Instance.new("PointLight")
+	light.Color = GREEN
+	light.Range = 16
+	light.Brightness = 2
+	light.Parent = outer
+
+	-- remember which dimension this portal is in, so portals can link dimensions
+	portals[idx] = { model = model, cf = cf, swirl = swirl, dim = currentDim }
+end
+
+local spin, tpCooldown = 0, 0
+track(RunService.Heartbeat:Connect(function(dt)
+	spin += dt * 2.5
+	for i = 1, 2 do
+		local p = portals[i]
+		if p and p.swirl.Parent then
+			p.swirl.CFrame = p.cf * CFrame.Angles(spin * (i == 1 and 1 or -1), 0, 0)
+		end
+	end
+
+	if os.clock() < tpCooldown then return end
+	local _, root = getHumanoid()
+	if not root then return end
+
+	for i = 1, 2 do
+		local a, b = portals[i], portals[3 - i]
+		if a and b and a.dim == currentDim then
+			local rel = a.cf:PointToObjectSpace(root.Position)
+			if math.abs(rel.X) < 1.4 and math.abs(rel.Y) < PORTAL_H / 2 - 0.4 and math.abs(rel.Z) < PORTAL_W / 2 - 0.3 then
+				local n = b.cf.RightVector
+				local flat = Vector3.new(n.X, 0, n.Z)
+				flat = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
+				local exitPos = b.cf.Position + flat * 3.4 + Vector3.new(0, -0.5, 0)
+
+				local params = RaycastParams.new()
+				params.FilterType = Enum.RaycastFilterType.Exclude
+				params.FilterDescendantsInstances = { player.Character, portalFolder }
+				local down = Workspace:Raycast(exitPos, Vector3.new(0, -10, 0), params)
+				if down then
+					exitPos = Vector3.new(exitPos.X, down.Position.Y + 3.2, exitPos.Z)
+				end
+
+				if b.dim ~= currentDim then
+					if not currentDim then homeCF = root.CFrame end
+					setCurrentDim(b.dim)
+				end
+				root.CFrame = CFrame.lookAt(exitPos, exitPos + flat)
+				root.AssemblyLinearVelocity = Vector3.zero
+				tpCooldown = os.clock() + 1
+				break
+			end
+		end
+	end
+end))
+
+local function beam(from, to)
+	local len = (to - from).Magnitude
+	if len < 0.1 then return end
+	local b = newPart(portalFolder, Block, V(0.35, 0.35, len), CFrame.lookAt(from, to) * CFrame.new(0, 0, -len / 2), GREEN, Neon, 0, false, false)
+	TweenService:Create(b, TweenInfo.new(0.3), { Transparency = 1, Size = V(0.05, 0.05, len) }):Play()
+	Debris:AddItem(b, 0.4)
+end
+
+local nextPortal, lastShot = 1, 0
+local function firePortal(tool)
+	if os.clock() - lastShot < 0.4 then return end
+	lastShot = os.clock()
+	local char = player.Character
+	if not char then return end
+
+	local unit = mouse.UnitRay
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char, portalFolder }
+	local result = Workspace:Raycast(unit.Origin, unit.Direction * 800, params)
+
+	local lens = tool:FindFirstChild("EmitterLens")
+	local from = lens and lens.Position or (char.PrimaryPart and char.PrimaryPart.Position) or unit.Origin
+
+	if not result then
+		beam(from, unit.Origin + unit.Direction * 100)
+		toast("Aim at a surface to open a portal")
+		return
+	end
+
+	beam(from, result.Position)
+	openPortal(nextPortal, result.Position, result.Normal)
+	toast("Portal " .. nextPortal .. " opened")
+	nextPortal = nextPortal % 2 + 1
+end
+
+------------------------------------------------------------------
+-- HELD TOOLS + RECIPES
+------------------------------------------------------------------
+local function buildHeldTool(toolName, parts, setup)
+	local tool = trackObj(Instance.new("Tool"))
+	tool.Name = toolName
+	tool.ToolTip = toolName
+	tool.CanBeDropped = false
+	tool.RequiresHandle = true
+
+	-- invisible handle sits in the middle of the grip
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = V(0.4, 0.4, 0.4)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.Massless = true
+	handle.Parent = tool
+
+	for _, def in ipairs(parts) do
+		local p = makePart(def, 1)
+		p.Anchored = false
+		p.Massless = true
+		local w = Instance.new("Weld")
+		w.Part0 = handle
+		w.Part1 = p
+		w.C0 = def.offset
+		w.Parent = p
+		p.Parent = tool
+	end
+
+	if setup then setup(tool) end
+	return tool
+end
+
+local function createPortalGunTool()
+	return buildHeldTool("Portal Gun", GUN, function(tool)
+		local glow = Instance.new("PointLight")
+		glow.Color = GREEN
+		glow.Range = 8
+		glow.Brightness = 1.5
+		glow.Parent = tool:FindFirstChild("DomeCore")
+		tool.Activated:Connect(function() firePortal(tool) end)
+	end)
+end
+
+local function createLanternTool()
+	return buildHeldTool("Plasma Lantern", LANTERN, function(tool)
+		local glow = Instance.new("PointLight")
+		glow.Color = Color3.fromRGB(255, 160, 70)
+		glow.Range = 22
+		glow.Brightness = 2.5
+		glow.Parent = tool:FindFirstChild("Core")
+	end)
+end
+
+--[[ ADD YOUR ITEMS HERE
+	id          unique id
+	name        shown in the menu
+	toolName    name of the Tool in your backpack
+	cost        { materialId = amount, ... }
+	scale       size of the item on the bench (1.5 is good)
+	parts       a parts list (like GUN / LANTERN)
+	asm         where the finished item sits on the bench (CFrame relative to the table top)
+	createTool  function that returns the finished Tool
+]]
+local RECIPES = {
+	{
+		id = "portal_gun", name = "Portal Gun", toolName = "Portal Gun",
+		cost = { scrap = 8, circuit = 4, fluid = 3, crystal = 2, plasma = 1 },
+		scale = 1.5, parts = GUN,
+		asm = CFrame.new(-1.3, 1.5, -0.8) * CFrame.Angles(0, -math.pi / 2, 0),
+		createTool = createPortalGunTool,
+	},
+	{
+		id = "plasma_lantern", name = "Plasma Lantern", toolName = "Plasma Lantern",
+		cost = { scrap = 4, goo = 3, plasma = 2, crystal = 1 },
+		scale = 1.5, parts = LANTERN,
+		asm = CFrame.new(0, 0.7, -0.6),
+		createTool = createLanternTool,
+	},
+}
+
+------------------------------------------------------------------
+-- DIMENSIONS
+------------------------------------------------------------------
+local function spotFinder(rng, base, taken)
+	return function(r)
+		for _ = 1, 25 do
+			local a = rng:NextNumber() * math.pi * 2
+			local dist = 16 + rng:NextNumber() * 100
+			local x, z = base.X + math.cos(a) * dist, base.Z + math.sin(a) * dist
+			local ok = true
+			for _, t in ipairs(taken) do
+				if (t.x - x) ^ 2 + (t.z - z) ^ 2 < (t.r + r + 1.5) ^ 2 then ok = false break end
+			end
+			if ok then
+				table.insert(taken, { x = x, z = z, r = r })
+				return Vector3.new(x, base.Y, z)
+			end
+		end
+		return nil
+	end
+end
+
+local function decorJunk(ctx)
+	local f, rng = ctx.folder, ctx.rng
+	local function rust()
+		return Color3.fromRGB(rng:NextInteger(100, 150), rng:NextInteger(60, 90), rng:NextInteger(40, 60))
+	end
+	for _ = 1, 14 do -- scrap piles
+		local p = ctx.spot(4)
+		if p then
+			for k = 1, rng:NextInteger(2, 4) do
+				local sz = V(rng:NextNumber(2, 5), rng:NextNumber(1.2, 2.5), rng:NextNumber(2, 5))
+				local cf = CFrame.new(p + V(rng:NextNumber(-1, 1), (k - 1) * 2 + sz.Y / 2, rng:NextNumber(-1, 1))) * CFrame.Angles(0, rng:NextNumber(0, 6.28), 0)
+				newPart(f, Block, sz, cf, rust(), Enum.Material.CorrodedMetal, 0, true, true)
+			end
+		end
+	end
+	for _ = 1, 10 do -- tires
+		local p = ctx.spot(1.6)
+		if p then newPart(f, Cyl, V(0.9, 2.6, 2.6), CFrame.new(p + V(0, 0.45, 0)) * UPRIGHT, DARK, Plastic, 0, true, true) end
+	end
+	for _ = 1, 4 do -- rusty towers
+		local p = ctx.spot(2.5)
+		if p then
+			local h = rng:NextNumber(20, 34)
+			newPart(f, Block, V(4, h, 4), CFrame.new(p + V(0, h / 2, 0)), Color3.fromRGB(110, 70, 50), Enum.Material.CorrodedMetal, 0, true, true)
+		end
+	end
+end
+
+local function decorSwamp(ctx)
+	local f, rng = ctx.folder, ctx.rng
+	for _ = 1, 12 do -- trees
+		local p = ctx.spot(4)
+		if p then
+			local h = rng:NextNumber(8, 13)
+			newPart(f, Cyl, V(h, 1.3, 1.3), CFrame.new(p + V(0, h / 2, 0)) * UPRIGHT, Color3.fromRGB(70, 50, 35), Enum.Material.Wood, 0, true, true)
+			local s = rng:NextNumber(7, 10)
+			newPart(f, Ball, V(s, s, s), CFrame.new(p + V(0, h + 2, 0)), Color3.fromRGB(50, 130, 60), Plastic, 0, true, true)
+		end
+	end
+	for _ = 1, 10 do -- giant mushrooms
+		local p = ctx.spot(2.5)
+		if p then
+			newPart(f, Cyl, V(3, 0.9, 0.9), CFrame.new(p + V(0, 1.5, 0)) * UPRIGHT, Color3.fromRGB(235, 225, 200), Plastic, 0, true, true)
+			newPart(f, Cyl, V(0.8, 3.6, 3.6), CFrame.new(p + V(0, 3.2, 0)) * UPRIGHT, Color3.fromRGB(200, 60, 130), Plastic, 0, true, true)
+			newPart(f, Ball, V(0.6, 0.6, 0.6), CFrame.new(p + V(0.7, 3.65, 0.5)), CYAN, Neon, 0, false, false)
+			newPart(f, Ball, V(0.5, 0.5, 0.5), CFrame.new(p + V(-0.8, 3.6, -0.4)), CYAN, Neon, 0, false, false)
+		end
+	end
+	for _ = 1, 8 do -- glowing toxic pools
+		local p = ctx.spot(7)
+		if p then newPart(f, Cyl, V(0.2, 14, 14), CFrame.new(p + V(0, 0.1, 0)) * UPRIGHT, Color3.fromRGB(60, 255, 100), Neon, 0.35, false, false) end
+	end
+end
+
+local function decorVoid(ctx)
+	local f, rng = ctx.folder, ctx.rng
+	for i = 1, 22 do -- crystal spires
+		local p = ctx.spot(2)
+		if p then
+			local h = rng:NextNumber(8, 22)
+			local cf = CFrame.new(p + V(0, h / 2 - 1, 0)) * CFrame.Angles(rng:NextNumber(-0.2, 0.2), rng:NextNumber(0, 6.28), rng:NextNumber(-0.2, 0.2))
+			local c = i % 2 == 0 and Color3.fromRGB(150, 90, 255) or Color3.fromRGB(110, 150, 255)
+			newPart(f, Block, V(2, h, 2), cf, c, Neon, 0.15, true, true)
+		end
+	end
+	for _ = 1, 12 do -- floating rocks
+		local p = ctx.spot(3)
+		if p then
+			local s = rng:NextNumber(4, 9)
+			newPart(f, Ball, V(s, s, s), CFrame.new(p + V(0, rng:NextNumber(14, 32), 0)), Color3.fromRGB(60, 55, 85), Enum.Material.Slate, 0, true, true)
+		end
+	end
+end
+
+local function decorForge(ctx)
+	local f, rng = ctx.folder, ctx.rng
+	for _ = 1, 8 do -- lava pools
+		local p = ctx.spot(9)
+		if p then newPart(f, Cyl, V(0.3, 18, 18), CFrame.new(p + V(0, 0.15, 0)) * UPRIGHT, Color3.fromRGB(255, 100, 20), Neon, 0, false, false) end
+	end
+	for _ = 1, 16 do -- basalt pillars with glowing cracks
+		local p = ctx.spot(3)
+		if p then
+			local h = rng:NextNumber(10, 26)
+			newPart(f, Block, V(3, h, 3), CFrame.new(p + V(0, h / 2, 0)), Color3.fromRGB(35, 30, 32), Enum.Material.Basalt, 0, true, true)
+			newPart(f, Block, V(0.3, h * 0.6, 0.3), CFrame.new(p + V(1.55, h * 0.4, 0)), Color3.fromRGB(255, 110, 30), Neon, 0, false, false)
+		end
+	end
+	for _ = 1, 30 do -- floating embers
+		local a = rng:NextNumber() * math.pi * 2
+		local d = 10 + rng:NextNumber() * 105
+		newPart(f, Ball, V(0.5, 0.5, 0.5), CFrame.new(ctx.base + V(math.cos(a) * d, rng:NextNumber(4, 22), math.sin(a) * d)), Color3.fromRGB(255, 140, 40), Neon, 0, false, false)
+	end
+end
+
+local DIMENSIONS = {
+	{
+		id = "junkyard", name = "Scrap Junkyard", tag = "J-19", seed = 11,
+		color = Color3.fromRGB(255, 150, 60), ground = Color3.fromRGB(95, 80, 68), groundMat = Enum.Material.Slate,
+		nodes = { { "scrap", 16 }, { "circuit", 10 } }, decor = decorJunk,
+		look = { clock = 17.3, ambient = Color3.fromRGB(120, 90, 70), outdoor = Color3.fromRGB(150, 110, 80), brightness = 2,
+			density = 0.35, color = Color3.fromRGB(255, 170, 110), decay = Color3.fromRGB(255, 120, 60), haze = 2, glare = 0.2,
+			tint = Color3.fromRGB(255, 228, 205), sat = -0.05, contrast = 0.05 },
+	},
+	{
+		id = "swamp", name = "Toxic Swamp", tag = "S-7", seed = 23,
+		color = Color3.fromRGB(90, 255, 120), ground = Color3.fromRGB(45, 80, 50), groundMat = Enum.Material.Mud,
+		nodes = { { "fluid", 12 }, { "goo", 12 } }, decor = decorSwamp,
+		look = { clock = 22, ambient = Color3.fromRGB(40, 90, 50), outdoor = Color3.fromRGB(60, 120, 60), brightness = 2,
+			density = 0.5, color = Color3.fromRGB(90, 160, 90), decay = Color3.fromRGB(40, 90, 40), haze = 3, glare = 0,
+			tint = Color3.fromRGB(205, 255, 205), sat = 0.1, contrast = 0 },
+	},
+	{
+		id = "void", name = "Crystal Void", tag = "V-42", seed = 37,
+		color = Color3.fromRGB(175, 115, 255), ground = Color3.fromRGB(40, 35, 65), groundMat = Enum.Material.Slate,
+		nodes = { { "crystal", 14 }, { "plasma", 6 } }, decor = decorVoid,
+		look = { clock = 0, ambient = Color3.fromRGB(80, 50, 130), outdoor = Color3.fromRGB(90, 60, 150), brightness = 2,
+			density = 0.3, color = Color3.fromRGB(150, 110, 255), decay = Color3.fromRGB(90, 50, 200), haze = 1, glare = 0,
+			tint = Color3.fromRGB(230, 210, 255), sat = 0.2, contrast = 0.05 },
+	},
+	{
+		id = "forge", name = "Magma Forge", tag = "M-3", seed = 51,
+		color = Color3.fromRGB(255, 100, 30), ground = Color3.fromRGB(50, 40, 40), groundMat = Enum.Material.Basalt,
+		nodes = { { "plasma", 12 }, { "scrap", 8 } }, decor = decorForge,
+		look = { clock = 19.5, ambient = Color3.fromRGB(140, 60, 30), outdoor = Color3.fromRGB(170, 70, 30), brightness = 2,
+			density = 0.45, color = Color3.fromRGB(255, 110, 50), decay = Color3.fromRGB(200, 50, 20), haze = 2.5, glare = 0,
+			tint = Color3.fromRGB(255, 215, 190), sat = 0, contrast = 0.1 },
+	},
+}
+for i, d in ipairs(DIMENSIONS) do d.index = i end
+
+-- ===== atmosphere / lighting per dimension (local only) =====
+local lightBackup, atmo, atmoCreated, atmoBackup, cc
+
+local function applyLook(d)
+	if not d then
+		if lightBackup then
+			for k, v in pairs(lightBackup) do pcall(function() Lighting[k] = v end) end
+			lightBackup = nil
+		end
+		if atmo then
+			if atmoCreated then
+				atmo:Destroy()
+			elseif atmoBackup then
+				for k, v in pairs(atmoBackup) do pcall(function() atmo[k] = v end) end
+			end
+			atmo = nil
+		end
+		if cc then cc:Destroy() cc = nil end
+		return
+	end
+
+	if not lightBackup then
+		lightBackup = { ClockTime = Lighting.ClockTime, Ambient = Lighting.Ambient, OutdoorAmbient = Lighting.OutdoorAmbient, Brightness = Lighting.Brightness }
+	end
+	local L = d.look
+	Lighting.ClockTime = L.clock
+	Lighting.Ambient = L.ambient
+	Lighting.OutdoorAmbient = L.outdoor
+	Lighting.Brightness = L.brightness
+
+	if not atmo then
+		atmo = Lighting:FindFirstChildOfClass("Atmosphere")
+		if atmo then
+			atmoCreated = false
+			atmoBackup = { Density = atmo.Density, Offset = atmo.Offset, Color = atmo.Color, Decay = atmo.Decay, Glare = atmo.Glare, Haze = atmo.Haze }
+		else
+			atmoCreated = true
+			atmo = Instance.new("Atmosphere")
+			atmo.Parent = Lighting
+		end
+	end
+	atmo.Density = L.density
+	atmo.Color = L.color
+	atmo.Decay = L.decay
+	atmo.Haze = L.haze
+	atmo.Glare = L.glare
+
+	if not cc then
+		cc = Instance.new("ColorCorrectionEffect")
+		cc.Parent = Lighting
+	end
+	cc.TintColor = L.tint
+	cc.Saturation = L.sat
+	cc.Contrast = L.contrast
+end
+env.__PortalGunApplyLook = applyLook
+
+-- ===== building a dimension island =====
+local function buildNode(parent, matId, pos)
+	local model = Instance.new("Model")
+	model.Name = "Node_" .. matId
+	local pivot = newPart(model, Block, V(0.2, 0.2, 0.2), CFrame.new(), Color3.new(), Plastic, 1, false, false)
+	model.PrimaryPart = pivot
+	NODE_SHAPES[matId](function(shape, size, offset, color, material, transparency)
+		newPart(model, shape, size, offset, color, material, transparency, false, false)
+	end)
+	model.Parent = parent
+	model:PivotTo(CFrame.new(pos))
+	return model
+end
+
+local function buildDimension(d)
+	if d.built then return end
+	d.built = true
+
+	local rng = Random.new(d.seed)
+	local base = Vector3.new(d.index * 1500, 3000, 0)
+	d.base = base
+
+	local folder = Instance.new("Folder")
+	folder.Name = "Dim_" .. d.id
+	folder.Parent = dimFolder
+
+	-- island + glowing arrival pad
+	local ground = newPart(folder, Cyl, V(6, 260, 260), CFrame.new(base - V(0, 3, 0)) * UPRIGHT, d.ground, d.groundMat, 0, true, true)
+	ground.Name = "Ground"
+	newPart(folder, Cyl, V(0.2, 12, 12), CFrame.new(base + V(0, 0.1, 0)) * UPRIGHT, d.color, Neon, 0.35, false, false)
+
+	-- invisible wall so you can't walk off the edge
+	for i = 0, 23 do
+		local a = (i / 24) * math.pi * 2
+		local pos = base + V(math.cos(a) * 129, 30, math.sin(a) * 129)
+		newPart(folder, Block, V(36, 60, 2), CFrame.lookAt(pos, V(base.X, pos.Y, base.Z)), Color3.new(), Plastic, 1, true, false)
+	end
+
+	local taken = { { x = base.X, z = base.Z, r = 8 } }
+
+	-- collectible materials
+	d.nodes_built = {}
+	local nodeFolder = Instance.new("Folder")
+	nodeFolder.Name = "Nodes"
+	nodeFolder.Parent = folder
+	for _, entry in ipairs(d.nodes) do
+		local matId, count = entry[1], entry[2]
+		for _ = 1, count do
+			for _ = 1, 25 do
+				local a = rng:NextNumber() * math.pi * 2
+				local dist = 12 + rng:NextNumber() * 105
+				local x, z = base.X + math.cos(a) * dist, base.Z + math.sin(a) * dist
+				local ok = true
+				for _, t in ipairs(taken) do
+					if (t.x - x) ^ 2 + (t.z - z) ^ 2 < (t.r + 2.5) ^ 2 then ok = false break end
+				end
+				if ok then
+					table.insert(taken, { x = x, z = z, r = 2.5 })
+					local pos = Vector3.new(x, base.Y + 3.2, z)
+					table.insert(d.nodes_built, {
+						mat = matId, pos = pos, phase = rng:NextNumber() * 6.28, active = true,
+						folder = nodeFolder, model = buildNode(nodeFolder, matId, pos),
+					})
+					break
+				end
+			end
+		end
+	end
+
+	d.decor({ folder = folder, rng = rng, base = base, spot = spotFinder(rng, base, taken) })
+end
+
+-- ===== collecting =====
+local function popEffect(pos, color)
+	local p = newPart(portalFolder, Ball, V(1, 1, 1), CFrame.new(pos), color, Neon, 0.2, false, false)
+	TweenService:Create(p, TweenInfo.new(0.35), { Size = V(5, 5, 5), Transparency = 1 }):Play()
+	Debris:AddItem(p, 0.4)
+end
+
+local function collectNode(n)
+	n.active = false
+	inv[n.mat] += 1
+	refreshBag()
+	toast("+1 " .. MATERIALS[n.mat].name)
+	popEffect(n.pos, MATERIALS[n.mat].color)
+	n.model.Parent = nil
+	task.delay(RESPAWN_TIME + n.phase * 3, function()
+		pcall(function()
+			n.model.Parent = n.folder
+			n.active = true
+		end)
+	end)
+end
+
+track(RunService.Heartbeat:Connect(function()
+	local d = currentDim
+	if not d or not d.nodes_built then return end
+	local _, root = getHumanoid()
+	local t = os.clock()
+	for _, n in ipairs(d.nodes_built) do
+		if n.active then
+			n.model:PivotTo(CFrame.new(n.pos + V(0, math.sin(t * 2 + n.phase) * 0.4, 0)) * CFrame.Angles(0, t * 1.4 + n.phase, 0))
+			if root and (root.Position - n.pos).Magnitude < COLLECT_RADIUS then
+				collectNode(n)
+			end
+		end
+	end
+	-- safety: if you somehow fall off, go back to the arrival pad
+	if root and root.Position.Y < d.base.Y - 60 then
+		root.CFrame = CFrame.new(d.base + V(0, 6, 0))
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+end))
+
+-- ===== travelling =====
+function updateSideButtons()
+	for id, entry in pairs(sideButtons) do
+		local isHere = (id == "home" and currentDim == nil) or (currentDim ~= nil and currentDim.id == id)
+		entry.stroke.Thickness = isHere and 3.5 or 1.5
+		entry.button.BackgroundColor3 = isHere and Color3.fromRGB(55, 55, 75) or Color3.fromRGB(24, 24, 32)
+	end
+end
+
+local function travelTo(d)
+	if traveling then return end
+	if d == currentDim then
+		toast(d and ("You're already in " .. d.name) or "You're already home")
+		return
+	end
+	local _, root = getHumanoid()
+	if not root then return end
+
+	if inBench then
+		local hum = getHumanoid()
+		if hum then hum:UnequipTools() end
+		exitBench()
+	end
+
+	traveling = true
+	fadeTo(0, 0.25)
+	local _, root2 = getHumanoid()
+	if root2 then
+		if d then
+			buildDimension(d)
+			if not currentDim then homeCF = root2.CFrame end
+			root2.CFrame = CFrame.new(d.base + V(0, 6, 0))
+		elseif homeCF then
+			root2.CFrame = homeCF
+		end
+		root2.AssemblyLinearVelocity = Vector3.zero
+		setCurrentDim(d)
+	end
+	fadeTo(1, 0.35)
+	traveling = false
+	toast(d and ("Dimension " .. d.tag .. ": " .. d.name) or "Back home")
+end
+
+-- build the side buttons
+do
+	local bagBtn = makeSideButton("Bag", Color3.fromRGB(255, 210, 80), 1)
+	track(bagBtn.Activated:Connect(function()
+		bagPanel.Visible = not bagPanel.Visible
+	end))
+
+	local homeBtn, homeStroke = makeSideButton("Home", Color3.fromRGB(230, 230, 240), 2)
+	sideButtons.home = { button = homeBtn, stroke = homeStroke }
+	track(homeBtn.Activated:Connect(function() travelTo(nil) end))
+
+	for i, d in ipairs(DIMENSIONS) do
+		local b, s = makeSideButton(d.name, d.color, 2 + i)
+		sideButtons[d.id] = { button = b, stroke = s }
+		track(b.Activated:Connect(function() travelTo(d) end))
+	end
+	updateSideButtons()
+end
+
+------------------------------------------------------------------
+-- WORKBENCH SCENE (built in local space, then moved in front of you)
+------------------------------------------------------------------
+local function buildBench()
+	if benchBuilt then return end
+	benchBuilt = true
+
+	benchModel = trackObj(Instance.new("Model"))
+	benchModel.Name = "PortalWorkbenchScene"
+
+	local function block(name, size, pos, color, material, transparency, shape)
+		local p = newPart(benchModel, shape or Block, size, CFrame.new(pos), color, material, transparency, false, false)
+		p.Name = name
+		return p
+	end
+
+	local wood = Color3.fromRGB(150, 100, 55)
+	local darkWood = Color3.fromRGB(105, 68, 38)
+
+	-- table top surface is y = 0
+	local top = block("Top", V(20, 0.8, 9), V(0, -0.4, 0), wood, Enum.Material.WoodPlanks)
+	block("Shelf", V(18.4, 0.3, 7.4), V(0, -2.2, 0), darkWood, Enum.Material.Wood)
+	for _, sx in ipairs({ -1, 1 }) do
+		for _, sz in ipairs({ -1, 1 }) do
+			block("Leg", V(0.9, 2.6, 0.9), V(sx * 9.3, -2.1, sz * 3.9), darkWood, Enum.Material.Wood)
+		end
+	end
+
+	-- pegboard + decor so it feels like a workshop
+	block("Pegboard", V(20, 6, 0.4), V(0, 3, -4.7), Color3.fromRGB(95, 85, 70), Enum.Material.WoodPlanks)
+	block("Toolbox", V(2.6, 1.2, 1.3), V(-7.6, 0.6, -3.3), Color3.fromRGB(190, 40, 40), Metal)
+	block("ToolboxLid", V(2.7, 0.15, 1.4), V(-7.6, 1.25, -3.3), Color3.fromRGB(150, 30, 30), Metal)
+	local mug = block("Mug", V(0.8, 0.7, 0.7), V(7.8, 0.4, -3.4), Color3.fromRGB(240, 240, 240), Plastic, 0, Cyl)
+	mug.CFrame = CFrame.new(7.8, 0.4, -3.4) * UPRIGHT
+	block("Wrench", V(0.25, 2.6, 0.12), V(5.5, 3.6, -4.45), Color3.fromRGB(190, 195, 200), Metal)
+	block("Hammerhead", V(1.3, 0.6, 0.25), V(3.2, 4.2, -4.45), Color3.fromRGB(80, 82, 90), Metal)
+	block("HammerHandle", V(0.25, 2.4, 0.2), V(3.2, 3.0, -4.45), darkWood, Enum.Material.Wood)
+
+	local lamp = block("Lamp", V(1, 1, 1), V(0, 9, 2), WHITE, Plastic, 1)
+	local l = Instance.new("PointLight")
+	l.Brightness = 2
+	l.Range = 45
+	l.Color = Color3.fromRGB(255, 240, 210)
+	l.Parent = lamp
+
+	benchModel.PrimaryPart = top
+	benchPivotLocal = top.CFrame
+	camLocal = CFrame.lookAt(V(0, 6, 12), V(0, 1.8, 0))
+end
+
+-- puts the bench on the ground in front of the player, facing them
+local function computeFrame()
+	local _, root = getHumanoid()
+	local pos = root and root.Position or V(0, 5, 0)
+	local look = root and root.CFrame.LookVector or V(0, 0, -1)
+	local f = Vector3.new(look.X, 0, look.Z)
+	f = f.Magnitude > 0.05 and f.Unit or V(0, 0, -1)
+
+	local p = pos + f * BENCH_DISTANCE
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { player.Character, portalFolder, benchModel }
+	local hit = Workspace:Raycast(Vector3.new(p.X, pos.Y + 2, p.Z), V(0, -60, 0), params)
+	local groundY = hit and hit.Position.Y or (pos.Y - 3)
+
+	local origin = Vector3.new(p.X, groundY + 3.4, p.Z)
+	return CFrame.lookAt(origin, origin + f)
+end
+
+local function targetWorld(i)
+	return B * targetsLocal[i]
+end
+
+local function clearStepVisuals()
+	if highlight then
+		highlight:Destroy()
+		highlight = nil
+	end
+	for i, g in pairs(ghosts) do
+		g:Destroy()
+		ghosts[i] = nil
+	end
+end
+
+local function clearBuild()
+	clearStepVisuals()
+	if buildFolder then buildFolder:Destroy() buildFolder = nil end
+	targetsLocal, restYs, looseParts, ghosts = {}, {}, {}, {}
+	active = nil
+	step = 1
+	dragging = false
+end
+
+local function showMenu()
+	panel.Text = "Workbench: choose an item to craft"
+	cancelBtn.Visible = false
+	refreshRecipeMenu()
+	menu.Visible = true
+end
+
+local function showStep()
+	clearStepVisuals()
+	if not active then return end
+	local recipe = active.recipe
+	if step > #recipe.parts then return end
+	local def = recipe.parts[step]
+
+	local g = makePart(def, recipe.scale)
+	g.Name = "Ghost"
+	g.Color = BLUE
+	g.Material = Neon
+	g.Transparency = 0.55
+	g.CFrame = targetWorld(step)
+	g.Parent = buildFolder
+	ghosts[step] = g
+
+	pcall(function()
+		local hl = Instance.new("Highlight")
+		hl.Adornee = looseParts[step]
+		hl.FillColor = Color3.fromRGB(255, 220, 0)
+		hl.FillTransparency = 0.5
+		hl.OutlineColor = Color3.new(1, 1, 1)
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Parent = looseParts[step]
+		highlight = hl
+	end)
+
+	panel.Text = ("%s - part %d/%d: drag the %s onto the blue outline"):format(recipe.name, step, #recipe.parts, def.label)
+end
+
+local function startBuild(recipe)
+	clearBuild()
+	buildFolder = Instance.new("Folder")
+	buildFolder.Name = "Build"
+	buildFolder.Parent = benchModel
+	active = { recipe = recipe }
+	step = 1
+
+	for i, def in ipairs(recipe.parts) do
+		local target = recipe.asm * scaleCF(def.offset, recipe.scale)
+		targetsLocal[i] = target
+		local p = makePart(def, recipe.scale)
+		restYs[i] = halfHeight(target, p.Size) + 0.03
+		local slot = SLOTS[i]
+		p.CFrame = B * (CFrame.new(slot[1], restYs[i], slot[2]) * (target - target.Position))
+		p.Parent = buildFolder
+		looseParts[i] = p
+	end
+
+	menu.Visible = false
+	cancelBtn.Visible = true
+	showStep()
+end
+
+local function finishCrafting(recipe)
+	owned[recipe.id] = true
+	panel.Text = recipe.name .. " crafted!"
+	task.delay(1.3, function()
+		giveTools()
+		toast(recipe.name .. " added to your backpack")
+		clearBuild()
+		local hum = getHumanoid()
+		if hum then hum:UnequipTools() end
+		exitBench()
+	end)
+end
+
+local function snapPart()
+	local i = step
+	local part = looseParts[i]
+	local recipe = active.recipe
+	dragging = false
+
+	TweenService:Create(part, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { CFrame = targetWorld(i) }):Play()
+
+	local hl = highlight
+	highlight = nil
+	if hl then
+		hl.FillColor = BLUE
+		hl.FillTransparency = 0.2
+		TweenService:Create(hl, TweenInfo.new(0.5), { FillTransparency = 1, OutlineTransparency = 1 }):Play()
+		Debris:AddItem(hl, 0.6)
+	end
+
+	if ghosts[i] then
+		ghosts[i]:Destroy()
+		ghosts[i] = nil
+	end
+
+	step = i + 1
+	if step > #recipe.parts then
+		finishCrafting(recipe)
+	else
+		showStep()
+	end
+end
+
+local function dropPart()
+	if not dragging then return end
+	dragging = false
+	local part = looseParts[step]
+	if not part or not targetsLocal[step] then return end
+
+	if (part.Position - targetWorld(step).Position).Magnitude < SNAP_DIST then
+		snapPart()
+	else
+		-- let it fall back onto the table
+		local rest = Vector3.new(part.Position.X, B.Y + restYs[step], part.Position.Z)
+		TweenService:Create(part, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = rest }):Play()
+	end
+end
+
+local function planeHit(screenPos, worldY)
+	local ray = Workspace.CurrentCamera:ScreenPointToRay(screenPos.X, screenPos.Y)
+	local d = ray.Direction
+	if math.abs(d.Y) < 0.01 then return nil end
+	local t = (worldY - ray.Origin.Y) / d.Y
+	if t < 0 then return nil end
+	return ray.Origin + d * t
+end
+
+local function onRender()
+	if not ready then return end
+	local part, ghost, tLocal = looseParts[step], ghosts[step], targetsLocal[step]
+	if not (part and tLocal) then return end
+	local tWorld = B * tLocal
+
+	if dragging then
+		local p = dragIsTouch and (pointerPos + Vector2.new(0, -TOUCH_LIFT)) or pointerPos
+		local hit = planeHit(p, tWorld.Position.Y)
+		if hit then
+			local lp = B:PointToObjectSpace(hit)
+			local goal = B:PointToWorldSpace(Vector3.new(math.clamp(lp.X, -9.4, 9.4), tLocal.Position.Y, math.clamp(lp.Z, -4.1, 4.1)))
+			part.Position = part.Position:Lerp(goal, 0.45)
+		end
+	end
+
+	if ghost then
+		local near = dragging and (part.Position - ghost.Position).Magnitude < SNAP_DIST
+		ghost.Transparency = near and 0.2 or (0.55 + 0.12 * math.sin(os.clock() * 4))
+	end
+end
+
+local function tryCraft(recipe)
+	if owned[recipe.id] then
+		toast("You already crafted the " .. recipe.name)
+		return
+	end
+	if not canAfford(recipe.cost) then
+		toast("Not enough materials - explore the dimensions!")
+		return
+	end
+	pay(recipe.cost)
+	startBuild(recipe)
+end
+
+function refreshRecipeMenu()
+	for _, c in ipairs(menu:GetChildren()) do
+		if c:GetAttribute("RecipeButton") then c:Destroy() end
+	end
+	for i, r in ipairs(RECIPES) do
+		local btn = Instance.new("TextButton")
+		btn:SetAttribute("RecipeButton", true)
+		btn.Size = UDim2.new(1, 0, 0, 0)
+		btn.AutomaticSize = Enum.AutomaticSize.Y
+		btn.BackgroundColor3 = Color3.fromRGB(36, 36, 48)
+		btn.BorderSizePixel = 0
+		btn.RichText = true
+		btn.TextWrapped = true
+		btn.TextXAlignment = Enum.TextXAlignment.Left
+		btn.TextYAlignment = Enum.TextYAlignment.Top
+		btn.TextColor3 = Color3.new(1, 1, 1)
+		btn.Font = Enum.Font.GothamMedium
+		btn.TextSize = 13
+		btn.LayoutOrder = i
+		btn.ZIndex = 6
+
+		local lines = { "<b>" .. r.name .. "</b>" }
+		if owned[r.id] then
+			table.insert(lines, '<font color="#8AD4FF">Crafted - check your backpack</font>')
+		else
+			for _, id in ipairs(MAT_ORDER) do
+				local need = r.cost[id]
+				if need then
+					local have = inv[id]
+					table.insert(lines, ('<font color="%s">%s %d/%d</font>'):format(have >= need and "#7CFF7C" or "#FF8080", MATERIALS[id].name, have, need))
+				end
+			end
+			if canAfford(r.cost) then
+				table.insert(lines, '<font color="#FFE066"><b>Tap to build</b></font>')
+			end
+		end
+		btn.Text = table.concat(lines, "\n")
+
+		btn.Parent = menu
+		round(btn, 8)
+		pad(btn, 8)
+		btn.Activated:Connect(function() tryCraft(r) end)
+	end
+end
+
+local function enterBench()
+	if inBench then return end
+	buildBench()
+	inBench = true
+	ready = false
+	dragging = false
+
+	B = computeFrame()
+	benchModel.Parent = Workspace
+	benchModel:PivotTo(B * benchPivotLocal)
+
+	local cam = Workspace.CurrentCamera
+	local hum = getHumanoid()
+	saved.fov = cam.FieldOfView
+	if hum then
+		saved.walk, saved.jp, saved.jh = hum.WalkSpeed, hum.JumpPower, hum.JumpHeight
+		hum.WalkSpeed = 0
+		hum.JumpPower = 0
+		hum.JumpHeight = 0
+	end
+	setControls(false)
+	cam.CameraType = Enum.CameraType.Scriptable
+
+	side.Visible = false
+	bagPanel.Visible = false
+	panel.Visible = true
+	exitBtn.Visible = true
+	catcher.Visible = true
+	if active then
+		cancelBtn.Visible = true
+		showStep()
+	else
+		showMenu()
+	end
+
+	camTween = TweenService:Create(cam, TweenInfo.new(1.2, Enum.EasingStyle.Quart, Enum.EasingDirection.InOut), {
+		CFrame = B * camLocal,
+		FieldOfView = 55,
+	})
+	camTween:Play()
+	task.delay(1.3, function()
+		if inBench then ready = true end
+	end)
+
+	renderConn = RunService.RenderStepped:Connect(onRender)
+end
+
+function exitBench()
+	if not inBench then return end
+	inBench, ready = false, false
+
+	if dragging then
+		dragging = false
+		local part = looseParts[step]
+		if part and restYs[step] then
+			part.Position = Vector3.new(part.Position.X, B.Y + restYs[step], part.Position.Z)
+		end
+	end
+
+	if camTween then camTween:Cancel() end
+	if renderConn then
+		renderConn:Disconnect()
+		renderConn = nil
+	end
+	panel.Visible = false
+	exitBtn.Visible = false
+	cancelBtn.Visible = false
+	menu.Visible = false
+	catcher.Visible = false
+	side.Visible = true
+
+	local cam = Workspace.CurrentCamera
+	local hum = getHumanoid()
+	if hum then
+		hum.WalkSpeed = saved.walk or 16
+		hum.JumpPower = saved.jp or 50
+		hum.JumpHeight = saved.jh or 7.2
+		cam.CameraSubject = hum
+	end
+	setControls(true)
+	cam.FieldOfView = saved.fov or 70
+	cam.CameraType = Enum.CameraType.Custom
+	if benchModel then benchModel.Parent = nil end
+end
+
+------------------------------------------------------------------
+-- WORKBENCH TOOL + GIVING TOOLS
+------------------------------------------------------------------
+local function createWorkbenchTool()
+	local tool = trackObj(Instance.new("Tool"))
+	tool.Name = "Workbench"
+	tool.ToolTip = "Craft items"
+	tool.CanBeDropped = false
+	tool.RequiresHandle = false
+	tool.Equipped:Connect(enterBench)
+	tool.Unequipped:Connect(exitBench)
+	return tool
+end
+
+local function hasTool(name)
+	local bp = player:FindFirstChildOfClass("Backpack")
+	return (bp and bp:FindFirstChild(name)) or (player.Character and player.Character:FindFirstChild(name))
+end
+
+function giveTools()
+	local bp = player:WaitForChild("Backpack")
+	if not hasTool("Workbench") then
+		createWorkbenchTool().Parent = bp
+	end
+	for _, r in ipairs(RECIPES) do
+		if owned[r.id] and not hasTool(r.toolName) then
+			r.createTool().Parent = bp
+		end
+	end
+end
+
+------------------------------------------------------------------
+-- INPUT: touch/click and drag anywhere to move the glowing part
+------------------------------------------------------------------
+local function isPointer(input)
+	local t = input.UserInputType
+	return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch
+end
+
+local function startDrag(input)
+	if not inBench or not ready or dragging then return end
+	if not looseParts[step] then return end
+	dragging = true
+	dragIsTouch = input.UserInputType == Enum.UserInputType.Touch
+	pointerPos = Vector2.new(input.Position.X, input.Position.Y)
+end
+
+local function moveDrag(input)
+	if not dragging then return end
+	local t = input.UserInputType
+	if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+		pointerPos = Vector2.new(input.Position.X, input.Position.Y)
+	end
+end
+
+track(catcher.InputBegan:Connect(function(input)
+	if isPointer(input) then startDrag(input) end
+end))
+track(catcher.InputChanged:Connect(moveDrag))
+track(catcher.InputEnded:Connect(function(input)
+	if isPointer(input) then dropPart() end
+end))
+
+-- fallbacks in case the finger/mouse leaves the catcher
+track(UIS.InputChanged:Connect(moveDrag))
+track(UIS.InputEnded:Connect(function(input)
+	if dragging and isPointer(input) then dropPart() end
+end))
+
+track(exitBtn.Activated:Connect(function()
+	local hum = getHumanoid()
+	if hum then hum:UnequipTools() end
+	exitBench()
+end))
+
+track(cancelBtn.Activated:Connect(function()
+	if not active then return end
+	refund(active.recipe.cost)
+	clearBuild()
+	toast("Build cancelled - materials refunded")
+	showMenu()
+end))
+
+------------------------------------------------------------------
+-- RESPAWN + CLEANUP + START
+------------------------------------------------------------------
+track(player.CharacterAdded:Connect(function()
+	exitBench()
+	currentDim = nil
+	applyLook(nil)
+	updateSideButtons()
+	task.wait(0.8)
+	giveTools()
+end))
+
+env.__PortalGunCleanup = function()
+	exitBench()
+	if currentDim and homeCF then
+		local _, root = getHumanoid()
+		if root then root.CFrame = homeCF end
+	end
+	currentDim = nil
+	applyLook(nil)
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	for _, o in ipairs(objects) do
+		pcall(function() o:Destroy() end)
+	end
+	for _, r in ipairs(RECIPES) do
+		for _, name in ipairs({ r.toolName }) do
+			local bp = player:FindFirstChildOfClass("Backpack")
+			if bp and bp:FindFirstChild(name) then bp[name]:Destroy() end
+			if player.Character and player.Character:FindFirstChild(name) then player.Character[name]:Destroy() end
+		end
+	end
+	for _, name in ipairs({ "Workbench" }) do
+		local bp = player:FindFirstChildOfClass("Backpack")
+		if bp and bp:FindFirstChild(name) then bp[name]:Destroy() end
+		if player.Character and player.Character:FindFirstChild(name) then player.Character[name]:Destroy() end
+	end
+	env.__PortalGunApplyLook = nil
+end
+
+refreshBag()
+giveTools()
+toast("Workbench added. Use the side panel to visit dimensions!")
