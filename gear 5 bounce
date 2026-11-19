@@ -1,0 +1,1146 @@
+-- Jelly / Gear 5 style movement v7 (LocalScript)
+-- Put in: StarterPlayer > StarterPlayerScripts
+-- Needs an R15 character for the body squash & stretch.
+-- Controls: E (PC) or the on-screen "Jelly" button (mobile) = Jelly Bump
+--   Press it AGAIN while you're in the air after a bump = Jelly Slide
+--   (sit-slide, steer with the camera, press JUMP to get off)
+--
+-- GROUND JELLY (how it works):
+-- The real floor around you is copied into a grid of individual tiles. The floor
+-- parts stacked UNDER the top part (a thin "cover" over thicker parts) are split
+-- too, so the whole stack sinks together and the crater can go deep.
+-- Landing sinks the tiles, then they pop back and send a ripple out.
+-- JELLY BUMP: the ground sinks, then 4 separate tiles (a little apart, around
+-- you) shoot up and push you up, while ALL the other tiles sink down.
+-- JELLY SLIDE: in the air after a bump, press the key again. You sit-slide down a
+-- ramp built from copies of the floor under you (same texture) with little rails
+-- on both sides. Steer with the camera: turn left/right to turn, look UP to climb,
+-- look DOWN to dive. Press JUMP to stop.
+-- Works on flat, axis-aligned Parts (like the Baseplate). NOT on Terrain/MeshParts.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+
+---------------------------------------------------------------- SETTINGS
+local PUFF_WIDTH = 1.15          -- how puffy the body is (1 = normal)
+local PUFF_DEPTH = 1.15
+local BOUNCE_STRENGTH = 0.55     -- how much speed you keep when bouncing
+local MIN_BOUNCE_SPEED = 12      -- landing slower than this = no bounce
+local MAX_BOUNCES = 3            -- bounces in a row
+
+-- jelly bump ability
+local BUMP_POWER = 120           -- launch speed (120 = about 37 studs high)
+local BUMP_COOLDOWN = 3          -- seconds
+local BUMP_WINDUP = 0.25         -- seconds the ground sinks before the pillar shoots up
+local BUMP_KEY = Enum.KeyCode.E
+local PILLAR_MAX = 45            -- tallest the 4-tile pillar can get
+local PILLAR_SINK = 4            -- how deep ALL the other tiles sink during the jump
+local PILLAR_SPREAD = 1          -- how far apart the 4 pushing tiles are (1 = one tile gap, 0 = merged)
+
+-- jelly slide (press the key again in the air after a bump)
+local SLIDE_START_SPEED = 55     -- speed when the slide starts
+local SLIDE_MAX_SPEED = 95       -- top speed (you speed up going down)
+local SLIDE_GROUND_SPEED = 45    -- cruising speed once you're on the ground
+local SLIDE_DROP = 0.12          -- how much you sink when the camera looks level (0 = holds height)
+local SLIDE_MAX_SLOPE = 1.2      -- steepest climb / dive from looking up or down (1 = 45 degrees)
+local SLIDE_MIN_SPEED = 25       -- slowest you get when climbing (you lose speed going up)
+local SLIDE_TURN = 5             -- how fast you steer toward where the camera looks (radians/sec)
+local SLIDE_GROOVE = 1.0         -- how deep the floor tiles dip under you while sliding on the ground
+local SLIDE_SEG = 6              -- length of each ramp piece
+local SLIDE_WIDTH = 7            -- width of the ramp
+local SLIDE_THICK = 1            -- thickness of the ramp
+local SLIDE_RAIL_W = 0.8         -- width of the little side rails
+local SLIDE_RAIL_H = 1.4         -- height of the little side rails
+local SLIDE_MAX_SEGS = 24        -- how many ramp pieces stay behind you
+
+-- ground jelly
+local TILE = 3                   -- tile size in studs (smaller = smoother, heavier)
+local RADIUS_CELLS = 4           -- tiles each side of you (4 -> 9x9 = 81 tiles per layer)
+local MAX_LAYERS = 3             -- how many stacked floor parts under you also sink
+local LAYER_DEPTH = 40           -- how far down to look for stacked parts
+local MAX_SINK = 5               -- deepest the ground can sink (studs)
+local SINK_POWER = 0.45          -- how hard landings push the ground down
+local WAVE_SPEED = 100           -- higher = ripples spread faster
+local SPRINGINESS = 12           -- higher = pops back faster
+local WOBBLE_DAMPING = 2.5       -- lower = wobbles for longer
+local DRIVE_DEPTH = 0.3          -- how far your feet press in while walking
+local WALK_JELLY = true          -- false = ground only reacts to jump/land/bump (lighter)
+local SINK_BODY = true           -- your character sinks and rises with the ground
+
+-- floor textures
+local COPY_TEXTURES = true       -- keep Textures / SurfaceAppearance of the floor on the tiles
+local TEXTURE_FIX = true         -- line the floor texture up across tiles
+local TEXTURE_MODE = 1           -- if texture lines don't match up, try 2, 3, then 4
+---------------------------------------------------------------------------
+
+local effects = Instance.new("Folder")
+effects.Name = "JellyEffects"
+effects.Parent = workspace
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local connections = {}
+local current = nil
+local lastBump = -math.huge
+
+-- simple spring (underdamped = wobbly)
+local function newSpring(k, c)
+	return { x = 0, v = 0, target = 0, k = k, c = c }
+end
+
+local function stepSpring(s, dt)
+	s.v += (s.k * (s.target - s.x) - s.c * s.v) * dt
+	s.x += s.v * dt
+end
+
+---------------------------------------------------------------- JELLY GROUND
+local T = TILE
+local N = RADIUS_CELLS
+local M = 2 * N + 1
+local CELLS = M * M
+local VMAX = 80
+local HIDDEN = CFrame.new(0, -5000, 0)
+
+local zone = nil
+local warned = false
+
+local function idxOf(i, j)
+	return (i + N) * M + (j + N) + 1
+end
+
+-- per-slot constants: grid coords, and how much the edge tiles fade to flat
+local CI, CJ, FADE = {}, {}, {}
+for i = -N, N do
+	for j = -N, N do
+		local idx = idxOf(i, j)
+		CI[idx], CJ[idx] = i, j
+		FADE[idx] = math.clamp((N - math.max(math.abs(i), math.abs(j))) / 2, 0, 1)
+	end
+end
+
+-- a part we can split: flat Block part, anchored, lined up with the world axes
+local function supported(inst, normal)
+	if not (inst:IsA("Part") and inst.Shape == Enum.PartType.Block and inst.Anchored) then
+		return false
+	end
+	if inst:FindFirstChildWhichIsA("DataModelMesh") then return false end
+	local cf = inst.CFrame
+	if cf.UpVector.Y < 0.9995 or normal.Y < 0.9 then return false end
+	local r = cf.RightVector
+	return math.abs(r.X) > 0.9995 or math.abs(r.Z) > 0.9995
+end
+
+local function makeClone(zn, inst)
+	local was = inst.Archivable
+	inst.Archivable = true
+	local c = inst:Clone()
+	inst.Archivable = was
+	if not c then return nil end
+	for _, ch in ipairs(c:GetChildren()) do
+		local keep = false
+		if COPY_TEXTURES then
+			if ch:IsA("Texture") and ch.Face == Enum.NormalId.Top then
+				keep = true
+				zn.texBase[ch] = { ch.OffsetStudsU, ch.OffsetStudsV }
+			elseif ch:IsA("SurfaceAppearance") then
+				keep = true
+			end
+		end
+		if not keep then
+			ch:Destroy()
+		end
+	end
+	for _, tg in ipairs(c:GetTags()) do
+		c:RemoveTag(tg)
+	end
+	c.Name = "JellyTile"
+	c.Anchored = true
+	c.CanCollide = false
+	c.CanQuery = false
+	c.CanTouch = false
+	c.CastShadow = false
+	c.LocalTransparencyModifier = 0
+	c.CFrame = HIDDEN
+	c.Parent = effects
+	return c
+end
+
+local function newLayer(inst, depth)
+	local cf, size = inst.CFrame, inst.Size
+	local r, l = cf.RightVector, cf.LookVector
+	local ex = math.abs(r.X) * size.X / 2 + math.abs(l.X) * size.Z / 2
+	local ez = math.abs(r.Z) * size.X / 2 + math.abs(l.Z) * size.Z / 2
+	return {
+		part = inst, depth = depth, cf = cf, rot = cf.Rotation,
+		sx = size.X, sy = size.Y, sz = size.Z,
+		absRX = math.abs(r.X), absRZ = math.abs(r.Z),
+		absLX = math.abs(l.X), absLZ = math.abs(l.Z),
+		cy = cf.Position.Y,
+		x0 = cf.Position.X - ex, x1 = cf.Position.X + ex,
+		z0 = cf.Position.Z - ez, z1 = cf.Position.Z + ez,
+		tiles = {}, valid = {}, wx = {}, wz = {}, lsx = {}, lsz = {}, curY = {},
+		pool = {}, outer = {}, hidden = {}, ltm = inst.LocalTransparencyModifier,
+	}
+end
+
+-- sizes + positions a box (given in world X/Z bounds) and lines up its texture
+local function placeBox(zn, L, p, ax, bx, az, bz)
+	local cx, cz = (ax + bx) / 2, (az + bz) / 2
+	local wsx, wsz = bx - ax, bz - az
+	local sxl = L.absRX * wsx + L.absRZ * wsz
+	local szl = L.absLX * wsx + L.absLZ * wsz
+	p.Size = Vector3.new(sxl, L.sy, szl)
+	p.CFrame = CFrame.new(cx, L.cy, cz) * L.rot
+
+	if COPY_TEXTURES and TEXTURE_FIX then
+		local lc = L.cf:PointToObjectSpace(Vector3.new(cx, L.cy, cz))
+		local du, dv
+		if TEXTURE_MODE <= 2 then
+			du = (lc.X - sxl / 2) + L.sx / 2
+			dv = L.sz / 2 - (lc.Z + szl / 2)
+		else
+			du = L.sx / 2 - (lc.X + sxl / 2)
+			dv = (lc.Z - szl / 2) + L.sz / 2
+		end
+		if TEXTURE_MODE % 2 == 0 then
+			du, dv = -du, -dv
+		end
+		for _, ch in ipairs(p:GetChildren()) do
+			local b = zn.texBase[ch]
+			if b then
+				local pu = ch.StudsPerTileU > 0 and ch.StudsPerTileU or 1
+				local pv = ch.StudsPerTileV > 0 and ch.StudsPerTileV or 1
+				ch.OffsetStudsU = b[1] + du % pu
+				ch.OffsetStudsV = b[2] + dv % pv
+			end
+		end
+	end
+	return sxl, szl
+end
+
+-- makes / refreshes the tile for grid slot (i, j) of one layer
+local function fillCell(zn, L, i, j)
+	local idx = idxOf(i, j)
+	local inset = L.depth > 1 and 0.04 or 0 -- lower layers sit slightly inside the upper ones
+	local ax = math.max(zn.fx + (i - 0.5) * T, L.x0) + inset
+	local bx = math.min(zn.fx + (i + 0.5) * T, L.x1) - inset
+	local az = math.max(zn.fz + (j - 0.5) * T, L.z0) + inset
+	local bz = math.min(zn.fz + (j + 0.5) * T, L.z1) - inset
+	if bx - ax > 0.01 and bz - az > 0.01 then
+		local n = #L.pool
+		local tile = L.pool[n]
+		if tile then
+			L.pool[n] = nil
+		else
+			tile = makeClone(zn, L.part)
+		end
+		if not tile then
+			L.valid[idx] = false
+			return
+		end
+		local sxl, szl = placeBox(zn, L, tile, ax, bx, az, bz)
+		L.tiles[idx] = tile
+		L.valid[idx] = true
+		L.wx[idx], L.wz[idx] = (ax + bx) / 2, (az + bz) / 2
+		L.lsx[idx], L.lsz[idx] = sxl, szl
+		L.curY[idx] = L.sy
+	else
+		L.valid[idx] = false
+	end
+end
+
+-- the 4 pieces of normal floor around the jelly area (so there are no holes)
+local function layoutOuter(zn, L)
+	local gx0, gx1 = zn.fx - (N + 0.5) * T, zn.fx + (N + 0.5) * T
+	local gz0, gz1 = zn.fz - (N + 0.5) * T, zn.fz + (N + 0.5) * T
+	local rx0, rx1 = math.max(gx0, L.x0), math.min(gx1, L.x1)
+	local rz0, rz1 = math.max(gz0, L.z0), math.min(gz1, L.z1)
+
+	local function piece(k, ax, bx, az, bz)
+		local p = L.outer[k]
+		if not p then return end
+		if bx - ax > 0.01 and bz - az > 0.01 then
+			placeBox(zn, L, p, ax, bx, az, bz)
+		else
+			p.CFrame = HIDDEN
+		end
+	end
+	piece(1, L.x0, rx0, L.z0, L.z1)
+	piece(2, rx1, L.x1, L.z0, L.z1)
+	piece(3, rx0, rx1, L.z0, rz0)
+	piece(4, rx0, rx1, rz1, L.z1)
+end
+
+local function retireZone()
+	local zn = zone
+	if not zn then return end
+	zone = nil
+	for _, L in ipairs(zn.layers) do
+		for _, t in pairs(L.tiles) do t:Destroy() end
+		for _, t in pairs(L.pool) do t:Destroy() end
+		for _, t in pairs(L.outer) do t:Destroy() end
+		if zn.hiddenDone and L.part.Parent then
+			L.part.LocalTransparencyModifier = L.ltm
+			for d, tr in pairs(L.hidden) do
+				if d.Parent then d.Transparency = tr end
+			end
+		end
+	end
+end
+
+local function shiftArray(src, di, dj) -- fills new slots with 0
+	local out = {}
+	for i = -N, N do
+		for j = -N, N do
+			local si, sj = i + di, j + dj
+			if si >= -N and si <= N and sj >= -N and sj <= N then
+				out[idxOf(i, j)] = src[idxOf(si, sj)]
+			else
+				out[idxOf(i, j)] = 0
+			end
+		end
+	end
+	return out
+end
+
+local function shiftAny(src, di, dj) -- fills new slots with nil
+	local out = {}
+	for i = -N, N do
+		for j = -N, N do
+			local si, sj = i + di, j + dj
+			if si >= -N and si <= N and sj >= -N and sj <= N then
+				out[idxOf(i, j)] = src[idxOf(si, sj)]
+			end
+		end
+	end
+	return out
+end
+
+-- slides the jelly area to follow you. Tiles are reused: only the tiles at the
+-- new edge get set up, so walking doesn't create lag.
+local function shiftSlots(zn, di, dj)
+	if di == 0 and dj == 0 then return end
+	zn.H = shiftArray(zn.H, di, dj)
+	zn.V = shiftArray(zn.V, di, dj)
+	zn.fx += di * T
+	zn.fz += dj * T
+
+	for _, L in ipairs(zn.layers) do
+		-- tiles leaving the area go back to the pool
+		for i = -N, N do
+			for j = -N, N do
+				local ni, nj = i - di, j - dj
+				if ni < -N or ni > N or nj < -N or nj > N then
+					local t = L.tiles[idxOf(i, j)]
+					if t then
+						t.CFrame = HIDDEN
+						L.pool[#L.pool + 1] = t
+					end
+				end
+			end
+		end
+		L.tiles = shiftAny(L.tiles, di, dj)
+		L.valid = shiftAny(L.valid, di, dj)
+		L.wx = shiftAny(L.wx, di, dj)
+		L.wz = shiftAny(L.wz, di, dj)
+		L.lsx = shiftAny(L.lsx, di, dj)
+		L.lsz = shiftAny(L.lsz, di, dj)
+		L.curY = shiftAny(L.curY, di, dj)
+
+		-- set up tiles that just entered the area
+		for i = -N, N do
+			for j = -N, N do
+				local si, sj = i + di, j + dj
+				if si < -N or si > N or sj < -N or sj > N then
+					fillCell(zn, L, i, j)
+				end
+			end
+		end
+		layoutOuter(zn, L)
+	end
+end
+
+local function createZone(stack, hitPos)
+	local zn = {
+		top = stack[1],
+		fx = math.floor(hitPos.X / T + 0.5) * T,
+		fz = math.floor(hitPos.Z / T + 0.5) * T,
+		H = {}, V = {}, A = {}, Hf = {}, kin = {},
+		layers = {}, texBase = {},
+		lastDisturb = os.clock(), active = 0, pillar = nil,
+		groundY = hitPos.Y, hiddenDone = false,
+	}
+	for idx = 1, CELLS do
+		zn.H[idx], zn.V[idx], zn.A[idx], zn.Hf[idx] = 0, 0, 0, 0
+	end
+	zone = zn -- set early so retireZone can clean up if anything fails
+
+	for k, inst in ipairs(stack) do
+		local L = newLayer(inst, k)
+		zn.layers[#zn.layers + 1] = L
+		for o = 1, 4 do
+			L.outer[o] = makeClone(zn, inst)
+		end
+		for i = -N, N do
+			for j = -N, N do
+				fillCell(zn, L, i, j)
+			end
+		end
+		layoutOuter(zn, L)
+	end
+	zn.groundY = zn.layers[1].cy + zn.layers[1].sy / 2
+
+	-- hide the real floor on this client (it still collides, you still stand on it)
+	for _, L in ipairs(zn.layers) do
+		L.part.LocalTransparencyModifier = 1
+		for _, ch in ipairs(L.part:GetChildren()) do
+			if ch:IsA("Decal") then
+				L.hidden[ch] = ch.Transparency
+				ch.Transparency = 1
+			end
+		end
+	end
+	zn.hiddenDone = true
+	return zn
+end
+
+-- finds the floor under you (plus parts stacked below it) and makes sure a jelly zone exists
+local function ensureZone(root)
+	rayParams.FilterDescendantsInstances = { player.Character, effects }
+	local r = workspace:Raycast(root.Position, Vector3.new(0, -12, 0), rayParams)
+	if not r then return zone end
+
+	if zone and zone.top == r.Instance then
+		local pos = root.Position
+		shiftSlots(zone, math.floor((pos.X - zone.fx) / T + 0.5), math.floor((pos.Z - zone.fz) / T + 0.5))
+		return zone
+	end
+
+	retireZone()
+	if not supported(r.Instance, r.Normal) then
+		if not warned then
+			warned = true
+			warn("[Jelly] The floor under you isn't a flat, axis-aligned Part (Terrain, MeshPart, wedge, rotated part...), so no ground jelly there.")
+		end
+		return nil
+	end
+
+	-- look for parts stacked underneath (a thin cover over thicker parts)
+	local stack = { r.Instance }
+	local excl = { player.Character, effects, r.Instance }
+	local origin = r.Position
+	for _ = 2, MAX_LAYERS do
+		rayParams.FilterDescendantsInstances = excl
+		local r2 = workspace:Raycast(origin - Vector3.new(0, 0.02, 0), Vector3.new(0, -LAYER_DEPTH, 0), rayParams)
+		if not r2 or not supported(r2.Instance, r2.Normal) then break end
+		stack[#stack + 1] = r2.Instance
+		excl[#excl + 1] = r2.Instance
+		origin = r2.Position
+	end
+
+	local ok, err = pcall(createZone, stack, r.Position)
+	if not ok then
+		warn("[Jelly] Couldn't build the ground jelly: " .. tostring(err))
+		retireZone()
+		return nil
+	end
+	return zone
+end
+
+-- strength > 0 = push ground DOWN (it pops back + ripples), strength < 0 = pop it UP
+local function impulse(strength, radius)
+	local zn, s = zone, current
+	if not zn or not s then return end
+	zn.lastDisturb = os.clock()
+	local pos = s.root.Position
+	for idx = 1, CELLS do
+		local dx = zn.fx + CI[idx] * T - pos.X
+		local dz = zn.fz + CJ[idx] * T - pos.Z
+		local d = math.sqrt(dx * dx + dz * dz)
+		if d < radius then
+			zn.V[idx] = math.clamp(zn.V[idx] - strength * (1 - d / radius), -VMAX, VMAX)
+		end
+	end
+end
+
+local function simulate(zn, dt, px, pz, driveDepth, driveR)
+	local H, V, A, kin = zn.H, zn.V, zn.A, zn.kin
+
+	-- forces: neighbors pull on each other (= ripples), spring back to flat
+	for idx = 1, CELLS do
+		local i, j = CI[idx], CJ[idx]
+		local h = H[idx]
+		local avg = ((i < N and H[idx + M] or 0)
+			+ (i > -N and H[idx - M] or 0)
+			+ (j < N and H[idx + 1] or 0)
+			+ (j > -N and H[idx - 1] or 0)) * 0.25
+		local a = WAVE_SPEED * (avg - h) - SPRINGINESS * h - WOBBLE_DAMPING * V[idx]
+		if driveDepth then
+			local dx = zn.fx + i * T - px
+			local dz = zn.fz + j * T - pz
+			local d = math.sqrt(dx * dx + dz * dz)
+			if d < driveR then
+				a += (-driveDepth - h) * 60 * (1 - d / driveR)
+			end
+		end
+		A[idx] = a
+	end
+
+	-- integrate
+	local active = 0
+	for idx = 1, CELLS do
+		if not kin[idx] then
+			local v = math.clamp(V[idx] + A[idx] * dt, -VMAX, VMAX)
+			local h = H[idx] + v * dt
+			if h < -MAX_SINK then
+				h = -MAX_SINK
+				if v < 0 then v = 0 end
+			elseif h > PILLAR_MAX then
+				h = PILLAR_MAX
+				if v > 0 then v = 0 end
+			end
+			if math.abs(h) < 0.004 and math.abs(v) < 0.03 then
+				h, v = 0, 0
+			else
+				active += 1
+			end
+			H[idx], V[idx] = h, v
+		end
+	end
+	zn.active = active
+end
+
+local function render(zn)
+	local H, Hf = zn.H, zn.Hf
+	for idx = 1, CELLS do
+		Hf[idx] = H[idx] * FADE[idx]
+	end
+
+	local ps, cfs, k = {}, {}, 0
+	for _, L in ipairs(zn.layers) do
+		local baseTop = L.cy + L.sy * 0.5
+		for idx = 1, CELLS do
+			if L.valid[idx] then
+				local i, j = CI[idx], CJ[idx]
+				local h = Hf[idx]
+				local hx1 = i < N and Hf[idx + M] or 0
+				local hx0 = i > -N and Hf[idx - M] or 0
+				local hz1 = j < N and Hf[idx + 1] or 0
+				local hz0 = j > -N and Hf[idx - 1] or 0
+
+				-- raised tiles grow taller so there is never a gap under them
+				local rise = h > 0 and h or 0
+				local thick = L.sy + rise
+				local tile = L.tiles[idx]
+				if math.abs(L.curY[idx] - thick) > 0.02 then
+					tile.Size = Vector3.new(L.lsx[idx], thick, L.lsz[idx])
+					L.curY[idx] = thick
+				end
+
+				-- tilt with the slope (fades out on tall columns)
+				local tf = math.clamp(1 - rise / 3, 0, 1)
+				local pitch = math.clamp(-math.atan((hz1 - hz0) / (2 * T)) * tf, -0.8, 0.8)
+				local roll = math.clamp(math.atan((hx1 - hx0) / (2 * T)) * tf, -0.8, 0.8)
+
+				k += 1
+				ps[k] = tile
+				cfs[k] = CFrame.new(L.wx[idx], baseTop + h, L.wz[idx])
+					* CFrame.Angles(pitch, 0, roll)
+					* L.rot
+					* CFrame.new(0, -thick / 2, 0)
+			end
+		end
+	end
+	if k > 0 then
+		workspace:BulkMoveTo(ps, cfs)
+	end
+end
+
+local function updateGround(dt)
+	local s = current
+	if not s or not s.root.Parent then
+		retireZone()
+		return
+	end
+	dt = math.min(dt, 1 / 30)
+
+	local root, hum = s.root, s.hum
+	local now = os.clock()
+	local grounded = hum.FloorMaterial ~= Enum.Material.Air
+	local vel = root.AssemblyLinearVelocity
+	local flat = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	local pos = root.Position
+	local sinkTarget = 0
+
+	local zn = zone
+	if zn then
+		for _, L in ipairs(zn.layers) do
+			if not L.part.Parent then
+				retireZone()
+				zn = nil
+				break
+			end
+		end
+	end
+
+	if zn then
+		-- follow the player
+		local di = math.floor((pos.X - zn.fx) / T + 0.5)
+		local dj = math.floor((pos.Z - zn.fz) / T + 0.5)
+		if math.abs(di) >= 2 or math.abs(dj) >= 2 then
+			shiftSlots(zn, di, dj)
+		end
+
+		local H, V = zn.H, zn.V
+		table.clear(zn.kin)
+
+		-- JELLY BUMP: 4 separate tiles around you rise and push you up,
+		-- every other tile sinks down
+		local p = zn.pillar
+		if p then
+			local feetY = pos.Y - (hum.HipHeight + root.Size.Y / 2)
+			local feetH = math.clamp(feetY - zn.groundY, 0, PILLAR_MAX)
+			if now - p.t0 > 0.15 and (vel.Y < BUMP_POWER * 0.12 or now - p.t0 > 1.6) then
+				zn.pillar = nil -- let go: the pillar collapses with a wobble + ripples
+			else
+				zn.lastDisturb = now
+				local kUp = math.min(1, dt * 25)
+				local kDown = math.min(1, dt * 10)
+				local ci = math.floor((pos.X - zn.fx) / T + 0.5)
+				local cj = math.floor((pos.Z - zn.fz) / T + 0.5)
+				for idx = 1, CELLS do
+					local i, j = CI[idx], CJ[idx]
+					local push = (i == ci - PILLAR_SPREAD or i == ci + PILLAR_SPREAD)
+						and (j == cj - PILLAR_SPREAD or j == cj + PILLAR_SPREAD)
+					local target = push and feetH or -PILLAR_SINK
+					local h = H[idx]
+					local nh = h + (target - h) * (push and kUp or kDown)
+					V[idx] = (nh - h) / dt
+					H[idx] = nh
+					zn.kin[idx] = true
+				end
+			end
+		end
+
+		local sl = s.slide
+		local driveDepth, driveR = nil, T
+		if sl and sl.onGround then
+			driveDepth, driveR = SLIDE_GROOVE, T * 1.6
+		elseif WALK_JELLY and grounded and flat > 1 and not sl then
+			driveDepth = DRIVE_DEPTH
+		end
+		if driveDepth then
+			zn.lastDisturb = now
+		end
+		simulate(zn, dt, pos.X, pos.Z, driveDepth, driveR)
+
+		-- your character sinks into the crater / rises with the pop
+		if grounded and not zn.pillar and not s.slide then
+			local i = math.clamp(math.floor((pos.X - zn.fx) / T + 0.5), -N, N)
+			local j = math.clamp(math.floor((pos.Z - zn.fz) / T + 0.5), -N, N)
+			sinkTarget = math.clamp(H[idxOf(i, j)], -MAX_SINK, 6)
+		end
+
+		render(zn)
+
+		-- everything has settled: put the normal floor back
+		if zn.active == 0 and not zn.pillar and now - zn.lastDisturb > 0.5 then
+			retireZone()
+		end
+	end
+
+	if SINK_BODY and s.rootJoint then
+		s.sink += (sinkTarget - s.sink) * math.min(dt * (grounded and 25 or 12), 1)
+		s.rootJoint.C0 = s.rootC0 * CFrame.new(0, s.sink, 0)
+	end
+end
+
+RunService.RenderStepped:Connect(updateGround)
+
+---------------------------------------------------------------- JELLY SLIDE
+local slabs = {} -- each entry = one ramp piece: { main, l, r } (floor + 2 side rails)
+
+local function destroyGroup(g)
+	for _, p in pairs(g) do p:Destroy() end
+end
+
+local function clearSlabs(gradual)
+	local list = slabs
+	slabs = {}
+	if not gradual then
+		for _, g in ipairs(list) do destroyGroup(g) end
+		return
+	end
+	task.spawn(function()
+		for _, g in ipairs(list) do
+			task.wait(0.04)
+			destroyGroup(g)
+		end
+	end)
+end
+
+-- one part of the slide: a copy of the floor part (keeps its texture)
+local function makeSlab(s)
+	local fp = s.floorPart
+	local p = nil
+	if fp and fp.Parent and fp:IsA("Part") and fp.Shape == Enum.PartType.Block then
+		p = makeClone({ texBase = {} }, fp)
+	end
+	if not p then
+		p = Instance.new("Part")
+		p.Name = "JellySlide"
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CanTouch = false
+		p.CastShadow = false
+		p.Material = Enum.Material.SmoothPlastic
+		p.Color = s.floorColor or Color3.fromRGB(163, 162, 165)
+		p.Parent = effects
+	end
+	return p
+end
+
+local function makeGroup(s)
+	return { main = makeSlab(s), l = makeSlab(s), r = makeSlab(s) }
+end
+
+-- how far the lowest body part is below the root (changes with the sit pose)
+local function bodyBottom(s)
+	local char = player.Character
+	if not char then return 3 end
+	local low = math.huge
+	for _, p in ipairs(char:GetChildren()) do
+		if p:IsA("BasePart") and p ~= s.root then
+			local cf, sz = p.CFrame, p.Size
+			local half = (math.abs(cf.RightVector.Y) * sz.X
+				+ math.abs(cf.UpVector.Y) * sz.Y
+				+ math.abs(cf.LookVector.Y) * sz.Z) / 2
+			low = math.min(low, cf.Position.Y - half)
+		end
+	end
+	if low == math.huge then return 3 end
+	return s.root.Position.Y - low
+end
+
+-- Roblox's default sit animation (taken from the character's Animate script)
+local function playSit(s)
+	local char, hum = player.Character, s.hum
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then return nil end
+	local id = nil
+	local animate = char and char:FindFirstChild("Animate")
+	local sit = animate and animate:FindFirstChild("sit")
+	local sa = sit and sit:FindFirstChild("SitAnim")
+	if sa and sa:IsA("Animation") and sa.AnimationId ~= "" then
+		id = sa.AnimationId
+	end
+	if not id then
+		id = hum.RigType == Enum.HumanoidRigType.R15 and "rbxassetid://2506281703" or "rbxassetid://178130996"
+	end
+	local anim = Instance.new("Animation")
+	anim.AnimationId = id
+	local ok, track = pcall(function()
+		return animator:LoadAnimation(anim)
+	end)
+	anim:Destroy()
+	if not ok or not track then return nil end
+	track.Priority = Enum.AnimationPriority.Action4
+	track.Looped = true
+	track:Play(0.15)
+	return track
+end
+
+-- builds the ramp (floor + side rails) under you while you're in the air
+local function updateSlabs(s, sl, pt, airborne)
+	if not airborne then
+		sl.head, sl.lastPt = nil, nil
+		return
+	end
+	if not sl.lastPt then sl.lastPt = pt end
+	local seg = pt - sl.lastPt
+	local len = seg.Magnitude
+	if len < 0.3 then return end
+
+	if not sl.head then
+		sl.head = makeGroup(s)
+		sl.n += 1
+		sl.headLift = (sl.n % 3) * 0.015 -- stops overlapping pieces from flickering
+		table.insert(slabs, sl.head)
+		if #slabs > SLIDE_MAX_SEGS then
+			destroyGroup(table.remove(slabs, 1))
+		end
+	end
+
+	local g, lift = sl.head, sl.headLift
+	local fwd = seg / len
+	local mid = (sl.lastPt + pt) / 2
+	local cf = CFrame.lookAt(mid, mid + fwd)
+	local L = len + 0.3
+	local off = SLIDE_WIDTH / 2 - SLIDE_RAIL_W / 2
+
+	g.main.Size = Vector3.new(SLIDE_WIDTH, SLIDE_THICK, L)
+	g.main.CFrame = cf * CFrame.new(0, -SLIDE_THICK / 2 - lift, 0)
+	g.l.Size = Vector3.new(SLIDE_RAIL_W, SLIDE_RAIL_H, L)
+	g.l.CFrame = cf * CFrame.new(-off, SLIDE_RAIL_H / 2 - lift, 0)
+	g.r.Size = Vector3.new(SLIDE_RAIL_W, SLIDE_RAIL_H, L)
+	g.r.CFrame = cf * CFrame.new(off, SLIDE_RAIL_H / 2 - lift, 0)
+
+	if len >= SLIDE_SEG then
+		sl.head = nil
+		sl.lastPt = pt
+	end
+end
+
+local function startSlide(s)
+	local root, hum = s.root, s.hum
+	local look = workspace.CurrentCamera.CFrame.LookVector
+	local dir = Vector3.new(look.X, 0, look.Z)
+	if dir.Magnitude < 0.1 then
+		local rl = root.CFrame.LookVector
+		dir = Vector3.new(rl.X, 0, rl.Z)
+	end
+	dir = dir.Unit
+
+	local v = root.AssemblyLinearVelocity
+	s.canSlide = false
+	if zone then zone.pillar = nil end -- the pillars collapse
+
+	local sl = {
+		dir = dir,
+		speed = math.max(SLIDE_START_SPEED, Vector3.new(v.X, 0, v.Z).Magnitude),
+		vy = v.Y,
+		tilt = 0,
+		t0 = os.clock(),
+		n = 0,
+		onGround = false,
+		nextZone = 0,
+		autoRotate = hum.AutoRotate,
+		bottom = bodyBottom(s),
+	}
+	s.slide = sl
+
+	-- the script drives the movement; the default sit animation plays on top
+	hum.AutoRotate = false
+	hum.PlatformStand = true
+	sl.track = playSit(s)
+	s.sq.v -= 6
+end
+
+local function stopSlide(s)
+	local sl = s.slide
+	if not sl then return end
+	s.slide = nil
+	local root, hum = s.root, s.hum
+	if sl.track then sl.track:Stop(0.1) end
+	hum.AutoRotate = sl.autoRotate
+	hum.PlatformStand = false
+	if root.Parent and hum.Health > 0 then
+		-- stand back up facing the way you slid, then a normal jump
+		local lift = math.max((hum.HipHeight + root.Size.Y / 2) - sl.bottom, 0) + 0.1
+		local pos = root.Position + Vector3.new(0, lift, 0)
+		root.CFrame = CFrame.new(pos) * CFrame.lookAt(Vector3.zero, sl.dir).Rotation
+		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		local jumpV = hum.UseJumpPower and hum.JumpPower or math.sqrt(2 * workspace.Gravity * hum.JumpHeight)
+		root.AssemblyLinearVelocity = Vector3.new(sl.dir.X * sl.speed * 0.4, jumpV, sl.dir.Z * sl.speed * 0.4)
+		root.AssemblyAngularVelocity = Vector3.zero
+		s.sq.v += 7
+	end
+	clearSlabs(true) -- the slide pieces disappear one by one
+end
+
+-- runs before physics every frame while sliding
+RunService.Stepped:Connect(function(_, dt)
+	local s = current
+	local sl = s and s.slide
+	if not sl then return end
+	local root, hum = s.root, s.hum
+	if not root.Parent or hum.Health <= 0 then
+		s.slide = nil
+		if sl.track then sl.track:Stop(0) end
+		clearSlabs(false)
+		return
+	end
+	dt = math.min(dt, 1 / 30)
+	local now = os.clock()
+
+	-- JUMP = get off the slide
+	if now - sl.t0 > 0.25 and hum.Jump then
+		stopSlide(s)
+		return
+	end
+	if not hum.PlatformStand then hum.PlatformStand = true end
+	if sl.track and not sl.track.IsPlaying then sl.track:Play(0.1) end
+
+	-- steer: turn toward where the camera is looking
+	local look = workspace.CurrentCamera.CFrame.LookVector
+	local want = Vector3.new(look.X, 0, look.Z)
+	if want.Magnitude > 0.1 then
+		want = want.Unit
+		local ang = math.atan2(sl.dir:Cross(want).Y, sl.dir:Dot(want))
+		local step = math.clamp(ang, -SLIDE_TURN * dt, SLIDE_TURN * dt)
+		sl.dir = CFrame.Angles(0, step, 0):VectorToWorldSpace(sl.dir).Unit
+	end
+
+	-- find the floor under you
+	local pos = root.Position
+	rayParams.FilterDescendantsInstances = { player.Character, effects }
+	local r = workspace:Raycast(pos + Vector3.new(0, 2, 0), Vector3.new(0, -400, 0), rayParams)
+	local groundY = r and r.Position.Y
+	if r and r.Instance:IsA("BasePart") and not r.Instance:IsA("Terrain") then
+		s.floorPart = r.Instance
+		s.floorColor = r.Instance.Color
+	end
+
+	-- keep your lowest body part just above the floor (the sit pose is lower than standing)
+	sl.bottom += (bodyBottom(s) - sl.bottom) * math.min(dt * 10, 1)
+
+	-- up / down: look up with the camera to climb, look down to dive
+	local flatLook = math.sqrt(look.X * look.X + look.Z * look.Z)
+	local camSlope = math.clamp(look.Y / math.max(flatLook, 0.2), -SLIDE_MAX_SLOPE, SLIDE_MAX_SLOPE)
+	local slope = camSlope - SLIDE_DROP
+	local wantVy = sl.speed * slope
+
+	-- on the floor you hug it, unless you look up (then you take off)
+	local onGround = false
+	if groundY then
+		local targetY = groundY + sl.bottom + 0.1
+		local nextY = pos.Y + sl.vy * dt
+		if sl.vy <= 0 and wantVy <= 4 and nextY <= targetY + 0.05 then
+			onGround = true
+			sl.vy = math.clamp((targetY - pos.Y) * 20, -80, 80)
+		end
+	end
+	if not onGround then
+		sl.vy += (wantVy - sl.vy) * math.min(dt * 6, 1)
+		-- diving speeds you up, climbing slows you down
+		sl.speed = math.clamp(sl.speed - slope * 35 * dt, SLIDE_MIN_SPEED, SLIDE_MAX_SPEED)
+	else
+		sl.speed += (SLIDE_GROUND_SPEED - sl.speed) * math.min(dt * 1.5, 1)
+	end
+	sl.onGround = onGround
+
+	-- move + face the slide direction, leaning with the slope
+	local tiltTarget = onGround and 0 or math.clamp(sl.vy / math.max(sl.speed, 1), -0.9, 0.9)
+	sl.tilt += (tiltTarget - sl.tilt) * math.min(dt * 8, 1)
+	root.AssemblyLinearVelocity = Vector3.new(sl.dir.X * sl.speed, sl.vy, sl.dir.Z * sl.speed)
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.CFrame = CFrame.lookAt(pos, pos + Vector3.new(sl.dir.X, sl.tilt, sl.dir.Z))
+
+	-- the ramp under you (copies of the floor, with its texture, plus side rails)
+	local seatPt = pos - Vector3.new(0, sl.bottom, 0)
+	local airborne = (not groundY) or seatPt.Y > groundY + 0.8
+	updateSlabs(s, sl, seatPt, airborne)
+
+	-- on the ground the jelly tiles follow you and dip as you slide over them
+	if onGround and now >= sl.nextZone then
+		sl.nextZone = now + 0.12
+		ensureZone(root)
+	end
+end)
+
+---------------------------------------------------------------- JELLY BUMP
+local function bump()
+	local s = current
+	if not s or s.hum.Health <= 0 then return end
+	if s.slide then return end
+
+	-- pressed again in the air after a bump -> slide
+	if s.canSlide and s.hum.FloorMaterial == Enum.Material.Air then
+		startSlide(s)
+		return
+	end
+
+	if os.clock() - lastBump < BUMP_COOLDOWN then return end
+	lastBump = os.clock()
+
+	local root, hum = s.root, s.hum
+	s.bounces = 0
+
+	-- remember the floor so the slide can be built from copies of it
+	rayParams.FilterDescendantsInstances = { player.Character, effects }
+	local fr = workspace:Raycast(root.Position, Vector3.new(0, -12, 0), rayParams)
+	s.floorPart, s.floorColor = nil, nil
+	if fr and fr.Instance:IsA("BasePart") and not fr.Instance:IsA("Terrain") then
+		s.floorPart = fr.Instance
+		s.floorColor = fr.Instance.Color
+	end
+
+	-- wind-up: the ground sinks deep under you
+	if ensureZone(root) then
+		impulse(45, 14)
+	end
+
+	task.delay(BUMP_WINDUP, function()
+		if not root.Parent or hum.Health <= 0 then return end
+		hum:ChangeState(Enum.HumanoidStateType.Freefall)
+		local v = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity = Vector3.new(v.X, BUMP_POWER, v.Z)
+		s.sq.v += 12
+		s.canSlide = true -- press again in the air = slide
+		-- 4 tiles shoot up and push you, the rest of the ground sinks
+		if zone then
+			zone.pillar = { t0 = os.clock() }
+			zone.lastDisturb = os.clock()
+		end
+	end)
+end
+
+ContextActionService:BindAction("JellyBump", function(_, state)
+	if state == Enum.UserInputState.Begin then
+		bump()
+	end
+end, true, BUMP_KEY)
+ContextActionService:SetTitle("JellyBump", "Jelly")
+
+---------------------------------------------------------------- CHARACTER SETUP
+local function setup(char)
+	for _, c in ipairs(connections) do
+		c:Disconnect()
+	end
+	table.clear(connections)
+	retireZone()
+	clearSlabs(false)
+
+	local hum = char:WaitForChild("Humanoid")
+	local root = char:WaitForChild("HumanoidRootPart")
+
+	local scaleH = hum:WaitForChild("BodyHeightScale", 3)
+	local scaleW = hum:WaitForChild("BodyWidthScale", 3)
+	local scaleD = hum:WaitForChild("BodyDepthScale", 3)
+	if not (scaleH and scaleW and scaleD) then
+		warn("[Jelly] Needs an R15 character with avatar scaling for squash & stretch.")
+		scaleH, scaleW, scaleD = nil, nil, nil
+	end
+	local origH = scaleH and scaleH.Value or 1
+	local origW = scaleW and scaleW.Value or 1
+	local origD = scaleD and scaleD.Value or 1
+
+	local upper = char:FindFirstChild("UpperTorso")
+	local waist = upper and upper:FindFirstChild("Waist")
+	local waistC0 = waist and waist.C0
+
+	local lower = char:FindFirstChild("LowerTorso")
+	local rootJoint = (lower and lower:FindFirstChild("Root")) or root:FindFirstChild("RootJoint")
+	local rootC0 = rootJoint and rootJoint.C0
+
+	local sq = newSpring(140, 6)       -- squash / stretch
+	local pitch = newSpring(80, 5)     -- lean forward / back
+	local roll = newSpring(80, 5)      -- lean sideways
+
+	local state = {
+		hum = hum, root = root, sq = sq, bounces = 0,
+		rootJoint = rootJoint, rootC0 = rootC0, sink = 0,
+		canSlide = false, slide = nil,
+	}
+	current = state
+
+	-- JUMP gets you off the slide
+	local function tryStop()
+		local sl = state.slide
+		if sl and os.clock() - sl.t0 > 0.25 then
+			stopSlide(state)
+		end
+	end
+	table.insert(connections, UserInputService.JumpRequest:Connect(tryStop))
+	table.insert(connections, UserInputService.InputBegan:Connect(function(input, processed)
+		if not processed and input.KeyCode == Enum.KeyCode.Space then
+			tryStop()
+		end
+	end))
+
+	local t, stepTimer, lastVy = 0, 0, 0
+
+	table.insert(connections, RunService.RenderStepped:Connect(function(dt)
+		dt = math.min(dt, 1 / 30)
+		t += dt
+
+		local vel = root.AssemblyLinearVelocity
+		local flat = Vector3.new(vel.X, 0, vel.Z).Magnitude
+		local moving = math.clamp(flat / 16, 0, 1)
+		local grounded = hum.FloorMaterial ~= Enum.Material.Air
+		if not grounded then
+			lastVy = vel.Y
+		end
+
+		-- targets
+		sq.target = (grounded and math.sin(t * 13) * 0.07 * moving or 0) + math.sin(t * 2) * 0.015
+		local lv = root.CFrame:VectorToObjectSpace(vel)
+		pitch.target = math.clamp(lv.Z * 0.012, -0.3, 0.3)
+		roll.target = math.clamp(-lv.X * 0.012, -0.3, 0.3) + math.sin(t * 6.5) * 0.1 * moving
+
+		stepSpring(sq, dt)
+		stepSpring(pitch, dt)
+		stepSpring(roll, dt)
+
+		-- body squash / stretch + puffy base
+		if scaleH then
+			local sc = math.clamp(sq.x, -0.4, 0.4)
+			scaleH.Value = origH * (1 + sc)
+			scaleW.Value = origW * PUFF_WIDTH * (1 - sc * 0.7)
+			scaleD.Value = origD * PUFF_DEPTH * (1 - sc * 0.7)
+		end
+
+		-- jelly bend (torso sways and wobbles)
+		if waist then
+			local yaw = math.sin(t * 13) * 0.1 * moving
+			waist.C0 = waistC0 * CFrame.Angles(pitch.x, yaw, roll.x)
+		end
+
+		-- each footstep thumps the jelly ground
+		if WALK_JELLY and grounded and flat > 4 and not state.slide then
+			stepTimer += dt
+			if stepTimer >= 0.33 then
+				stepTimer = 0
+				sq.v -= 2.5
+				if ensureZone(root) then
+					impulse(3, 2.8)
+				end
+			end
+		else
+			stepTimer = 0.2
+		end
+	end))
+
+	table.insert(connections, hum.StateChanged:Connect(function(_, new)
+		if new == Enum.HumanoidStateType.Jumping then
+			sq.v += 7 -- stretch up when jumping
+			if ensureZone(root) then
+				impulse(10, 4) -- ground sinks as you push off
+			end
+		elseif new == Enum.HumanoidStateType.Landed then
+			state.canSlide = false -- touched down: no more sliding until the next bump
+			local impact = math.max(-lastVy, 0)
+			sq.v -= math.min(impact * 0.3, 14) -- squash on landing
+
+			if impact > 5 and ensureZone(root) then
+				-- crater! it pops back and ripples out
+				impulse(math.min(impact * SINK_POWER, 50), 4 + math.min(impact * 0.06, 4))
+			end
+
+			if impact >= MIN_BOUNCE_SPEED and state.bounces < MAX_BOUNCES then
+				state.bounces += 1
+				local up = math.min(impact, 90) * BOUNCE_STRENGTH
+				-- launch as the ground pops back
+				task.delay(0.1, function()
+					if not root.Parent then return end
+					hum:ChangeState(Enum.HumanoidStateType.Freefall)
+					local v = root.AssemblyLinearVelocity
+					root.AssemblyLinearVelocity = Vector3.new(v.X, up, v.Z)
+				end)
+			else
+				state.bounces = 0
+			end
+		end
+	end))
+end
+
+if player.Character then
+	task.spawn(setup, player.Character)
+end
+player.CharacterAdded:Connect(setup)
